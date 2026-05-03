@@ -860,8 +860,10 @@ def get_pocket():
     items=[{"id":r[0],"amount":float(r[1]),"direction":r[2],"note":r[3],"ts":r[4]} for r in rows]
     balance=sum(i["amount"] for i in items if i["direction"]=="p_income")
     balance-=sum(i["amount"] for i in items if i["direction"]=="p_expense")
+    balance+=sum(i["amount"] for i in items if i["direction"]=="p_adjust")
     deferred=sum(i["amount"] for i in items if i["direction"]=="p_deferred")
     deferred-=sum(i["amount"] for i in items if i["direction"]=="p_deferred_spend")
+    deferred+=sum(i["amount"] for i in items if i["direction"]=="p_deferred_adjust")
     return {"balance":round(balance,2),"deferred":round(deferred,2),
             "reserve_pct":cfg["reserve_pct"],"transactions":items[:40]}
 
@@ -891,6 +893,18 @@ def pocket_config(req: PocketCfgReq):
     cfg=_pocket_cfg(); cfg["reserve_pct"]=max(0,min(99,req.reserve_pct))
     POCKET_CFG.write_text(json.dumps(cfg,ensure_ascii=False))
     return {"ok":True,"reserve_pct":cfg["reserve_pct"]}
+
+class PocketAdjustReq(BaseModel): amount: float; note: str = ""; target: str = "balance"
+
+@app.post("/pocket/adjust")
+def pocket_adjust(req: PocketAdjustReq):
+    direction = "p_adjust" if req.target == "balance" else "p_deferred_adjust"
+    note = req.note or ("корректировка баланса" if req.target == "balance" else "корректировка резерва")
+    _conn.execute(
+        "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts})",
+        {"id":str(uuid.uuid4()),"a":req.amount,"d":direction,"n":note,
+         "ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
+    return {"ok":True}
 
 @app.get("/modes")
 def get_modes():
@@ -1411,6 +1425,7 @@ section.active{display:block}
       <button class="pocket-btn" onclick="togglePocketForm('income')">+ Пополнить</button>
       <button class="pocket-btn secondary" onclick="togglePocketForm('expense')">− Потратить</button>
       <button class="pocket-btn danger" onclick="togglePocketForm('deferred-spend')" style="font-size:12px">⚑ Из резерва</button>
+      <button class="pocket-btn secondary" onclick="togglePocketForm('adjust')" style="font-size:12px">✎ Корректировка</button>
     </div>
 
     <div class="pocket-form" id="pf-income">
@@ -1440,6 +1455,21 @@ section.active{display:block}
       <input type="text" id="pf-ds-note" placeholder="Что это значит для тебя">
       <div class="pocket-form-row">
         <button class="pocket-btn danger" onclick="submitPocketExpense(true)">Потратить из резерва</button>
+        <button class="pocket-btn secondary" onclick="closePocketForms()">Отмена</button>
+      </div>
+    </div>
+
+    <div class="pocket-form" id="pf-adjust">
+      <div class="pocket-form-title">КОРРЕКТИРОВКА</div>
+      <div style="font-size:12px;font-family:sans-serif;color:var(--ink3);margin-bottom:10px">Положительное число увеличивает, отрицательное — уменьшает.</div>
+      <select id="pf-adjust-target" style="width:100%;margin-bottom:8px;background:var(--paper);border:1px solid var(--border);color:var(--ink);padding:7px;border-radius:2px">
+        <option value="balance">Баланс</option>
+        <option value="deferred">Резерв (отложено)</option>
+      </select>
+      <input type="number" id="pf-adjust-amount" placeholder="Сумма (может быть отрицательной)" step="0.01">
+      <input type="text" id="pf-adjust-note" placeholder="Причина корректировки">
+      <div class="pocket-form-row">
+        <button class="pocket-btn secondary" onclick="submitPocketAdjust()">Применить</button>
         <button class="pocket-btn secondary" onclick="closePocketForms()">Отмена</button>
       </div>
     </div>
@@ -2210,9 +2240,9 @@ async function loadPocket(){
   document.getElementById('pc-balance').textContent=fmt(d.balance)+' ₽';
   document.getElementById('pc-deferred').textContent=fmt(d.deferred)+' ₽';
   document.getElementById('pc-reserve-pct').value=d.reserve_pct;
-  const DIR={p_income:'income',p_expense:'expense',p_deferred:'deferred',p_deferred_spend:'expense'};
-  const LABEL={p_income:'+ доход',p_expense:'− расход',p_deferred:'→ резерв',p_deferred_spend:'← из резерва'};
-  const SIGN={p_income:'+',p_expense:'−',p_deferred:'→',p_deferred_spend:'←'};
+  const DIR={p_income:'income',p_expense:'expense',p_deferred:'deferred',p_deferred_spend:'expense',p_adjust:'income',p_deferred_adjust:'deferred'};
+  const LABEL={p_income:'+ доход',p_expense:'− расход',p_deferred:'→ резерв',p_deferred_spend:'← из резерва',p_adjust:'✎ корректировка баланса',p_deferred_adjust:'✎ корректировка резерва'};
+  const SIGN={p_income:'+',p_expense:'−',p_deferred:'→',p_deferred_spend:'←',p_adjust:'±',p_deferred_adjust:'±'};
   document.getElementById('pocket-tx-list').innerHTML=d.transactions.length?
     d.transactions.map(t=>`
     <div class="pocket-tx-item">
@@ -2231,13 +2261,13 @@ async function savePocketCfg(){
   loadPocket();
 }
 function togglePocketForm(which){
-  ['income','expense','deferred-spend'].forEach(f=>{
+  ['income','expense','deferred-spend','adjust'].forEach(f=>{
     const el=document.getElementById('pf-'+f);
     el.classList.toggle('open',f===which&&!el.classList.contains('open'));
   });
 }
 function closePocketForms(){
-  ['income','expense','deferred-spend'].forEach(f=>document.getElementById('pf-'+f).classList.remove('open'));
+  ['income','expense','deferred-spend','adjust'].forEach(f=>document.getElementById('pf-'+f).classList.remove('open'));
 }
 async function submitPocketIncome(){
   const amount=parseFloat(document.getElementById('pf-income-amount').value)||0;
@@ -2259,6 +2289,18 @@ async function submitPocketExpense(fromDeferred){
     body:JSON.stringify({amount,note,from_deferred:fromDeferred})});
   document.getElementById(amountId).value='';
   document.getElementById(noteId).value='';
+  closePocketForms(); loadPocket();
+}
+
+async function submitPocketAdjust(){
+  const amount=parseFloat(document.getElementById('pf-adjust-amount').value);
+  const note=document.getElementById('pf-adjust-note').value.trim();
+  const target=document.getElementById('pf-adjust-target').value;
+  if(!amount) return;
+  await fetch('/pocket/adjust',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({amount,note,target})});
+  document.getElementById('pf-adjust-amount').value='';
+  document.getElementById('pf-adjust-note').value='';
   closePocketForms(); loadPocket();
 }
 
