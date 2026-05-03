@@ -1,0 +1,9 @@
+liferpg.db/
+*.db/
+app_config.json
+pocket_config.json
+inbox.json
+.schema_v
+__pycache__/
+*.pyc
+.env
