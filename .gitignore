@@ -1,5 +1,10 @@
+liferpg.db
 liferpg.db/
-*.db/
+liferpg.db.wal
+*.db
+*.db.wal
+server.log
+.DS_Store
 app_config.json
 pocket_config.json
 inbox.json
