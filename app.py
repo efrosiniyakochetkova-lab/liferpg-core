@@ -573,12 +573,17 @@ def get_missions():
         # Linked entities
         eid="mission_"+slug(r[1])
         linked=kuzu_rows(_conn.execute(
-            "MATCH (m:Entity)-[r:LINKED]->(e:Entity) WHERE m.id=$id RETURN e.name,e.type",
+            "MATCH (m:Entity)-[r:LINKED]->(e:Entity) WHERE m.id=$id RETURN e.id,e.name,e.type,e.summary",
             {"id":eid}))
         linked+= kuzu_rows(_conn.execute(
-            "MATCH (e:Entity)-[r:LINKED]->(m:Entity) WHERE m.id=$id RETURN e.name,e.type",
+            "MATCH (e:Entity)-[r:LINKED]->(m:Entity) WHERE m.id=$id RETURN e.id,e.name,e.type,e.summary",
             {"id":eid}))
-        entity_tags=[{"name":x[0],"type":x[1]} for x in linked]
+        seen_ids=set()
+        entity_tags=[]
+        for x in linked:
+            if x[0] not in seen_ids:
+                seen_ids.add(x[0])
+                entity_tags.append({"id":x[0],"name":x[1],"type":x[2],"summary":x[3] or ""})
         result.append({"id":mid,"title":r[1],"description":r[2],"status":r[3],"ts":r[4],
                         "lore":r[5] or "","tasks":task_list,"entities":entity_tags})
     return result
@@ -2157,6 +2162,7 @@ function openOracle(type,value,effect,label){
     });
 }
 function closeOracle(){document.getElementById('oracle-modal').classList.remove('open');}
+function oracleClick(type,value,effect){openOracle(type,value,effect||'',value);}
 document.getElementById('oracle-modal').addEventListener('click',e=>{if(e.target.id==='oracle-modal')closeOracle();});
 
 // ── Mechanics section in База знаний ─────────────────────────────────────────
@@ -2857,15 +2863,15 @@ async function loadBase(){
   const missionR=await fetch('/missions'); const missions=await missionR.json();
   const missionCards=missions.map(m=>{
     const clr='var(--red)';
-    const entTags=(m.entities||[]).map(e=>`<span class="bcard-rel" style="cursor:default">${e.name}</span>`).join('');
+    const entTags=(m.entities||[]).map(e=>`<span class="bcard-rel" onclick="event.stopPropagation();oracleClick('entity','${(e.id||e.name).replace(/'/g,"\\'")}','${(e.summary||'').replace(/'/g,"\\'")}')" style="cursor:pointer">${e.name}</span>`).join('');
     const statusBadge=m.status==='done'?'<span style="font-size:9px;font-family:sans-serif;color:var(--ink3);margin-left:6px">завершён</span>':'';
-    return `<div class="bcard" onclick="">
+    return `<div class="bcard" onclick="nav(document.querySelector('[data-s=missions]'))">
       <div class="bcard-stripe" style="background:${clr}"></div>
       <div class="bcard-name">${m.title}${statusBadge}</div>
       <div class="bcard-type" style="color:${clr}">⚔ Путь</div>
       <div class="bcard-summary">${m.description||m.lore||'Описание не задано'}</div>
       ${entTags?`<div class="bcard-rels">${entTags}</div>`:''}
-      <div class="bcard-footer">${m.tasks.length} заданий · нажми на Путях чтобы редактировать</div>
+      <div class="bcard-footer">${m.tasks.length} заданий · нажми чтобы перейти к Путям</div>
     </div>`;
   }).join('');
   const pathsSection=missions.length?`<div class="base-section">
