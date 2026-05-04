@@ -645,27 +645,6 @@ def completed_today():
     partial=int(r2[0][0]) if r2 else 0
     return {"count": done+partial}
 
-@app.get("/today-narrative")
-def today_narrative():
-    today=datetime.now().strftime("%Y-%m-%d")
-    rows=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d AND t.current_iters > 0 "
-        "RETURN t.title, t.current_iters, t.required_iters",{"d":today}))
-    rows2=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.completed_ts STARTS WITH $d RETURN t.title, 1, 1",{"d":today}))
-    all_tasks=rows+rows2
-    if not all_tasks: return {"narrative":"","cached":False}
-    task_lines="\n".join(f"- {r[0]} ({r[1]}/{r[2]})" for r in all_tasks)
-    p=f"""Ты — Архивариус. Одним абзацем (2-3 предложения) в стиле летописи Морровинда опиши достижения Героя за сегодня.
-Лаконично, эпично, от третьего лица. Без лишних слов.
-
-Задания сегодня:
-{task_lines}
-
-Верни только текст летописи, без кавычек и заголовков."""
-    text=_call_any_ai(p) if _has_any_ai() else ""
-    return {"narrative":text.strip(),"cached":False}
-
 @app.post("/entities/{eid}/delete")
 def delete_entity(eid: str):
     es=slug(eid)
@@ -799,6 +778,27 @@ def save_api_key(req: ApiKeyReq):
     cfg=_app_cfg(); cfg["api_key"]=req.api_key.strip()
     APP_CFG_FILE.write_text(json.dumps(cfg,ensure_ascii=False))
     return {"ok":True,"has_key":bool(cfg["api_key"])}
+
+@app.get("/today-narrative")
+def today_narrative():
+    today=datetime.now().strftime("%Y-%m-%d")
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d AND t.current_iters > 0 "
+        "RETURN t.title, t.current_iters, t.required_iters",{"d":today}))
+    rows2=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.completed_ts STARTS WITH $d RETURN t.title, 1, 1",{"d":today}))
+    all_tasks=rows+rows2
+    if not all_tasks: return {"narrative":""}
+    task_lines="\n".join(f"- {r[0]} ({r[1]}/{r[2]})" for r in all_tasks)
+    p=f"""Ты — Архивариус. Одним абзацем (2-3 предложения) в стиле летописи Морровинда опиши достижения Героя за сегодня.
+Лаконично, эпично, от третьего лица. Без лишних слов.
+
+Задания сегодня:
+{task_lines}
+
+Верни только текст летописи, без кавычек и заголовков."""
+    text=_call_any_ai(p) if _has_any_ai() else ""
+    return {"narrative":text.strip()}
 
 @app.get("/config/status")
 def config_status():
