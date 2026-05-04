@@ -822,7 +822,7 @@ def _merge_entity(keep_id: str, drop_id: str):
                     "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
                     {"f":r[0],"t":keep_id,"l":r[1],"e":r[2] or "merge"})
                 except: pass
-        _conn.execute("MATCH (e:Entity) WHERE e.id=$id DELETE e",{"id":drop_id})
+        _conn.execute("MATCH (e:Entity) WHERE e.id=$id DETACH DELETE e",{"id":drop_id})
     except Exception as ex: print(f"[merge_entity] {ex}")
 
 def _run_reanalyze_bg():
