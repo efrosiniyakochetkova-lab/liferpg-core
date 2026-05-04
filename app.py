@@ -1609,7 +1609,7 @@ fetchAstroData(); setInterval(fetchAstroData, 6*60*60*1000);
 
 // ── КОЛЕСО МИРОВ ─────────────────────────────────────────────────────────────
 const WoW = {
-  EPOCH_START:2024, EPOCH_NAME:'Эпоха Пепла',
+  EPOCH_START:2026, EPOCH_START_MONTH:5, EPOCH_START_DAY:4, EPOCH_NAME:'Эпоха Пепла',
   SEASONS:[
     {name:'Пробуждение',element:'Воздух',emoji:'🌬️',moons:['Луна Первого Ветра','Луна Семян','Луна Голоса']},
     {name:'Зной',element:'Огонь',emoji:'🔥',moons:['Луна Меча','Луна Пепла','Луна Жажды']},
@@ -1672,13 +1672,17 @@ const WoW = {
     const phaseObj=this.PHASES.find(p=>phase>=p.lo&&phase<p.hi)||this.PHASES[7];
     const jan1=new Date(y,0,1);
     const doy=Math.round((new Date(y,m-1,d)-jan1)/86400000)+1;
-    const {real,prog}=this._season(y,doy);
-    let sIdx=real==='spring'?0:real==='summer'?prog<0.45?1:2:real==='autumn'?prog<0.50?3:4:4;
+    // Сезоны по месяцам: Пробуждение=3-4, Зной=5-6, Жатва=7-8, Угасание=9-10, Мороз=11-2
+    const sIdxByMonth=[4,4,0,0,1,1,2,2,3,3,4,4]; // jan=0..dec=11
+    const sIdx=sIdxByMonth[m-1];
     const season=this.SEASONS[sIdx];
-    const mIdx=Math.min(Math.floor(prog*3),2);
+    // Луна внутри сезона по дню месяца
+    const mIdx=d<=10?0:d<=20?1:2;
     const moon=season.moons[mIdx];
     const patron=this._patron(m,d);
-    const epochYear=y-this.EPOCH_START+1;
+    const epochStart=new Date(this.EPOCH_START,this.EPOCH_START_MONTH-1,this.EPOCH_START_DAY);
+    const nowDate=new Date(y,m-1,d);
+    const epochYear=Math.floor((nowDate-epochStart)/(365.25*24*3600*1000))+1;
     const todayStr=(()=>{const n=new Date();return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-${String(n.getDate()).padStart(2,'0')}`;})();
     const isToday=parts[0]===todayStr;
     let phaseName,phaseEmoji,phaseEffect,finalIllum;
