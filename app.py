@@ -13,7 +13,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
-APP_CFG_FILE = Path(__file__).parent / "app_config.json"
+_DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).parent
+APP_CFG_FILE = _DATA_DIR / "app_config.json"
 
 def _app_cfg():
     if APP_CFG_FILE.exists():
@@ -98,7 +99,7 @@ def call_claude_extract(raw: str) -> dict:  # backward compat alias
     return call_ai_extract(raw)
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
-SESSIONS_FILE = Path(__file__).parent / "sessions.json"
+SESSIONS_FILE = _DATA_DIR / "sessions.json"
 _SECRET = os.environ.get("SESSION_SECRET", "liferpg-secret-change-in-prod")
 
 def _hash_password(pw: str) -> str:
@@ -134,7 +135,7 @@ def optional_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) 
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-DB_PATH   = str(Path(__file__).parent / "liferpg.db")
+DB_PATH   = str(_DATA_DIR / "liferpg.db")
 _VER_F    = Path(__file__).parent / ".schema_v"
 _SCHEMA   = "5"   # bump → auto-drops all tables and rebuilds
 
