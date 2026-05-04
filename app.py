@@ -1967,7 +1967,7 @@ section.active{display:block}
     <div class="topbar-date" id="hdr-date"></div>
     <button class="sound-btn" id="sound-btn" onclick="toggleSound()">♪ амбиент</button>
     <div class="topbar-settings" onclick="openSettings()">⚙</div>
-    <div class="topbar-settings" onclick="doLogout()" title="Выйти" style="font-size:13px">⏻</div>
+    <div class="topbar-settings" onclick="doLogout()" title="Выйти из аккаунта" style="font-size:11px;letter-spacing:.5px">Выход</div>
   </div>
 </div>
 
@@ -2258,8 +2258,21 @@ async function authInit(){
     else{localStorage.removeItem('lrpg_token');showLogin();}
   }catch{showLogin();}
 }
-function showLogin(){document.getElementById('login-screen').style.display='flex';}
+let _lsMode='login';
+function lsTab(mode){
+  _lsMode=mode;
+  const isReg=mode==='reg';
+  document.getElementById('ls-pw2').style.display=isReg?'block':'none';
+  document.getElementById('ls-btn').textContent=isReg?'Создать аккаунт':'Войти';
+  document.getElementById('ls-tab-login').style.background=isReg?'var(--paper2)':'var(--ink)';
+  document.getElementById('ls-tab-login').style.color=isReg?'var(--ink3)':'var(--page)';
+  document.getElementById('ls-tab-reg').style.background=isReg?'var(--ink)':'var(--paper2)';
+  document.getElementById('ls-tab-reg').style.color=isReg?'var(--page)':'var(--ink3)';
+  document.getElementById('ls-err').textContent='';
+}
+function showLogin(){document.getElementById('login-screen').style.display='flex';lsTab('login');}
 function hideLogin(){document.getElementById('login-screen').style.display='none';}
+function lsSubmit(){_lsMode==='reg'?doRegister():doLogin();}
 async function doLogin(){
   const login=document.getElementById('ls-login').value.trim();
   const pw=document.getElementById('ls-pw').value;
@@ -2273,15 +2286,33 @@ async function doLogin(){
       localStorage.setItem('lrpg_token',d.token);
       window._me=d; hideLogin();
       loadJournal();loadAsides();loadCharacter();
-    } else {
-      const d=await r.json(); err.textContent=d.detail||'Ошибка';
-    }
+    } else { const d=await r.json(); err.textContent=d.detail||'Ошибка'; }
+  }catch{err.textContent='Нет связи с сервером';}
+}
+async function doRegister(){
+  const login=document.getElementById('ls-login').value.trim();
+  const pw=document.getElementById('ls-pw').value;
+  const pw2=document.getElementById('ls-pw2').value;
+  const err=document.getElementById('ls-err');
+  err.textContent='';
+  if(pw!==pw2){err.textContent='Пароли не совпадают';return;}
+  try{
+    const r=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({login,password:pw})});
+    if(r.ok){
+      const d=await r.json();
+      localStorage.setItem('lrpg_token',d.token);
+      window._me=d; hideLogin();
+      loadJournal();loadAsides();loadCharacter();
+    } else { const d=await r.json(); err.textContent=d.detail||'Ошибка'; }
   }catch{err.textContent='Нет связи с сервером';}
 }
 function doLogout(){
-  localStorage.removeItem('lrpg_token'); showLogin();
+  localStorage.removeItem('lrpg_token');
   document.getElementById('ls-login').value='';
   document.getElementById('ls-pw').value='';
+  document.getElementById('ls-pw2').value='';
+  showLogin();
 }
 // ── State ────────────────────────────────────────────────────────────────────
 let allEntities = [];
@@ -3514,24 +3545,28 @@ fetch('/character/data').then(r=>r.json()).then(d=>{
 </script>
 <div id="login-screen" style="display:none;position:fixed;inset:0;z-index:9999;
   background:var(--page);align-items:center;justify-content:center;flex-direction:column">
-  <div style="text-align:center;margin-bottom:32px">
+  <div style="text-align:center;margin-bottom:28px">
     <div style="font-size:28px;font-family:'Georgia',serif;color:var(--ink);letter-spacing:2px">Life RPG</div>
     <div style="font-size:11px;color:var(--ink3);letter-spacing:4px;text-transform:uppercase;margin-top:4px">живая летопись</div>
   </div>
   <div style="background:var(--paper);border:1px solid var(--border);border-radius:6px;
     padding:32px 40px;width:300px;box-shadow:0 4px 24px var(--shadow)">
+    <div style="display:flex;gap:0;margin-bottom:20px;border:1px solid var(--border);border-radius:3px;overflow:hidden">
+      <button id="ls-tab-login" onclick="lsTab('login')" style="flex:1;padding:7px;border:none;
+        background:var(--ink);color:var(--page);font-family:'Georgia',serif;font-size:12px;cursor:pointer">Войти</button>
+      <button id="ls-tab-reg" onclick="lsTab('reg')" style="flex:1;padding:7px;border:none;
+        background:var(--paper2);color:var(--ink3);font-family:'Georgia',serif;font-size:12px;cursor:pointer">Создать аккаунт</button>
+    </div>
     <input id="ls-login" class="dlg-input" placeholder="Логин" style="margin-bottom:10px"
       onkeydown="if(event.key==='Enter')document.getElementById('ls-pw').focus()">
-    <input id="ls-pw" class="dlg-input" type="password" placeholder="Пароль"
-      onkeydown="if(event.key==='Enter')doLogin()">
-    <div id="ls-err" style="font-size:12px;color:var(--red);font-family:sans-serif;
-      min-height:18px;margin:8px 0"></div>
-    <button onclick="doLogin()" style="width:100%;background:var(--ink);color:var(--page);
+    <input id="ls-pw" class="dlg-input" type="password" placeholder="Пароль" style="margin-bottom:10px"
+      onkeydown="if(event.key==='Enter')lsSubmit()">
+    <input id="ls-pw2" class="dlg-input" type="password" placeholder="Повтори пароль"
+      style="display:none;margin-bottom:10px" onkeydown="if(event.key==='Enter')lsSubmit()">
+    <div id="ls-err" style="font-size:12px;color:var(--red);font-family:sans-serif;min-height:18px;margin-bottom:8px"></div>
+    <button id="ls-btn" onclick="lsSubmit()" style="width:100%;background:var(--ink);color:var(--page);
       border:none;padding:10px;font-family:'Georgia',serif;font-size:14px;
       border-radius:3px;cursor:pointer;letter-spacing:1px">Войти</button>
-  </div>
-  <div style="font-size:10px;color:var(--border);margin-top:24px;font-family:sans-serif">
-    Нет аккаунта? Обратись к Мастеру игры.
   </div>
 </div>
 </body>
