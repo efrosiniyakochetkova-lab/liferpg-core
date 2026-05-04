@@ -645,6 +645,27 @@ def completed_today():
     partial=int(r2[0][0]) if r2 else 0
     return {"count": done+partial}
 
+@app.get("/today-narrative")
+def today_narrative():
+    today=datetime.now().strftime("%Y-%m-%d")
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d AND t.current_iters > 0 "
+        "RETURN t.title, t.current_iters, t.required_iters",{"d":today}))
+    rows2=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.completed_ts STARTS WITH $d RETURN t.title, 1, 1",{"d":today}))
+    all_tasks=rows+rows2
+    if not all_tasks: return {"narrative":"","cached":False}
+    task_lines="\n".join(f"- {r[0]} ({r[1]}/{r[2]})" for r in all_tasks)
+    p=f"""Ты — Архивариус. Одним абзацем (2-3 предложения) в стиле летописи Морровинда опиши достижения Героя за сегодня.
+Лаконично, эпично, от третьего лица. Без лишних слов.
+
+Задания сегодня:
+{task_lines}
+
+Верни только текст летописи, без кавычек и заголовков."""
+    text=_call_any_ai(p) if _has_any_ai() else ""
+    return {"narrative":text.strip(),"cached":False}
+
 @app.post("/entities/{eid}/delete")
 def delete_entity(eid: str):
     es=slug(eid)
@@ -1331,6 +1352,7 @@ section.active{display:block}
   <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
   <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
   <div class="nav-item" data-s="pocket" onclick="nav(this)">💰 Карман</div>
+  <div class="nav-item" data-s="base" onclick="nav(this)" style="display:none">🗄️ База знаний</div>
   <div class="nav-bottom">
     <div id="nav-api-status" style="font-size:10px;font-family:sans-serif;color:var(--nav-dim);margin-bottom:6px"></div>
     <div style="cursor:pointer;font-size:11px;font-family:sans-serif;color:var(--nav-dim);
@@ -1359,7 +1381,7 @@ section.active{display:block}
         </div>
         <div style="margin-top:auto;padding-top:16px;border-top:1px solid var(--border2)">
           <div style="cursor:pointer;font-size:11px;font-family:sans-serif;color:var(--ink3);padding:6px 4px"
-            onclick="nav(document.querySelector('[data-s=base]'))">🗄️ База знаний</div>
+            onclick="nav(document.querySelector('[data-s=base]'));this.closest('.journal-aside').querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'))">🗄️ База знаний →</div>
         </div>
       </div>
     </div>
@@ -1756,17 +1778,16 @@ function linkify(text){
 
 // ── Journal ──────────────────────────────────────────────────────────────────
 async function loadJournal(){
-  const [dr,er,ir,doneR,mr]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today'),fetch('/missions')]);
+  const [dr,er,ir,doneR,mr,narR]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today'),fetch('/missions'),fetch('/today-narrative')]);
   const diary=await dr.json(); allEntities=await er.json();
   const inboxRaw=await ir.json();
   const doneToday=(await doneR.json()).count||0;
   const missions=await mr.json();
+  const todayNarrative=(await narR.json()).narrative||'';
   const today=new Date().toISOString().slice(0,10);
-  const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>{
-    if(t.task_type==='repeat'&&t.current_iters>0) return true;
-    if(t.completed_ts&&t.completed_ts.startsWith(today)) return true;
-    return false;
-  })).map(t=>({...t,missionTitle:missions.find(m=>m.tasks.some(x=>x.id===t.id))?.title||''}));
+  const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>
+    (t.task_type==='repeat'&&t.current_iters>0)
+  ));
   // Only entries actually in the inbox queue are truly "pending"
   const pendingIds=new Set(inboxRaw.filter(i=>!i.type||i.type==='entry').map(i=>i.id));
   const el=document.getElementById('journal-main');
@@ -1801,18 +1822,17 @@ async function loadJournal(){
     }).join('');
     const isToday=date===new Date().toISOString().slice(0,10);
     const doneBadge=isToday&&doneToday>0?`<span class="daily-done-badge">✓ ${doneToday} заданий сегодня</span>`:'';
-    const progressBlock=isToday&&todayTasks.length?`<div style="margin:10px 0 16px;padding:10px 14px;background:var(--paper2);border:1px solid var(--border2);border-radius:3px">
-      <div style="font-size:9px;letter-spacing:2px;color:var(--ink3);font-family:sans-serif;margin-bottom:8px">ПРОГРЕСС ЗА СЕГОДНЯ</div>
+    const progressBlock=isToday&&todayTasks.length?`<div style="margin:10px 0 16px;padding:14px 16px;background:var(--paper2);border:1px solid var(--border2);border-radius:3px">
+      <div style="font-size:9px;letter-spacing:2px;color:var(--ink3);font-family:sans-serif;margin-bottom:10px">ХРОНИКИ ДНЯ</div>
+      ${todayNarrative?`<div style="font-size:13px;color:var(--ink);font-style:italic;margin-bottom:12px;line-height:1.6">${todayNarrative}</div>`:''}
       ${todayTasks.map(t=>{
-        const isRepeat=t.task_type==='repeat';
-        const pct=isRepeat?Math.round(t.current_iters/Math.max(t.required_iters,1)*100):100;
-        const label=isRepeat?`${t.current_iters}/${t.required_iters}`:'✓';
+        const pct=Math.round(t.current_iters/Math.max(t.required_iters,1)*100);
         return `<div style="margin-bottom:6px">
           <div style="display:flex;justify-content:space-between;font-size:12px;font-family:sans-serif;color:var(--ink2);margin-bottom:3px">
-            <span>${t.title}</span><span style="color:var(--gold)">${label}</span>
+            <span>${t.title}</span><span style="color:var(--gold)">${t.current_iters}/${t.required_iters}</span>
           </div>
           <div style="height:3px;background:var(--border2);border-radius:2px">
-            <div style="height:3px;background:var(--gold);border-radius:2px;width:${pct}%"></div>
+            <div style="height:3px;background:var(--gold);border-radius:2px;width:${Math.min(pct,100)}%"></div>
           </div>
         </div>`;
       }).join('')}
