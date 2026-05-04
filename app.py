@@ -822,11 +822,30 @@ def oracle(req: OracleReq):
     mission_lines="\n".join(f"- {r[0]}: {r[1] or ''}" for r in missions) or "нет активных путей"
 
     type_labels={"moon":"Фаза луны","season":"Сезон","patron":"Покровитель",
-                 "epoch":"Эпоха","moon_name":"Луна сезона"}
+                 "epoch":"Эпоха","moon_name":"Луна сезона","stat":"Стат Героя"}
     label=type_labels.get(req.mechanic_type, req.mechanic_type)
     effect_line=f"\nЛорное значение: {req.mechanic_effect}" if req.mechanic_effect else ""
 
-    p=f"""Ты — Архивариус. Говори как пророк — кратко, образно, от второго лица. Без вступлений и заголовков.
+    if req.mechanic_type=="stat":
+        stat_meta=next((s for s in HERO_STATS if s["id"]==req.mechanic_value),None)
+        stat_name=stat_meta["name"] if stat_meta else req.mechanic_value
+        stat_ai=stat_meta["ai"] if stat_meta else ""
+        char=_char_data(); score=char.get("stats",{}).get(req.mechanic_value,None)
+        score_line=f"\nТекущий показатель Героя: {score}/100" if score is not None else ""
+        p=f"""Ты — Архивариус. Говори как наставник — кратко, честно, от второго лица. Без вступлений.
+
+Стат: {stat_name}
+Суть: {stat_ai}{score_line}
+
+Нарратив Героя:
+{entry_lines}
+
+Пути:
+{mission_lines}
+
+Дай откровение (3-4 предложения): что именно в этой области сдерживает или усиливает этого Героя прямо сейчас. Будь конкретен — ссылайся на его реальные дела. Скажи, что он мог бы сделать иначе."""
+    else:
+        p=f"""Ты — Архивариус. Говори как пророк — кратко, образно, от второго лица. Без вступлений и заголовков.
 
 Сейчас {label}: {req.mechanic_value}.{effect_line}
 
@@ -836,7 +855,7 @@ def oracle(req: OracleReq):
 Активные Пути Героя:
 {mission_lines}
 
-Дай откровение (3-4 предложения): что означает {req.mechanic_value} для этого конкретного Героя прямо сейчас. Связь с его реальными делами и путями обязательна. Говори о том, что важно именно ему."""
+Дай откровение (3-4 предложения): что означает {req.mechanic_value} для этого конкретного Героя прямо сейчас. Связь с его реальными делами и путями обязательна."""
     text=_call_any_ai(p)
     return {"text":text.strip()}
 
@@ -848,12 +867,27 @@ def config_status():
 
 CHAR_FILE = Path(__file__).parent / "character.json"
 
+HERO_STATS = [
+    {"id":"will",    "name":"Воля",      "sub":"Ты движешь судьбу — или она тебя?",
+     "ai":"насколько Герой действует из своей воли, а не под давлением внешних обстоятельств"},
+    {"id":"temper",  "name":"Закалка",   "sub":"Металл, из которого куют легенды",
+     "ai":"способность восстанавливаться после трудностей и продолжать путь"},
+    {"id":"flame",   "name":"Пламя",     "sub":"Зачем ты идёшь — ты знаешь?",
+     "ai":"ощущение смысла и цели за действиями, внутренний огонь"},
+    {"id":"mastery", "name":"Мастерство","sub":"Острота, что точится через действие",
+     "ai":"конкретный рост, навыки, достижения, выполненные задания"},
+    {"id":"threads", "name":"Нити",      "sub":"Связи, которые держат мир",
+     "ai":"качество и глубина связей с другими людьми"},
+    {"id":"shadow",  "name":"Тень",      "sub":"То, что идёт рядом и просит имени",
+     "ai":"осознание своих теней, принятие сложных частей себя, самоосознанность"},
+]
+
 def _char_data():
     if CHAR_FILE.exists():
         try: return json.loads(CHAR_FILE.read_text())
         except: pass
-    return {"traits":[],"antagonist_name":"","antagonist_desc":"",
-            "last_analyzed":"","season_chronicles":{},"mission_epilogues":{}}
+    return {"stats":{},"antagonist_name":"","antagonist_desc":"",
+            "last_analyzed":"","mission_epilogues":{}}
 
 def _save_char(data):
     CHAR_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
@@ -861,6 +895,10 @@ def _save_char(data):
 @app.get("/character/data")
 def get_character_data():
     return _char_data()
+
+@app.get("/character/stats-schema")
+def stats_schema():
+    return [{"id":s["id"],"name":s["name"],"sub":s["sub"]} for s in HERO_STATS]
 
 @app.post("/character/analyze")
 def analyze_character():
@@ -872,15 +910,26 @@ def analyze_character():
     missions=kuzu_rows(_conn.execute(
         "MATCH (m:Mission) RETURN m.title, m.status LIMIT 10"))
     mission_lines="\n".join(f"- {r[0]} ({r[1]})" for r in missions) or "нет"
+    stat_desc="\n".join(f"- {s['id']}: {s['ai']}" for s in HERO_STATS)
     def _bg():
+        # Stats scoring
         try:
-            t1=_call_any_ai(f"""Ты — Архивариус. Выяви 3-4 черты характера Героя, которые проявились в записях сами — не декларированные, а реально видимые в поступках.
-Каждая черта — одно предложение от третьего лица в стиле летописца.
-Записи:\n{entry_lines}
-Верни ТОЛЬКО JSON: {{"traits": ["черта1","черта2","черта3"]}}""")
-            m1=re.search(r'\{.*\}',t1,re.DOTALL)
-            traits=json.loads(m1.group()).get("traits",[]) if m1 else []
-        except: traits=[]
+            t1=_call_any_ai(f"""Ты — Архивариус. Оцени Героя по 6 измерениям от 0 до 100. Будь строг и честен: 50 = средний человек, 80+ = реально высокий уровень.
+
+Измерения:
+{stat_desc}
+
+Записи Героя:
+{entry_lines}
+
+Пути:
+{mission_lines}
+
+Верни ТОЛЬКО JSON без пояснений: {{"will":65,"temper":42,"flame":78,"mastery":55,"threads":60,"shadow":35}}""")
+            m1=re.search(r'\{[^{}]+\}',t1)
+            stats=json.loads(m1.group()) if m1 else {}
+        except: stats={}
+        # Antagonist
         try:
             t2=_call_any_ai(f"""Ты — Архивариус. Найди главное повторяющееся препятствие Героя. Назови его мифическим именем (2-3 слова) и опиши в 1-2 предложениях.
 Записи:\n{entry_lines}\nПути:\n{mission_lines}
@@ -889,7 +938,7 @@ def analyze_character():
             antag=json.loads(m2.group()) if m2 else {"name":"","desc":""}
         except: antag={"name":"","desc":""}
         data=_char_data()
-        data["traits"]=traits
+        data["stats"]=stats
         data["antagonist_name"]=antag.get("name","")
         data["antagonist_desc"]=antag.get("desc","")
         data["last_analyzed"]=datetime.now().strftime("%Y-%m-%d")
@@ -1472,13 +1521,20 @@ section.active{display:block}
   cursor:pointer;transition:all .15s;white-space:nowrap}
 .sound-btn:hover{border-color:var(--gold);color:var(--gold)}
 .sound-btn.on{border-color:var(--gold);color:var(--gold);background:rgba(138,92,42,.07)}
-/* ── CHARACTER TRAITS SIDEBAR ── */
+/* ── CHARACTER STATS SIDEBAR ── */
 .char-section{margin-top:4px;padding-top:14px;border-top:1px solid var(--border2)}
-.char-trait{font-size:11px;color:var(--ink2);font-family:sans-serif;line-height:1.5;
-  padding:5px 0;border-bottom:.5px solid var(--border2);font-style:italic}
-.char-trait:last-child{border-bottom:none}
+.stat-row{display:flex;align-items:center;gap:8px;padding:7px 0;
+  cursor:pointer;border-bottom:.5px solid var(--border2);transition:opacity .12s}
+.stat-row:last-of-type{border-bottom:none}
+.stat-row:hover{opacity:.75}
+.stat-name{font-size:12px;color:var(--ink);font-family:sans-serif;
+  width:82px;flex-shrink:0;font-weight:600}
+.stat-bar-wrap{flex:1;height:3px;background:var(--border2);border-radius:2px;overflow:hidden}
+.stat-bar{height:3px;border-radius:2px;transition:width .8s ease;width:0%}
+.stat-val{font-size:10px;font-family:sans-serif;color:var(--ink3);
+  width:24px;text-align:right;flex-shrink:0}
 .char-analyze-btn{font-size:10px;font-family:sans-serif;color:var(--ink3);
-  cursor:pointer;padding:4px 0;transition:color .12s;margin-top:6px;display:block}
+  cursor:pointer;padding:6px 0 2px;transition:color .12s;display:block}
 .char-analyze-btn:hover{color:var(--gold)}
 /* ── PAST MOON MEMORY ── */
 .past-moon-block{margin:0 0 28px;padding:12px 16px;background:var(--paper2);
@@ -2175,26 +2231,52 @@ function entryAgeStyle(tsStr){
   return 'opacity:.70;filter:sepia(62%)';
 }
 
-// ── Character Traits ──────────────────────────────────────────────────────────
+// ── Character Stats ───────────────────────────────────────────────────────────
+const STATS_META=[
+  {id:'will',    name:'Воля',       sub:'Ты движешь судьбу — или она тебя?'},
+  {id:'temper',  name:'Закалка',    sub:'Металл, из которого куют легенды'},
+  {id:'flame',   name:'Пламя',      sub:'Зачем ты идёшь — ты знаешь?'},
+  {id:'mastery', name:'Мастерство', sub:'Острота, что точится через действие'},
+  {id:'threads', name:'Нити',       sub:'Связи, которые держат мир'},
+  {id:'shadow',  name:'Тень',       sub:'То, что идёт рядом и просит имени'},
+];
+function _statColor(v){
+  if(v>=80) return 'var(--green)';
+  if(v>=55) return 'var(--gold)';
+  if(v>=30) return 'var(--ink3)';
+  return 'var(--red)';
+}
 async function loadCharacter(){
   const d=await(await fetch('/character/data')).json();
   const el=document.getElementById('char-sidebar');
-  if(!el)return;
-  if(!d.traits?.length&&!d.antagonist_name){
-    el.innerHTML=`<div class="aside-label" style="margin-bottom:6px">Облик Героя</div>
-      <span class="char-analyze-btn" onclick="triggerAnalyze()">⟳ Архивариус изучает характер...</span>`;
-    return;
-  }
-  const traitsHtml=d.traits.map(t=>`<div class="char-trait">${t}</div>`).join('');
-  el.innerHTML=`<div class="aside-label" style="margin-bottom:6px">Облик Героя</div>
-    ${traitsHtml}
-    ${d.last_analyzed?`<span class="char-analyze-btn" onclick="triggerAnalyze()" title="Обновить">⟳ обновить · ${d.last_analyzed}</span>`:''}`;
+  if(!el) return;
+  const stats=d.stats||{};
+  const hasStats=STATS_META.some(s=>stats[s.id]!=null);
+  el.innerHTML=`<div class="aside-label" style="margin-bottom:8px">Статы Героя</div>`+
+    STATS_META.map(s=>{
+      const v=stats[s.id];
+      const pct=v!=null?Math.min(v,100):null;
+      const color=pct!=null?_statColor(pct):'var(--border2)';
+      return `<div class="stat-row" onclick="openOracle('stat','${s.id}','${s.sub.replace(/'/g,"\\'")}','${s.name}')" title="${s.sub}">
+        <div class="stat-name">${s.name}</div>
+        <div class="stat-bar-wrap"><div class="stat-bar" style="width:${pct??0}%;background:${color}" data-target="${pct??0}"></div></div>
+        <div class="stat-val" style="color:${color}">${pct!=null?pct:'—'}</div>
+      </div>`;
+    }).join('')+
+    `<span class="char-analyze-btn" onclick="triggerAnalyze()">⟳ ${d.last_analyzed?'обновить · '+d.last_analyzed:'Архивариус изучает характер...'}</span>`;
+  // Animate bars after render
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    el.querySelectorAll('.stat-bar').forEach(b=>{
+      b.style.width=b.dataset.target+'%';
+    });
+  }));
 }
 async function triggerAnalyze(){
   const el=document.getElementById('char-sidebar');
-  if(el) el.querySelector('.char-analyze-btn,.aside-label')&&(el.innerHTML+='<span style="font-size:10px;font-family:sans-serif;color:var(--ink3)"> анализирует...</span>');
+  const btn=el?.querySelector('.char-analyze-btn');
+  if(btn) btn.textContent='⟳ Архивариус анализирует...';
   await fetch('/character/analyze',{method:'POST'});
-  setTimeout(()=>loadCharacter(),12000);
+  setTimeout(()=>loadCharacter(),14000);
 }
 
 // ── Nav ──────────────────────────────────────────────────────────────────────
