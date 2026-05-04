@@ -406,8 +406,7 @@ def export_data():
         "MATCH (a:Entity)-[r:LINKED]->(b:Entity) RETURN a.id,r.label,b.id,r.entry_id"))
     mentions = kuzu_rows(_conn.execute(
         "MATCH (e:Entry)-[:MENTIONS]->(n:Entity) RETURN e.id,n.id"))
-    char_file = Path(__file__).parent/"character.json"
-    char = json.loads(char_file.read_text()) if char_file.exists() else {}
+    char = json.loads(CHAR_FILE.read_text()) if CHAR_FILE.exists() else {}
     return {
         "version": 2,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -512,9 +511,7 @@ def import_data(req: ImportReq):
         except: pass
     # Character
     if d.get("character"):
-        char_file = Path(__file__).parent/"character.json"
-        if not char_file.exists():
-            char_file.write_text(json.dumps(d["character"],ensure_ascii=False,indent=2))
+        CHAR_FILE.write_text(json.dumps(d["character"],ensure_ascii=False,indent=2))
     return {"ok": True, "imported": imported}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1303,7 +1300,7 @@ def config_status():
     return {"has_key": bool(_get_api_key()), "has_gigachat": bool(cfg.get("gigachat_key")),
             "active": "anthropic" if _get_api_key() else ("gigachat" if cfg.get("gigachat_key") else "none")}
 
-CHAR_FILE = Path(__file__).parent / "character.json"
+CHAR_FILE = _DATA_DIR / "character.json"
 
 HERO_STATS = [
     {"id":"will",    "name":"Воля",      "sub":"Ты движешь судьбу — или она тебя?",
@@ -1413,40 +1410,6 @@ def _gen_epilogue_bg(mid: str):
     data.setdefault("mission_epilogues",{})[mid]=text.strip()
     _save_char(data)
 
-@app.get("/export")
-def export_data():
-    entries=kuzu_rows(_conn.execute("MATCH (e:Entry) RETURN e.id,e.ts,e.raw_text,e.narrative,e.archivist_note"))
-    entities=kuzu_rows(_conn.execute("MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary,e.tags"))
-    missions=kuzu_rows(_conn.execute("MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status,m.ts,m.lore"))
-    tasks=kuzu_rows(_conn.execute("MATCH (t:Task) RETURN t.id,t.mission_id,t.title,t.status,t.ts,t.task_type,t.reset_hours,t.required_iters,t.current_iters,t.last_reset_ts,t.streak,t.best_streak"))
-    finances=kuzu_rows(_conn.execute("MATCH (f:Finance) RETURN f.id,f.amount,f.direction,f.category,f.note,f.ts"))
-    return {
-        "entries":[{"id":r[0],"ts":r[1],"raw_text":r[2],"narrative":r[3],"archivist_note":r[4]} for r in entries],
-        "entities":[{"id":r[0],"name":r[1],"type":r[2],"summary":r[3],"tags":r[4]} for r in entities],
-        "missions":[{"id":r[0],"title":r[1],"description":r[2],"status":r[3],"ts":r[4],"lore":r[5] or ""} for r in missions],
-        "tasks":[{"id":r[0],"mission_id":r[1],"title":r[2],"status":r[3],"ts":r[4],"task_type":r[5] or "once","reset_hours":r[6] or 24,"required_iters":r[7] or 1,"current_iters":r[8] or 0,"last_reset_ts":r[9] or "","streak":r[10] or 0,"best_streak":r[11] or 0} for r in tasks],
-        "finances":[{"id":r[0],"amount":r[1],"direction":r[2],"category":r[3],"note":r[4],"ts":r[5]} for r in finances],
-    }
-
-@app.post("/import")
-def import_data(data: dict):
-    for r in data.get("entries",[]):
-        try: _conn.execute("CREATE (:Entry {id:$id,ts:$ts,raw_text:$rt,narrative:$n,archivist_note:$an})",{"id":r["id"],"ts":r["ts"],"rt":r.get("raw_text",""),"n":r.get("narrative",""),"an":r.get("archivist_note","")})
-        except: pass
-    for r in data.get("entities",[]):
-        try: _conn.execute("CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg})",{"id":r["id"],"n":r["name"],"t":r["type"],"s":r.get("summary",""),"tg":r.get("tags","")})
-        except: pass
-    for r in data.get("missions",[]):
-        try: _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:$s,ts:$ts,lore:$l})",{"id":r["id"],"t":r["title"],"d":r.get("description",""),"s":r["status"],"ts":r["ts"],"l":r.get("lore","")})
-        except: pass
-    for r in data.get("tasks",[]):
-        try: _conn.execute("CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:$s,ts:$ts,entry_id:'',task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:$ci,last_reset_ts:$lr,streak:$st,best_streak:$bs,completed_ts:''})",{"id":r["id"],"mid":r["mission_id"],"t":r["title"],"s":r["status"],"ts":r["ts"],"tt":r.get("task_type","once"),"rh":r.get("reset_hours",24),"ri":r.get("required_iters",1),"ci":r.get("current_iters",0),"lr":r.get("last_reset_ts",""),"st":r.get("streak",0),"bs":r.get("best_streak",0)})
-        except: pass
-    for r in data.get("finances",[]):
-        try: _conn.execute("CREATE (:Finance {id:$id,amount:$a,direction:$d,category:$c,note:$n,ts:$ts})",{"id":r["id"],"a":r["amount"],"d":r["direction"],"c":r.get("category",""),"n":r.get("note",""),"ts":r["ts"]})
-        except: pass
-    return {"ok":True}
-
 @app.get("/finances")
 def get_finances():
     rows=kuzu_rows(_conn.execute(
@@ -1467,7 +1430,7 @@ def add_finance(req: FinanceReq):
     return {"id":fid}
 
 # ── Pocket ───────────────────────────────────────────────────────────────────
-POCKET_CFG = Path(__file__).parent / "pocket_config.json"
+POCKET_CFG = _DATA_DIR / "pocket_config.json"
 
 def _pocket_cfg():
     if POCKET_CFG.exists():
