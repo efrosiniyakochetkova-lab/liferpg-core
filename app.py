@@ -2242,6 +2242,7 @@ section.active{display:block}
   aside{
     position:fixed; top:52px; left:0; bottom:0;
     width:82vw; max-width:320px;
+    height:calc(100dvh - 52px); max-height:none;
     display:flex !important; flex-direction:column !important;
     overflow-y:auto; overflow-x:hidden;
     z-index:1200; transform:translateX(-105%);
