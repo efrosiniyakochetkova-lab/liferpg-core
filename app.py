@@ -1328,9 +1328,8 @@ section.active{display:block}
     <div class="nav-game">Life RPG</div>
     <div class="nav-tagline">живая летопись судьбы</div>
   </div>
-  <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Журнал</div>
+  <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
   <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
-  <div class="nav-item" data-s="base" onclick="nav(this)">🗄️ База знаний</div>
   <div class="nav-item" data-s="pocket" onclick="nav(this)">💰 Карман</div>
   <div class="nav-bottom">
     <div id="nav-api-status" style="font-size:10px;font-family:sans-serif;color:var(--nav-dim);margin-bottom:6px"></div>
@@ -1341,7 +1340,7 @@ section.active{display:block}
 </nav>
 
 <header>
-  <div class="hdr-title" id="hdr-title">Журнал</div>
+  <div class="hdr-title" id="hdr-title">Дневник</div>
   <div class="hdr-date" id="hdr-date"></div>
 </header>
 
@@ -1358,9 +1357,9 @@ section.active{display:block}
           <div class="aside-label">Активные пути</div>
           <div id="aside-missions"></div>
         </div>
-        <div class="aside-section">
-          <div class="aside-label">Персонажи</div>
-          <div id="aside-chars"></div>
+        <div style="margin-top:auto;padding-top:16px;border-top:1px solid var(--border2)">
+          <div style="cursor:pointer;font-size:11px;font-family:sans-serif;color:var(--ink3);padding:6px 4px"
+            onclick="nav(document.querySelector('[data-s=base]'))">🗄️ База знаний</div>
         </div>
       </div>
     </div>
@@ -1727,7 +1726,7 @@ function tickClock(){
 tickClock(); setInterval(tickClock,30000);
 
 // ── Nav ──────────────────────────────────────────────────────────────────────
-const TITLES={journal:'Журнал',missions:'Пути',base:'База знаний',pocket:'Карман'};
+const TITLES={journal:'Дневник',missions:'Пути',base:'База знаний',pocket:'Карман'};
 function nav(el){
   document.querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'));
   el.classList.add('active');
@@ -1757,10 +1756,17 @@ function linkify(text){
 
 // ── Journal ──────────────────────────────────────────────────────────────────
 async function loadJournal(){
-  const [dr,er,ir,doneR]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today')]);
+  const [dr,er,ir,doneR,mr]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today'),fetch('/missions')]);
   const diary=await dr.json(); allEntities=await er.json();
   const inboxRaw=await ir.json();
   const doneToday=(await doneR.json()).count||0;
+  const missions=await mr.json();
+  const today=new Date().toISOString().slice(0,10);
+  const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>{
+    if(t.task_type==='repeat'&&t.current_iters>0) return true;
+    if(t.completed_ts&&t.completed_ts.startsWith(today)) return true;
+    return false;
+  })).map(t=>({...t,missionTitle:missions.find(m=>m.tasks.some(x=>x.id===t.id))?.title||''}));
   // Only entries actually in the inbox queue are truly "pending"
   const pendingIds=new Set(inboxRaw.filter(i=>!i.type||i.type==='entry').map(i=>i.id));
   const el=document.getElementById('journal-main');
@@ -1795,30 +1801,60 @@ async function loadJournal(){
     }).join('');
     const isToday=date===new Date().toISOString().slice(0,10);
     const doneBadge=isToday&&doneToday>0?`<span class="daily-done-badge">✓ ${doneToday} заданий сегодня</span>`:'';
+    const progressBlock=isToday&&todayTasks.length?`<div style="margin:10px 0 16px;padding:10px 14px;background:var(--paper2);border:1px solid var(--border2);border-radius:3px">
+      <div style="font-size:9px;letter-spacing:2px;color:var(--ink3);font-family:sans-serif;margin-bottom:8px">ПРОГРЕСС ЗА СЕГОДНЯ</div>
+      ${todayTasks.map(t=>{
+        const isRepeat=t.task_type==='repeat';
+        const pct=isRepeat?Math.round(t.current_iters/Math.max(t.required_iters,1)*100):100;
+        const label=isRepeat?`${t.current_iters}/${t.required_iters}`:'✓';
+        return `<div style="margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;font-size:12px;font-family:sans-serif;color:var(--ink2);margin-bottom:3px">
+            <span>${t.title}</span><span style="color:var(--gold)">${label}</span>
+          </div>
+          <div style="height:3px;background:var(--border2);border-radius:2px">
+            <div style="height:3px;background:var(--gold);border-radius:2px;width:${pct}%"></div>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`:'';
     return `<div class="day-block">
       <div class="day-heading">${cal.heading}${doneBadge}</div>
       <div class="day-sub">${cal.sub}</div>
+      ${progressBlock}
       ${items}
     </div>`;
   }).join('');
 }
 
+function _taskUrgency(t){
+  if(t.task_type!=='repeat'||!t.last_reset_ts) return Infinity;
+  const due=new Date(t.last_reset_ts.replace(' ','T')).getTime()+(t.reset_hours||24)*3600000;
+  return due-Date.now();
+}
 async function loadAsides(){
-  const [mr,er]=await Promise.all([fetch('/missions'),fetch('/entities?type=person')]);
-  const missions=await mr.json(), persons=await er.json();
+  const mr=await fetch('/missions');
+  const missions=await mr.json();
   const active=missions.filter(m=>m.status==='active');
   document.getElementById('aside-missions').innerHTML=active.length
-    ?active.map(m=>`<div class="aside-mission" onclick="nav(document.querySelector('[data-s=missions]'))">
-      <div class="aside-mission-t">${m.title}</div></div>`).join('')
-    :'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif">нет</div>';
-  document.getElementById('aside-chars').innerHTML=persons.slice(0,5).map(p=>`
-    <div class="aside-entity" onclick="openEnt('${p.name.replace(/'/g,"\\'")}')">
-      <div class="aside-entity-ic">${ICONS[p.type]||'◆'}</div>
-      <div>
-        <div class="aside-entity-name">${p.name}</div>
-        <div class="aside-entity-sub">${(p.summary||'').slice(0,36)}…</div>
+    ?active.map(m=>{
+      const incompleteTasks=m.tasks.filter(t=>t.status!=='done')
+        .sort((a,b)=>_taskUrgency(a)-_taskUrgency(b));
+      const tasksHtml=incompleteTasks.map(t=>{
+        const isRepeat=t.task_type==='repeat';
+        const prog=isRepeat?`${t.current_iters}/${t.required_iters}`:'';
+        const timeLeft=isRepeat&&t.last_reset_ts?fmtCountdown(t.last_reset_ts,t.reset_hours):'';
+        return `<div style="padding:4px 8px 4px 14px;font-size:12px;font-family:sans-serif;color:var(--ink2);border-left:2px solid var(--border2);margin:3px 0">
+          <span>${t.title}</span>
+          ${prog?`<span style="color:var(--gold);margin-left:6px">${prog}</span>`:''}
+          ${timeLeft?`<span style="color:var(--ink3);font-size:10px;margin-left:4px">${timeLeft}</span>`:''}
+        </div>`;
+      }).join('');
+      return `<div class="aside-mission" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+        <div class="aside-mission-t">⚔️ ${m.title}</div>
       </div>
-    </div>`).join('')||'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif">нет</div>';
+      <div style="display:none">${tasksHtml||'<div style="padding:4px 14px;font-size:11px;color:var(--ink3);font-family:sans-serif">нет заданий</div>'}</div>`;
+    }).join('')
+    :'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif">нет</div>';
 }
 
 // ── Ingest ───────────────────────────────────────────────────────────────────
