@@ -959,39 +959,53 @@ HTML = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --nav-bg:#1a1208; --nav-text:#c8a878; --nav-dim:#5a3e1a; --nav-border:#2d1e08;
-  --page:#ede3c8; --paper:#fdf6e3; --paper2:#f5ecd0;
-  --ink:#2d1e08; --ink2:#5c3d18; --ink3:#8a6040;
-  --red:#8b2e0f; --blue:#1a4a6b; --gold:#8b6914; --green:#2d5c14;
-  --border:#c4a070; --border2:#dfc898; --shadow:rgba(45,30,8,.13);
+  --page:#f0e9dc; --paper:#fdf8f0; --paper2:#e8ddd0;
+  --ink:#2c2318; --ink2:#5a3e28; --ink3:#8a6a4a;
+  --red:#8b2e0f; --blue:#1a4a6b; --gold:#8a5c2a; --green:#2d5c14;
+  --border:#c8b89a; --border2:#ddd0b8; --shadow:rgba(44,35,24,.10);
 }
 body{background:var(--page);color:var(--ink);font-family:'Georgia',serif;
-  display:grid;grid-template-columns:200px 1fr;grid-template-rows:auto 1fr auto;
+  display:grid;grid-template-columns:240px 1fr;grid-template-rows:52px 1fr auto;
   height:100vh;overflow:hidden}
 
-/* ── NAV ── */
-nav{grid-column:1;grid-row:1/4;background:var(--nav-bg);border-right:2px solid #0e0906;
-  display:flex;flex-direction:column;overflow-y:auto}
-.nav-logo{padding:18px 14px 16px;border-bottom:1px solid var(--nav-border)}
-.nav-game{font-size:19px;color:#f0d890;letter-spacing:3px;margin-bottom:3px}
-.nav-tagline{font-size:9px;color:var(--nav-dim);font-family:sans-serif;letter-spacing:1.5px;
-  text-transform:uppercase;line-height:1.6}
-.nav-item{padding:11px 14px;cursor:pointer;font-family:sans-serif;font-size:13px;
-  color:var(--nav-dim);display:flex;align-items:center;gap:9px;
-  border-left:2px solid transparent;transition:all .12s}
-.nav-item:hover{color:var(--nav-text);background:rgba(255,255,255,.03)}
-.nav-item.active{color:#f0d890;border-left-color:var(--gold);background:rgba(255,255,255,.055)}
-.nav-sep{border-top:1px solid var(--nav-border);margin:4px 0}
-.nav-bottom{margin-top:auto;padding:12px 14px;border-top:1px solid var(--nav-border);
-  font-size:10px;color:var(--nav-dim);font-family:sans-serif;line-height:1.7}
+/* ── TOPBAR ── */
+.topbar{grid-column:1/-1;grid-row:1;background:var(--paper2);
+  border-bottom:1.5px solid var(--border);display:flex;align-items:center;
+  padding:0 20px;gap:0;box-shadow:0 1px 5px var(--shadow);z-index:10}
+.topbar-logo{font-size:15px;color:var(--ink2);letter-spacing:2px;font-style:italic;
+  padding-right:22px;border-right:1px solid var(--border2);margin-right:4px;white-space:nowrap}
+.topbar-tagline{font-size:9px;color:var(--ink3);font-family:sans-serif;
+  letter-spacing:1.5px;text-transform:uppercase;margin-left:6px;margin-right:12px}
+nav{display:flex;align-items:center}
+.nav-item{padding:0 15px;height:52px;cursor:pointer;font-family:sans-serif;font-size:13px;
+  color:var(--ink3);display:flex;align-items:center;gap:7px;
+  border-bottom:2px solid transparent;transition:all .12s;white-space:nowrap}
+.nav-item:hover{color:var(--ink2)}
+.nav-item.active{color:var(--ink);border-bottom-color:var(--gold)}
+.topbar-right{margin-left:auto;display:flex;align-items:center;gap:14px}
+.topbar-date{font-size:12px;color:var(--ink3);font-family:sans-serif}
+.topbar-settings{cursor:pointer;font-size:14px;color:var(--ink3);
+  padding:4px 8px;border-radius:3px;transition:color .12s;font-family:sans-serif}
+.topbar-settings:hover{color:var(--ink)}
+#nav-api-status{font-size:10px;font-family:sans-serif;color:var(--ink3)}
 
-/* ── HEADER ── */
-header{grid-column:2;grid-row:1;background:var(--paper2);border-bottom:2px solid var(--border);
-  padding:10px 22px;display:flex;align-items:center;justify-content:space-between;
-  box-shadow:0 2px 8px var(--shadow)}
-.hdr-title{font-size:12px;color:var(--ink3);font-family:sans-serif;letter-spacing:4px;
-  text-transform:uppercase}
-.hdr-date{font-size:12px;color:var(--ink3);font-family:sans-serif}
+/* ── SIDEBAR ── */
+aside{grid-column:1;grid-row:2/4;background:var(--paper2);
+  border-right:1.5px solid var(--border);display:flex;flex-direction:column;
+  overflow-y:auto;padding:20px 16px}
+.cal-widget{padding-bottom:14px;margin-bottom:14px;border-bottom:1px solid var(--border2)}
+.cal-season{font-size:16px;color:var(--ink);margin-bottom:5px;font-family:'Georgia',serif}
+.cal-moon{font-size:12px;color:var(--ink2);font-family:sans-serif;margin-bottom:3px}
+.cal-patron{font-size:11px;color:var(--gold);font-family:sans-serif;margin-bottom:2px}
+.cal-year{font-size:10px;color:var(--ink3);font-family:sans-serif;letter-spacing:.8px;margin-bottom:4px}
+.cal-time{font-size:12px;color:var(--ink3);font-family:sans-serif}
+.cal-sun{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-top:3px}
+.cal-effect{font-size:10px;color:var(--ink3);font-family:sans-serif;font-style:italic;
+  margin-top:4px;opacity:.8;line-height:1.4}
+.aside-bottom{margin-top:auto;padding-top:12px;border-top:1px solid var(--border2)}
+.aside-bottom-link{cursor:pointer;font-size:11px;font-family:sans-serif;
+  color:var(--ink3);padding:6px 4px;transition:color .12s}
+.aside-bottom-link:hover{color:var(--gold)}
 
 /* ── MAIN ── */
 main{grid-column:2;grid-row:2;overflow:hidden;position:relative}
@@ -1031,10 +1045,7 @@ section.active{display:block}
 
 /* ── JOURNAL ── */
 #s-journal{padding:0}
-.journal-wrap{display:grid;grid-template-columns:1fr 230px;height:100%;overflow:hidden}
-.journal-main{overflow-y:auto;padding:40px 56px 60px;background:var(--paper)}
-.journal-aside{overflow-y:auto;padding:20px 16px;background:var(--paper2);
-  border-left:1px solid var(--border)}
+.journal-main{overflow-y:auto;height:100%;padding:40px 56px 60px;background:var(--paper)}
 .day-block{margin-bottom:0}
 .day-heading{font-size:11px;color:var(--red);font-family:sans-serif;letter-spacing:3px;
   text-transform:uppercase;font-weight:700;margin:44px 0 4px;
@@ -1344,46 +1355,39 @@ section.active{display:block}
 </head>
 <body>
 
-<nav>
-  <div class="nav-logo">
-    <div class="nav-game">Life RPG</div>
-    <div class="nav-tagline">живая летопись судьбы</div>
+<div class="topbar">
+  <div class="topbar-logo">Life RPG</div>
+  <div class="topbar-tagline">живая летопись</div>
+  <nav>
+    <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
+    <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
+    <div class="nav-item" data-s="pocket" onclick="nav(this)">💰 Карман</div>
+    <div class="nav-item" data-s="base" onclick="nav(this)" style="display:none">🗄️ База знаний</div>
+  </nav>
+  <div class="topbar-right">
+    <div id="nav-api-status"></div>
+    <div class="topbar-date" id="hdr-date"></div>
+    <div class="topbar-settings" onclick="openSettings()">⚙</div>
   </div>
-  <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
-  <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
-  <div class="nav-item" data-s="pocket" onclick="nav(this)">💰 Карман</div>
-  <div class="nav-item" data-s="base" onclick="nav(this)" style="display:none">🗄️ База знаний</div>
-  <div class="nav-bottom">
-    <div id="nav-api-status" style="font-size:10px;font-family:sans-serif;color:var(--nav-dim);margin-bottom:6px"></div>
-    <div style="cursor:pointer;font-size:11px;font-family:sans-serif;color:var(--nav-dim);
-      padding:4px 0" onclick="openSettings()">⚙ Настройки Архивариуса</div>
-    liferpg · v5
-  </div>
-</nav>
+</div>
 
-<header>
-  <div class="hdr-title" id="hdr-title">Дневник</div>
-  <div class="hdr-date" id="hdr-date"></div>
-</header>
+<aside id="sidebar">
+  <div class="cal-widget" id="sidebar-cal"></div>
+  <div class="aside-section">
+    <div class="aside-label">Активные пути</div>
+    <div id="aside-missions"></div>
+  </div>
+  <div class="aside-bottom">
+    <div class="aside-bottom-link" onclick="nav(document.querySelector('[data-s=base]'))">🗄️ База знаний →</div>
+  </div>
+</aside>
 
 <main>
 
   <!-- JOURNAL -->
   <section id="s-journal" class="active">
-    <div class="journal-wrap">
-      <div class="journal-main" id="journal-main">
-        <div class="empty">Дневник пуст. Напиши первую запись ↓</div>
-      </div>
-      <div class="journal-aside">
-        <div class="aside-section">
-          <div class="aside-label">Активные пути</div>
-          <div id="aside-missions"></div>
-        </div>
-        <div style="margin-top:auto;padding-top:16px;border-top:1px solid var(--border2)">
-          <div style="cursor:pointer;font-size:11px;font-family:sans-serif;color:var(--ink3);padding:6px 4px"
-            onclick="nav(document.querySelector('[data-s=base]'));this.closest('.journal-aside').querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'))">🗄️ База знаний →</div>
-        </div>
-      </div>
+    <div class="journal-main" id="journal-main">
+      <div class="empty">Дневник пуст. Напиши первую запись ↓</div>
     </div>
   </section>
 
@@ -1741,9 +1745,19 @@ const WoW = {
 function tickClock(){
   const cal=WoW.now();
   const t=new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
-  document.getElementById('hdr-date').innerHTML=
-    `<span style="color:var(--red);font-weight:700">${cal.short}</span>`+
-    `&ensp;<span style="color:var(--ink3);font-size:11px">${t}</span>`;
+  const hdrDate=document.getElementById('hdr-date');
+  if(hdrDate) hdrDate.innerHTML=
+    `<span style="color:var(--red)">${cal.phaseEmoji} ${cal.phase}</span>`+
+    `<span style="color:var(--ink3)"> · ${t}</span>`;
+  const calEl=document.getElementById('sidebar-cal');
+  if(calEl) calEl.innerHTML=
+    `<div class="cal-season">${cal.seasonEmoji} ${cal.season}</div>`+
+    `<div class="cal-moon">${cal.phaseEmoji} ${cal.phase} · ${cal.illumination}%</div>`+
+    `<div class="cal-patron">${cal.patronEmoji} ${cal.patron}</div>`+
+    `<div class="cal-year">${cal.epochYear}-й год · ${cal.epochName}</div>`+
+    `<div class="cal-time">${t}</div>`+
+    (cal.phaseEffect?`<div class="cal-effect">${cal.phaseEffect}</div>`:'')+
+    (cal.sunrise?`<div class="cal-sun">☀️ ${cal.sunrise} — ${cal.sunset}</div>`:'');
 }
 tickClock(); setInterval(tickClock,30000);
 
@@ -1755,7 +1769,6 @@ function nav(el){
   const s=el.dataset.s;
   document.querySelectorAll('section').forEach(i=>i.classList.remove('active'));
   document.getElementById('s-'+s).classList.add('active');
-  document.getElementById('hdr-title').textContent=TITLES[s]||s;
   if(s==='journal'){loadJournal();loadAsides();}
   if(s==='missions') loadMissions();
   if(s==='base') loadBase();
