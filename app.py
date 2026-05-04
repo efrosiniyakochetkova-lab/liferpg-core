@@ -535,18 +535,33 @@ def graph():
     rows=kuzu_rows(_conn.execute("MATCH (a:Entity)-[r:LINKED]->(b:Entity) RETURN a.name,r.label,b.name"))
     return [{"from":r[0],"label":r[1],"to":r[2]} for r in rows]
 
+def _sync_mission_entity(mid: str, title: str, description: str, status: str="active"):
+    """Keep Mission mirrored as Entity node of type 'mission'."""
+    eid = "mission_" + slug(title)
+    summary = description.strip() if description else title
+    if entity_exists(eid):
+        _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.summary=$s",
+                      {"id":eid,"s":summary})
+    else:
+        try:
+            _conn.execute(
+                "CREATE (:Entity {id:$id,name:$name,type:'mission',summary:$s,tags:$t})",
+                {"id":eid,"name":title,"s":summary,"t":f"mission,{status}"})
+        except: pass
+
 @app.get("/missions")
 def get_missions():
     rows=kuzu_rows(_conn.execute(
         "MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status,m.ts,m.lore ORDER BY m.ts"))
     result=[]
     for r in rows:
+        mid=r[0]
         tasks=kuzu_rows(_conn.execute(
             "MATCH (t:Task) WHERE t.mission_id=$mid "
             "RETURN t.id,t.title,t.status,t.ts,"
             "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
             "t.last_reset_ts,t.streak,t.best_streak ORDER BY t.ts",
-            {"mid":r[0]}))
+            {"mid":mid}))
         task_list=[]
         for t in tasks:
             td={"id":t[0],"title":t[1],"status":t[2],"ts":t[3],
@@ -555,17 +570,41 @@ def get_missions():
                 "last_reset_ts":t[8] or "","streak":int(t[9] or 0),"best_streak":int(t[10] or 0)}
             td=_maybe_reset_task(td)
             task_list.append(td)
-        result.append({"id":r[0],"title":r[1],"description":r[2],"status":r[3],"ts":r[4],
-                        "lore":r[5] or "","tasks":task_list})
+        # Linked entities
+        eid="mission_"+slug(r[1])
+        linked=kuzu_rows(_conn.execute(
+            "MATCH (m:Entity)-[r:LINKED]->(e:Entity) WHERE m.id=$id RETURN e.name,e.type",
+            {"id":eid}))
+        linked+= kuzu_rows(_conn.execute(
+            "MATCH (e:Entity)-[r:LINKED]->(m:Entity) WHERE m.id=$id RETURN e.name,e.type",
+            {"id":eid}))
+        entity_tags=[{"name":x[0],"type":x[1]} for x in linked]
+        result.append({"id":mid,"title":r[1],"description":r[2],"status":r[3],"ts":r[4],
+                        "lore":r[5] or "","tasks":task_list,"entities":entity_tags})
     return result
+
+class MissionDescReq(BaseModel):
+    description: str
+
+@app.patch("/missions/{mid}/description")
+def update_mission_description(mid: str, req: MissionDescReq):
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.id=$id RETURN m.title,m.status",{"id":mid}))
+    if not rows: raise HTTPException(404)
+    title,status=rows[0]
+    _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.description=$d",
+                  {"id":mid,"d":req.description})
+    _sync_mission_entity(mid,title,req.description,status)
+    return {"ok":True}
 
 @app.post("/missions")
 def add_mission(req: MissionReq):
     mid=str(uuid.uuid4())
-    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:'active',ts:$ts})",
-                  {"id":mid,"t":req.title,"d":req.description,
-                   "ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
-    return {"id":mid,"title":req.title,"status":"active","tasks":[]}
+    ts=datetime.now().strftime("%Y-%m-%d %H:%M")
+    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:'active',ts:$ts,lore:''})",
+                  {"id":mid,"t":req.title,"d":req.description,"ts":ts})
+    _sync_mission_entity(mid,req.title,req.description)
+    return {"id":mid,"title":req.title,"status":"active","tasks":[],"entities":[]}
 
 @app.post("/missions/{mid}/complete")
 def complete_mission(mid: str):
@@ -714,15 +753,26 @@ def _call_any_ai(prompt_text: str) -> str:
 
 def _run_reanalyze_bg():
     try:
+        # 1. Sync ALL missions to Entity nodes
+        all_missions=kuzu_rows(_conn.execute(
+            "MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status"))
+        for r in all_missions:
+            try: _sync_mission_entity(r[0],r[1],r[2] or "",r[3] or "active")
+            except: pass
+
         if not _has_any_ai(): return
-        miss=kuzu_rows(_conn.execute(
-            "MATCH (m:Mission) WHERE m.status='active' RETURN m.id,m.title ORDER BY m.ts"))
+
+        # 2. AI: update lore + find entity links for each mission
         entries=kuzu_rows(_conn.execute(
-            "MATCH (e:Entry) RETURN e.ts,e.narrative ORDER BY e.ts DESC LIMIT 10"))
-        miss_txt="\n".join(f"ID={r[0]}: {r[1]}" for r in miss)
-        ent_txt="\n".join(f"[{r[0]}] {r[1]}" for r in entries)
-        p=_REANALYZE_PROMPT.format(missions=miss_txt or "нет", entries=ent_txt or "нет")
-        text = _call_any_ai(p)
+            "MATCH (e:Entry) RETURN e.ts,e.narrative ORDER BY e.ts DESC LIMIT 15"))
+        entities=kuzu_rows(_conn.execute(
+            "MATCH (e:Entity) WHERE e.type<>'mission' RETURN e.name,e.type LIMIT 40"))
+        miss_txt="\n".join(f"ID={r[0]} TITLE={r[1]} DESC={r[2] or ''}" for r in all_missions)
+        ent_txt="\n".join(f"- {r[0]} ({r[1]})" for r in entities)
+        entry_txt="\n".join(f"[{r[0]}] {r[1]}" for r in entries)
+
+        p=_REANALYZE_PROMPT.format(missions=miss_txt or "нет", entries=entry_txt or "нет")
+        text=_call_any_ai(p)
         m=re.search(r'\{.*\}',text,re.DOTALL)
         if m:
             data=json.loads(m.group())
@@ -732,6 +782,39 @@ def _run_reanalyze_bg():
                     try: _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.lore=$l",
                                        {"id":item["id"],"l":lore})
                     except: pass
+
+        # 3. AI: find connections between entities and missions
+        if entities and all_missions:
+            p2=f"""Ты — Архивариус. Найди связи между сущностями и Путями Героя.
+
+Пути:
+{miss_txt}
+
+Известные сущности:
+{ent_txt}
+
+Записи:
+{entry_txt}
+
+Верни ТОЛЬКО JSON: {{"links": [{{"mission_title":"название пути","entity_name":"имя сущности","label":"тип связи (1-2 слова)"}}]}}
+Только явные связи из записей. Максимум 15."""
+            t2=_call_any_ai(p2)
+            m2=re.search(r'\{.*\}',t2,re.DOTALL)
+            if m2:
+                links=json.loads(m2.group()).get("links",[])
+                for lnk in links:
+                    mtitle=lnk.get("mission_title",""); ename=lnk.get("entity_name","")
+                    label=lnk.get("label","связан с")
+                    if not mtitle or not ename: continue
+                    meid="mission_"+slug(mtitle)
+                    eeid=slug(ename)
+                    if entity_exists(meid) and entity_exists(eeid):
+                        try:
+                            _conn.execute(
+                                "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                                "CREATE (a)-[:LINKED{label:$l,entry_id:'reanalyze'}]->(b)",
+                                {"f":meid,"t":eeid,"l":label})
+                        except: pass
     except Exception as e: print(f"[reanalyze_bg] {e}")
     finally:
         try:
@@ -1554,6 +1637,24 @@ section.active{display:block}
 .antag-desc{font-size:13px;color:var(--ink2);font-family:sans-serif;
   line-height:1.65;font-style:italic}
 .antag-hint{font-size:10px;font-family:sans-serif;color:var(--ink3);margin-top:10px}
+/* ── MISSION ENTITIES (tags on path card) ── */
+.mission-entities{display:flex;flex-wrap:wrap;gap:5px;margin:10px 0 0 28px}
+.mission-ent-tag{font-size:10px;font-family:sans-serif;padding:2px 9px;border-radius:10px;
+  background:rgba(139,105,20,.08);color:var(--gold);border:1px solid rgba(139,105,20,.2);
+  cursor:pointer;transition:background .12s}
+.mission-ent-tag:hover{background:rgba(139,105,20,.18)}
+/* ── MISSION DESCRIPTION ── */
+.mission-desc-view{margin:6px 0 0 28px;font-size:12.5px;color:var(--ink2);
+  font-family:'Georgia',serif;line-height:1.5;cursor:pointer;padding:4px 8px;
+  border-radius:3px;transition:background .12s}
+.mission-desc-view:hover{background:rgba(139,105,20,.06)}
+.mission-desc-empty{color:var(--ink3);font-style:italic}
+.mission-desc-edit{margin:6px 0 0 28px;width:calc(100% - 28px);box-sizing:border-box}
+.mission-desc-edit textarea{width:100%;box-sizing:border-box;background:var(--paper2);
+  border:1px solid var(--border);color:var(--ink);font-family:'Georgia',serif;
+  font-size:13px;padding:8px 11px;border-radius:3px;outline:none;
+  resize:none;display:block}
+.mission-desc-edit textarea:focus{border-color:var(--gold)}
 /* ── EPILOGUE ── */
 .mission-epilogue{margin:14px 0 0 28px;padding:12px 14px;
   background:rgba(139,105,20,.05);border-left:2px solid rgba(139,105,20,.35);
@@ -2523,6 +2624,10 @@ async function loadMissions(){
     const repeatBadge=repeatTotal?`${repeatTotal} повтор.`:'';
     const badge=[badgeText,repeatBadge].filter(Boolean).join(' · ');
 
+    const entTags=(m.entities||[]).map(e=>`<span class="mission-ent-tag" onclick="oracleClick('entity','${e.id}','${(e.name||'').replace(/'/g,"\\'")}');event.stopPropagation()" title="${e.summary||''}">${e.name}</span>`).join('');
+    const descHtml=m.description?`<div class="mission-desc-view" id="mdesc-view-${m.id}" onclick="editMissionDesc('${m.id}')" title="Нажми чтобы изменить описание">${m.description}</div>`
+      :`<div class="mission-desc-view mission-desc-empty" id="mdesc-view-${m.id}" onclick="editMissionDesc('${m.id}')" title="Добавить описание">+ добавить описание пути...</div>`;
+
     return `
     <div class="mission-block ${m.status==='done'?'done':''}">
       <div class="mission-block-hdr" onclick="toggleMission('${m.id}')">
@@ -2531,8 +2636,17 @@ async function loadMissions(){
           <div class="mission-block-title" id="mtitle-${m.id}">${m.title}</div>
           ${badge?`<div class="mission-progress-badge">${badge}</div>`:''}
         </div>
-        <button class="btn-edit-inline" onclick="editMission('${m.id}');event.stopPropagation()" title="Редактировать">✎</button>
+        <button class="btn-edit-inline" onclick="editMission('${m.id}');event.stopPropagation()" title="Переименовать">✎</button>
         <div class="mission-block-chevron ${wasOpen?'open':''}" id="chev-${m.id}">▾</div>
+      </div>
+      ${entTags?`<div class="mission-entities">${entTags}</div>`:''}
+      ${descHtml}
+      <div class="mission-desc-edit" id="mdesc-edit-${m.id}" style="display:none">
+        <textarea id="mdesc-ta-${m.id}" rows="3" placeholder="Описание пути — что это значит для Героя, зачем он идёт...">${m.description||''}</textarea>
+        <div style="display:flex;gap:6px;margin-top:5px">
+          <button class="btn-sm btn-ok" onclick="saveMissionDesc('${m.id}')">Сохранить</button>
+          <button class="btn-sm" onclick="cancelMissionDesc('${m.id}')">Отмена</button>
+        </div>
       </div>
       ${m.lore?`<div class="mission-lore">${m.lore}</div>`:''}
       <div class="quest-chain ${wasOpen?'open':''}" id="qchain-${m.id}">
@@ -2555,6 +2669,21 @@ async function loadMissions(){
   });
 }
 
+function editMissionDesc(mid){
+  document.getElementById('mdesc-view-'+mid).style.display='none';
+  const ed=document.getElementById('mdesc-edit-'+mid);
+  ed.style.display='block';
+  setTimeout(()=>document.getElementById('mdesc-ta-'+mid).focus(),30);
+}
+function cancelMissionDesc(mid){
+  document.getElementById('mdesc-edit-'+mid).style.display='none';
+  document.getElementById('mdesc-view-'+mid).style.display='';
+}
+async function saveMissionDesc(mid){
+  const val=document.getElementById('mdesc-ta-'+mid).value.trim();
+  await fetch(`/missions/${mid}/description`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({description:val})});
+  loadMissions();
+}
 async function saveMission(){
   const t=document.getElementById('m-title').value.trim();
   const d=document.getElementById('m-desc').value.trim();
@@ -2723,7 +2852,31 @@ async function loadBase(){
     <div class="antag-desc">${charData.antagonist_desc}</div>
     <div class="antag-hint">Архивариус выявил это из твоих записей · ${charData.last_analyzed||''}</div>
   </div>`:'';
-  el.innerHTML=antagonistHtml+(html||'<div class="empty">База пуста. Записи в журнале породят сущности здесь.</div>')+loadMechanics();
+
+  // Separate Пути section — mission entities
+  const missionR=await fetch('/missions'); const missions=await missionR.json();
+  const missionCards=missions.map(m=>{
+    const clr='var(--red)';
+    const entTags=(m.entities||[]).map(e=>`<span class="bcard-rel" style="cursor:default">${e.name}</span>`).join('');
+    const statusBadge=m.status==='done'?'<span style="font-size:9px;font-family:sans-serif;color:var(--ink3);margin-left:6px">завершён</span>':'';
+    return `<div class="bcard" onclick="">
+      <div class="bcard-stripe" style="background:${clr}"></div>
+      <div class="bcard-name">${m.title}${statusBadge}</div>
+      <div class="bcard-type" style="color:${clr}">⚔ Путь</div>
+      <div class="bcard-summary">${m.description||m.lore||'Описание не задано'}</div>
+      ${entTags?`<div class="bcard-rels">${entTags}</div>`:''}
+      <div class="bcard-footer">${m.tasks.length} заданий · нажми на Путях чтобы редактировать</div>
+    </div>`;
+  }).join('');
+  const pathsSection=missions.length?`<div class="base-section">
+    <div class="base-sec-hdr">
+      <div class="base-sec-title" style="color:var(--red)">⚔ Пути Героя</div>
+      <div class="base-sec-count">${missions.length} путей</div>
+    </div>
+    <div class="base-grid">${missionCards}</div>
+  </div>`:'';
+
+  el.innerHTML=antagonistHtml+pathsSection+(html||'<div class="empty">База пуста. Записи в журнале породят сущности здесь.</div>')+loadMechanics();
 }
 
 // ── Переосмыслить ────────────────────────────────────────────────────────────
