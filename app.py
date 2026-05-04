@@ -1564,6 +1564,7 @@ HTML = r"""<!DOCTYPE html>
 <title>Life RPG</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
+html{height:100%;-webkit-text-size-adjust:100%}
 :root{
   --page:#f0e9dc; --paper:#fdf8f0; --paper2:#e8ddd0;
   --ink:#2c2318; --ink2:#5a3e28; --ink3:#8a6a4a;
@@ -1571,8 +1572,8 @@ HTML = r"""<!DOCTYPE html>
   --border:#c8b89a; --border2:#ddd0b8; --shadow:rgba(44,35,24,.10);
 }
 body{background:var(--page);color:var(--ink);font-family:'Georgia',serif;
-  display:grid;grid-template-columns:240px 1fr;grid-template-rows:52px 1fr auto;
-  height:100vh;overflow:hidden}
+  display:grid;grid-template-columns:240px minmax(0,1fr);grid-template-rows:52px minmax(0,1fr) auto;
+  width:100%;height:100vh;height:100dvh;overflow:hidden}
 
 /* ── TOPBAR ── */
 .topbar{grid-column:1/-1;grid-row:1;background:var(--paper2);
@@ -1582,13 +1583,13 @@ body{background:var(--page);color:var(--ink);font-family:'Georgia',serif;
   padding-right:22px;border-right:1px solid var(--border2);margin-right:4px;white-space:nowrap}
 .topbar-tagline{font-size:9px;color:var(--ink3);font-family:sans-serif;
   letter-spacing:1.5px;text-transform:uppercase;margin-left:6px;margin-right:12px}
-nav{display:flex;align-items:center}
+nav{display:flex;align-items:center;min-width:0}
 .nav-item{padding:0 15px;height:52px;cursor:pointer;font-family:sans-serif;font-size:13px;
   color:var(--ink3);display:flex;align-items:center;gap:7px;
   border-bottom:2px solid transparent;transition:all .12s;white-space:nowrap}
 .nav-item:hover{color:var(--ink2)}
 .nav-item.active{color:var(--ink);border-bottom-color:var(--gold)}
-.topbar-right{margin-left:auto;display:flex;align-items:center;gap:14px}
+.topbar-right{margin-left:auto;display:flex;align-items:center;gap:14px;min-width:0}
 .topbar-date{font-size:12px;color:var(--ink3);font-family:sans-serif}
 .topbar-settings{cursor:pointer;font-size:14px;color:var(--ink3);
   padding:4px 8px;border-radius:3px;transition:color .12s;font-family:sans-serif}
@@ -1614,8 +1615,8 @@ aside{grid-column:1;grid-row:2/4;background:var(--paper2);
 .aside-bottom-link:hover{color:var(--gold)}
 
 /* ── MAIN ── */
-main{grid-column:2;grid-row:2;overflow:hidden;position:relative}
-section{display:none;height:100%;overflow-y:auto}
+main{grid-column:2;grid-row:2;overflow:hidden;position:relative;min-width:0;min-height:0}
+section{display:none;height:100%;overflow-y:auto;min-width:0}
 section.active{display:block}
 
 /* ── INPUT BAR ── */
@@ -2078,11 +2079,295 @@ section.active{display:block}
   font-family:sans-serif;font-size:12px;color:var(--green);
   background:rgba(45,92,20,.08);border:1px solid rgba(45,92,20,.2);
   border-radius:10px;padding:2px 10px;margin-left:10px}
+
+/* ── RESPONSIVE LAYOUT ── */
+@media (max-width: 920px){
+  body{
+    grid-template-columns:minmax(0,1fr);
+    grid-template-rows:auto auto minmax(0,1fr) auto;
+  }
+  .topbar{
+    grid-row:1;padding:8px 12px;min-height:0;height:auto;gap:8px 10px;
+    align-items:center;flex-wrap:wrap;
+  }
+  .topbar-logo{padding-right:12px;margin-right:0}
+  .topbar-tagline{margin:0;font-size:8px}
+  nav{
+    order:3;width:100%;overflow-x:auto;overflow-y:hidden;
+    -webkit-overflow-scrolling:touch;scrollbar-width:none;
+  }
+  nav::-webkit-scrollbar{display:none}
+  .nav-item[data-s="base"]{display:flex!important}
+  .nav-item{height:38px;padding:0 12px;font-size:12px;flex:0 0 auto}
+  .topbar-right{gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  .topbar-date{font-size:11px}
+  #nav-api-status{font-size:9px}
+  aside{
+    grid-column:1;grid-row:2;border-right:none;border-bottom:1.5px solid var(--border);
+    padding:10px 12px;display:flex;flex-direction:row;gap:12px;
+    overflow-x:auto;overflow-y:hidden;max-height:178px;
+    -webkit-overflow-scrolling:touch;
+  }
+  aside > *{flex:0 0 210px;max-height:154px;overflow-y:auto}
+  .cal-widget{padding-bottom:0;margin-bottom:0;border-bottom:none}
+  .aside-section,.char-section,.aside-bottom{
+    margin:0;padding:0;border:1px solid var(--border2);background:rgba(253,248,240,.45);
+    border-radius:4px;padding:10px;
+  }
+  .aside-bottom{flex:0 0 150px;display:flex;align-items:center}
+  .stat-name{width:74px}
+  main{grid-column:1;grid-row:3}
+  #input-bar{
+    grid-column:1;grid-row:4;padding:10px 12px calc(10px + env(safe-area-inset-bottom));
+    gap:10px;align-items:stretch;
+  }
+  #txt{height:52px;min-height:52px;font-size:16px;padding:9px 12px}
+  #send-btn{height:52px;padding:0 18px}
+  .journal-main{padding:28px 22px 44px}
+  .entry-text{text-align:left;line-height:1.8}
+  .missions-wrap{max-width:none;padding:30px 22px 56px}
+  .missions-sub{margin-bottom:24px}
+  .base-wrap,#s-pocket{padding:28px 22px 48px}
+  .base-topbar{gap:12px;align-items:flex-start}
+  .base-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr))}
+  .mech-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,210px),1fr))}
+  .pocket-cards{grid-template-columns:repeat(2,minmax(0,1fr));max-width:none}
+  .pocket-form,.pocket-tx-list{max-width:none}
+  .btn-edit-inline{opacity:1}
+  .dlg,#ent-modal,#settings-modal,#oracle-modal{padding:12px;align-items:center}
+  .dlg-box,#settings-box,#ent-box,#oracle-box{
+    width:100%;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);
+    overflow-y:auto;padding:22px;
+  }
+  #reanalyze-modal{padding:12px;align-items:center}
+  #reanalyze-box{width:100%;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px)}
+}
+
+@media (max-width: 560px){
+  .topbar{padding:7px 10px}
+  .topbar-logo{font-size:14px;letter-spacing:1.5px}
+  .topbar-tagline{display:none}
+  .sound-btn{padding:3px 8px;font-size:10px}
+  .topbar-settings{padding:4px 6px}
+  aside{max-height:150px;padding:8px 10px;gap:10px}
+  aside > *{flex-basis:190px;max-height:130px}
+  .cal-season{font-size:14px}
+  .journal-main{padding:22px 16px 36px}
+  .day-heading{letter-spacing:2px;gap:8px;align-items:flex-start;flex-wrap:wrap}
+  .day-heading::after{min-width:80px}
+  .daily-done-badge{margin-left:0;font-size:11px}
+  .missions-wrap,.base-wrap,#s-pocket{padding:22px 16px 40px}
+  .missions-topbar,.base-topbar{align-items:stretch;flex-direction:column}
+  .base-topbar-right,.mission-actions,.dlg-btns,.pocket-form-row{
+    width:100%;justify-content:flex-start;flex-wrap:wrap;
+  }
+  .btn-add,.btn-reanalyze,.btn-add-entity,.btn-primary,.btn-cancel,.pocket-btn{
+    min-height:38px;
+  }
+  .quest-chain{margin-left:10px;padding-left:10px}
+  .mission-desc-view,.mission-desc-edit,.mission-entities,.mission-epilogue,.mission-actions{margin-left:0}
+  .mission-block-title{font-size:17px}
+  .quest-item{gap:8px}
+  .repeat-progress{gap:6px}
+  .pocket-cards{grid-template-columns:1fr;gap:12px;margin-bottom:24px}
+  .pocket-card{padding:16px 18px}
+  .pocket-card-amount{font-size:24px;letter-spacing:0}
+  .pocket-reserve-row{align-items:flex-start;flex-wrap:wrap}
+  .pocket-actions{gap:9px;margin-bottom:24px}
+  .pocket-btn{padding:8px 14px}
+  .pocket-tx-item{gap:8px}
+  .pocket-tx-amount{margin-left:0}
+  .bcard{padding:16px 16px 13px 20px}
+  .mcard.current::after{position:static;display:inline-block;margin-top:8px}
+  #settings-box .pocket-btn{width:100%;margin-bottom:8px}
+}
+
+@media (max-width: 420px){
+  .topbar-right{width:100%;justify-content:space-between}
+  #txt{height:54px;min-height:54px}
+  #send-btn{height:54px;padding:0 14px}
+  .entry-text{font-size:14.5px;line-height:1.75}
+  .entry-raw{padding-left:10px}
+  .mission-block-hdr{gap:8px}
+  .quest-item.repeat-task{padding-left:8px}
+  .iter-btn{padding:3px 10px}
+  .dlg-box,#settings-box,#ent-box,#oracle-box{padding:18px}
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MOBILE APP LAYOUT  ≤ 768px
+   ══════════════════════════════════════════════════════════════ */
+
+/* hamburger + bottom-nav hidden by default (desktop) */
+#mob-hamburger{ display:none; }
+#bottom-nav{ display:none; }
+#drawer-backdrop{ display:none; }
+
+@media (max-width: 768px){
+
+  /* ── Grid: topbar + content + bottom nav ── */
+  body{
+    grid-template-columns: 1fr;
+    grid-template-rows: 52px minmax(0,1fr) calc(56px + env(safe-area-inset-bottom));
+    height: 100dvh;
+    overflow: hidden;
+  }
+
+  /* ── Topbar: compact, no nav tabs ── */
+  .topbar{
+    grid-row:1; grid-column:1;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:0 14px; height:52px; flex-wrap:nowrap; gap:0;
+    border-bottom:1px solid var(--border);
+  }
+  .topbar > nav{ display:none !important; }
+  .topbar-logo{ font-size:15px; letter-spacing:2px; padding-right:0; margin-right:0; }
+  .topbar-tagline{ display:none; }
+  .topbar-right{ gap:6px; flex-wrap:nowrap; }
+  .topbar-date{ display:none; }
+  #nav-api-status{ display:none; }
+  .sound-btn{ padding:3px 8px; font-size:10px; }
+  .topbar-settings{ padding:5px 7px; font-size:15px; }
+
+  /* hamburger button visible on mobile */
+  #mob-hamburger{
+    display:flex; align-items:center; justify-content:center;
+    width:36px; height:36px; cursor:pointer; font-size:20px;
+    border-radius:6px; transition:background .15s; user-select:none;
+    -webkit-tap-highlight-color:transparent;
+  }
+  #mob-hamburger:active{ background:rgba(0,0,0,.08); }
+
+  /* ── Sidebar → slide-in drawer ── */
+  aside{
+    position:fixed; top:0; left:0; bottom:0;
+    width:82vw; max-width:320px;
+    display:flex !important; flex-direction:column !important;
+    overflow-y:auto; overflow-x:hidden;
+    max-height:100dvh; height:100dvh;
+    z-index:1200; transform:translateX(-105%);
+    transition:transform .28s cubic-bezier(.4,0,.2,1);
+    border-right:1.5px solid var(--border); border-bottom:none;
+    background:var(--bg); padding:72px 18px 32px;
+    gap:18px; box-shadow: 4px 0 24px rgba(0,0,0,.18);
+    grid-row:unset; grid-column:unset;
+  }
+  aside > *{ flex:0 0 auto; max-height:none; }
+  aside.drawer-open{ transform:translateX(0); }
+  .cal-widget{ padding-bottom:0; margin-bottom:0; border-bottom:none; }
+  .aside-section,.char-section,.aside-bottom{
+    margin:0; border:1px solid var(--border2); background:rgba(253,248,240,.45);
+    border-radius:6px; padding:12px;
+  }
+  .aside-bottom{ display:flex; align-items:center; }
+
+  /* drawer backdrop */
+  #drawer-backdrop{
+    display:block; position:fixed; inset:0; z-index:1100;
+    background:rgba(0,0,0,.38); backdrop-filter:blur(1px);
+    opacity:0; pointer-events:none;
+    transition:opacity .25s;
+  }
+  #drawer-backdrop.visible{ opacity:1; pointer-events:auto; }
+
+  /* ── Main scrollable area ── */
+  main{
+    grid-row:2; grid-column:1;
+    overflow-y:auto; -webkit-overflow-scrolling:touch;
+  }
+
+  /* ── Input bar: fixed above bottom nav ── */
+  #input-bar{
+    position:fixed;
+    bottom:calc(56px + env(safe-area-inset-bottom));
+    left:0; right:0;
+    padding:8px 14px;
+    gap:10px; align-items:stretch;
+    z-index:80;
+    display:none; /* shown only on journal tab */
+  }
+  #input-bar.mob-visible{ display:flex; }
+  #txt{ height:48px; min-height:48px; font-size:16px; padding:9px 12px; }
+  #send-btn{ height:48px; padding:0 18px; white-space:nowrap; }
+
+  /* ── Bottom navigation bar ── */
+  #bottom-nav{
+    display:flex;
+    position:fixed; bottom:0; left:0; right:0;
+    height:calc(56px + env(safe-area-inset-bottom));
+    padding-bottom:env(safe-area-inset-bottom);
+    background:var(--bg);
+    border-top:1.5px solid var(--border);
+    z-index:900;
+    align-items:stretch;
+    box-shadow:0 -2px 12px rgba(0,0,0,.10);
+  }
+  .bnav-item{
+    flex:1; display:flex; flex-direction:column;
+    align-items:center; justify-content:center;
+    gap:3px; cursor:pointer;
+    font-size:9px; letter-spacing:.5px; text-transform:uppercase;
+    color:var(--muted); transition:color .15s;
+    -webkit-tap-highlight-color:transparent;
+    padding:6px 4px 4px;
+  }
+  .bnav-item .bnav-icon{ font-size:22px; line-height:1; }
+  .bnav-item.active{ color:var(--accent); }
+  .bnav-item:active{ opacity:.6; }
+
+  /* ── Content padding: bottom = bottom-nav + input-bar height ── */
+  .journal-main{ padding:18px 16px 176px; }
+  .missions-wrap,.base-wrap,#s-pocket{ padding:18px 16px 80px; }
+  .missions-sub{ margin-bottom:20px; }
+
+  /* ── Cards ── */
+  .base-grid{ grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr)); }
+  .mech-grid{ grid-template-columns:repeat(auto-fill,minmax(min(100%,210px),1fr)); }
+  .pocket-cards{ grid-template-columns:1fr; max-width:none; gap:12px; margin-bottom:20px; }
+  .pocket-form,.pocket-tx-list{ max-width:none; }
+
+  /* ── Full-screen sheet modals ── */
+  .dlg,#ent-modal,#settings-modal,#oracle-modal,#reanalyze-modal{
+    padding:0; align-items:flex-end;
+  }
+  .dlg-box,#settings-box,#ent-box,#oracle-box{
+    width:100%; max-width:100%; border-radius:18px 18px 0 0;
+    max-height:90dvh; overflow-y:auto; padding:24px 20px;
+  }
+  #reanalyze-box{
+    width:100%; max-width:100%; border-radius:18px 18px 0 0;
+    max-height:90dvh;
+  }
+
+  /* ── Touch targets ── */
+  .btn-add,.btn-reanalyze,.btn-add-entity,.btn-primary,.btn-cancel,.pocket-btn{ min-height:44px; }
+  .quest-item{ min-height:44px; }
+
+  /* ── Topbar actions ── */
+  .missions-topbar,.base-topbar{ align-items:stretch; flex-direction:column; }
+  .base-topbar-right,.mission-actions,.dlg-btns,.pocket-form-row{
+    width:100%; justify-content:flex-start; flex-wrap:wrap;
+  }
+
+  /* ── Misc ── */
+  .btn-edit-inline{ opacity:1; }
+  .bcard{ padding:16px 16px 13px 20px; }
+  .mcard.current::after{ position:static; display:inline-block; margin-top:8px; }
+  #settings-box .pocket-btn{ width:100%; margin-bottom:8px; }
+  .entry-text{ text-align:left; line-height:1.8; }
+  .mission-block-title{ font-size:17px; }
+  .quest-chain{ margin-left:10px; padding-left:10px; }
+  .mission-desc-view,.mission-desc-edit,.mission-entities,.mission-epilogue,.mission-actions{ margin-left:0; }
+  .pocket-card{ padding:16px 18px; }
+  .pocket-card-amount{ font-size:24px; letter-spacing:0; }
+}
+
 </style>
 </head>
 <body>
 
 <div class="topbar">
+  <div id="mob-hamburger" onclick="toggleDrawer()">☰</div>
   <div class="topbar-logo">Life RPG</div>
   <div class="topbar-tagline">живая летопись</div>
   <nav>
@@ -2100,6 +2385,9 @@ section.active{display:block}
   </div>
 </div>
 
+<!-- Mobile drawer backdrop -->
+<div id="drawer-backdrop" onclick="closeDrawer()"></div>
+
 <aside id="sidebar">
   <div class="cal-widget" id="sidebar-cal"></div>
   <div class="aside-section">
@@ -2108,9 +2396,25 @@ section.active{display:block}
   </div>
   <div class="char-section" id="char-sidebar"></div>
   <div class="aside-bottom">
-    <div class="aside-bottom-link" onclick="nav(document.querySelector('[data-s=base]'))">🗄️ База знаний →</div>
+    <div class="aside-bottom-link" onclick="nav(document.querySelector('[data-s=base]'));closeDrawer()">🗄️ База знаний →</div>
   </div>
 </aside>
+
+<!-- Bottom navigation (mobile only) -->
+<nav id="bottom-nav">
+  <div class="bnav-item active" data-s="journal" onclick="navMob(this)">
+    <span class="bnav-icon">🗺️</span><span>Дневник</span>
+  </div>
+  <div class="bnav-item" data-s="missions" onclick="navMob(this)">
+    <span class="bnav-icon">⚔️</span><span>Пути</span>
+  </div>
+  <div class="bnav-item" data-s="pocket" onclick="navMob(this)">
+    <span class="bnav-icon">💰</span><span>Карман</span>
+  </div>
+  <div class="bnav-item" data-s="base" onclick="navMob(this)">
+    <span class="bnav-icon">🗄️</span><span>База</span>
+  </div>
+</nav>
 
 <main>
 
@@ -2878,10 +3182,44 @@ function nav(el){
   const s=el.dataset.s;
   document.querySelectorAll('section').forEach(i=>i.classList.remove('active'));
   document.getElementById('s-'+s).classList.add('active');
+  // sync bottom nav
+  document.querySelectorAll('.bnav-item').forEach(i=>{
+    i.classList.toggle('active', i.dataset.s===s);
+  });
+  // input bar: only on journal (mobile)
+  const _ib=document.getElementById('input-bar');
+  if(window.innerWidth<=768) _ib.classList.toggle('mob-visible', s==='journal');
   if(s==='journal'){loadJournal();loadAsides();}
   if(s==='missions') loadMissions();
   if(s==='base') loadBase();
   if(s==='pocket') loadPocket();
+}
+
+function navMob(el){
+  // Navigate via bottom nav; sync topbar nav-item
+  const s=el.dataset.s;
+  const topEl=document.querySelector(`.nav-item[data-s="${s}"]`);
+  if(topEl) nav(topEl); else{
+    document.querySelectorAll('.bnav-item').forEach(i=>i.classList.remove('active'));
+    el.classList.add('active');
+    document.querySelectorAll('section').forEach(i=>i.classList.remove('active'));
+    document.getElementById('s-'+s).classList.add('active');
+    if(s==='journal'){loadJournal();loadAsides();}
+    if(s==='missions') loadMissions();
+    if(s==='base') loadBase();
+    if(s==='pocket') loadPocket();
+  }
+}
+
+function toggleDrawer(){
+  const aside=document.getElementById('sidebar');
+  const bd=document.getElementById('drawer-backdrop');
+  const open=aside.classList.toggle('drawer-open');
+  bd.classList.toggle('visible',open);
+}
+function closeDrawer(){
+  document.getElementById('sidebar').classList.remove('drawer-open');
+  document.getElementById('drawer-backdrop').classList.remove('visible');
 }
 
 // ── Linkify ──────────────────────────────────────────────────────────────────
@@ -3889,6 +4227,12 @@ checkApiStatus();
 authInit().then(()=>{
   if(localStorage.getItem('lrpg_token')) loadJournal(),loadAsides(),loadCharacter();
 });
+// Mobile: show input bar on journal tab by default
+(function(){
+  if(window.innerWidth<=768){
+    document.getElementById('input-bar').classList.add('mob-visible');
+  }
+})();
 // Auto-analyze character if never done or >7 days ago
 fetch('/character/data').then(r=>r.json()).then(d=>{
   const last=d.last_analyzed;
