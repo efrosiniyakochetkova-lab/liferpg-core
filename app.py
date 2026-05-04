@@ -747,6 +747,19 @@ def delete_entity(eid: str):
     except: pass
     return {"deleted":es}
 
+class MergeEntityReq(BaseModel):
+    keep_name: str
+    drop_name: str
+
+@app.post("/entities/merge")
+def merge_entities(req: MergeEntityReq):
+    kid=slug(req.keep_name); did=slug(req.drop_name)
+    if not entity_exists(kid): raise HTTPException(404, f"keep not found: {req.keep_name}")
+    if not entity_exists(did): raise HTTPException(404, f"drop not found: {req.drop_name}")
+    if kid==did: raise HTTPException(400, "same entity")
+    _merge_entity(kid, did)
+    return {"ok":True,"kept":req.keep_name,"removed":req.drop_name}
+
 class MissionUpdateReq(BaseModel): title: str = ""; description: str = ""
 class TaskUpdateReq(BaseModel): title: str = ""
 
@@ -859,9 +872,15 @@ def _run_reanalyze_bg():
                                 print(f"[dedup] merging '{dname}' → '{kname}'")
                                 _merge_entity(kid,did)
                             elif kname and dname and not entity_exists(kid) and entity_exists(did):
-                                # keep_name is the better name — rename drop to keep
-                                _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.name=$n, e.id=$kid",
-                                              {"id":did,"n":kname,"kid":kid})
+                                # keep_name doesn't exist yet — create it, merge drop into it
+                                row=kuzu_rows(_conn.execute(
+                                    "MATCH (e:Entity) WHERE e.id=$id RETURN e.type,e.summary,e.tags",{"id":did}))
+                                t2,s2,tg2=row[0] if row else ("concept","","[]")
+                                try: _conn.execute(
+                                    "CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg})",
+                                    {"id":kid,"n":kname,"t":t2,"s":s2,"tg":tg2 or "[]"})
+                                except: pass
+                                _merge_entity(kid,did)
                                 print(f"[dedup] renamed '{dname}' → '{kname}'")
                         for rt in parsed.get("retypes",[]):
                             eid=slug(rt.get("name",""))
@@ -1525,6 +1544,13 @@ section.active{display:block}
   margin-bottom:28px;padding-bottom:16px;border-bottom:2px solid var(--border)}
 .base-heading{font-size:21px;color:var(--ink)}
 .base-topbar-right{display:flex;gap:10px;align-items:center}
+.ent-merge-btn{background:none;border:1px solid var(--border2);color:var(--ink3);
+  font-family:'Georgia',serif;font-size:12px;padding:5px 12px;border-radius:3px;cursor:pointer;transition:all .12s}
+.ent-merge-btn:hover{border-color:var(--blue);color:var(--blue)}
+.merge-suggest{font-size:11px;font-family:sans-serif;padding:2px 9px;border-radius:10px;
+  background:rgba(26,74,107,.08);color:var(--blue);border:1px solid rgba(26,74,107,.2);
+  cursor:pointer;transition:background .12s}
+.merge-suggest:hover{background:rgba(26,74,107,.18)}
 .btn-add-entity{background:none;border:1px dashed var(--border2);color:var(--ink3);
   font-family:'Georgia',serif;font-size:12px;padding:4px 12px;border-radius:3px;cursor:pointer;transition:all .12s}
 .btn-add-entity:hover{border-color:var(--gold);color:var(--gold)}
@@ -2045,6 +2071,19 @@ section.active{display:block}
 
 
 <!-- Dialogs -->
+<div class="dlg" id="merge-dlg">
+  <div class="dlg-box">
+    <div class="dlg-title">Объединить сущности</div>
+    <div style="font-size:12px;color:var(--ink3);font-family:sans-serif;margin-bottom:10px">Оставшаяся сущность поглотит все связи удалённой</div>
+    <div style="font-size:13px;color:var(--ink2);margin-bottom:6px">Оставить: <strong id="merge-keep-label"></strong></div>
+    <input class="dlg-input" id="merge-drop-input" placeholder="Удалить и влить в неё: введи имя сущности">
+    <div id="merge-suggestions" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
+    <div class="dlg-btns" style="margin-top:12px">
+      <button class="btn-sm btn-ok" onclick="doMerge()">Объединить</button>
+      <button class="btn-sm" onclick="closeDlg('merge-dlg')">Отмена</button>
+    </div>
+  </div>
+</div>
 <div class="dlg" id="entity-dlg">
   <div class="dlg-box">
     <div class="dlg-title" id="entity-dlg-title">Новая сущность</div>
@@ -3122,10 +3161,36 @@ async function openEnt(name){
     <div class="ent-sec">← Упоминается</div>${inp}
     <div class="ent-sec">Из дневника</div>
     ${ments||'<div style="color:var(--ink3);font-size:12px;font-family:sans-serif">нет записей</div>'}
-    <button class="ent-del" onclick="deleteEntity('${e.name.replace(/'/g,"\\'")}')">× Удалить из базы</button>`;
+    <div style="display:flex;gap:8px;margin-top:18px">
+      <button class="ent-merge-btn" onclick="openMergeDlg('${e.name.replace(/'/g,"\\'")}')">⇔ Объединить с...</button>
+      <button class="ent-del" onclick="deleteEntity('${e.name.replace(/'/g,"\\'")}')">× Удалить</button>
+    </div>`;
   document.getElementById('ent-modal').classList.add('open');
 }
 function closeEnt(){document.getElementById('ent-modal').classList.remove('open');}
+
+function openMergeDlg(keepName){
+  document.getElementById('merge-keep-label').textContent=keepName;
+  document.getElementById('merge-drop-input').value='';
+  // Show other entities as clickable suggestions
+  const suggs=document.getElementById('merge-suggestions');
+  suggs.innerHTML=(allEntities||[])
+    .filter(e=>e.name!==keepName)
+    .map(e=>`<span class="merge-suggest" onclick="document.getElementById('merge-drop-input').value='${e.name.replace(/'/g,"\\'")}';">${e.name}</span>`)
+    .join('');
+  openDlg('merge-dlg');
+}
+async function doMerge(){
+  const keepName=document.getElementById('merge-keep-label').textContent;
+  const dropName=document.getElementById('merge-drop-input').value.trim();
+  if(!dropName){alert('Укажи что удалить'); return;}
+  const r=await fetch('/entities/merge',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({keep_name:keepName,drop_name:dropName})});
+  if(!r.ok){const d=await r.json(); alert(d.detail||'Ошибка'); return;}
+  closeDlg('merge-dlg'); closeEnt(); loadBase();
+  if(document.querySelector('#s-missions.active')) loadMissions();
+}
 async function deleteEntity(name){
   if(!confirm(`Удалить "${name}" из базы знаний?`)) return;
   const id=name.toLowerCase().replace(/[\s\-]+/g,'_').replace(/[^a-z0-9а-яё_]/g,'');
