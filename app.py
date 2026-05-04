@@ -2255,7 +2255,7 @@ section.active{display:block}
   aside.drawer-open{ transform:translateX(0); }
   .cal-widget{ padding-bottom:0; margin-bottom:0; border-bottom:none; }
   .aside-section,.char-section,.aside-bottom{
-    margin:0; border:1px solid var(--border2); background:rgba(253,248,240,.45);
+    margin:0; border:1px solid var(--border2); background:var(--paper);
     border-radius:6px; padding:12px;
   }
   .aside-bottom{ display:flex; align-items:center; }
@@ -2328,14 +2328,15 @@ section.active{display:block}
   /* ── Full-screen sheet modals ── */
   .dlg,#ent-modal,#settings-modal,#oracle-modal,#reanalyze-modal{
     padding:0; align-items:flex-end;
+    z-index:1300 !important; /* above drawer(1200) and bottom-nav(900) */
   }
   .dlg-box,#settings-box,#ent-box,#oracle-box{
     width:100%; max-width:100%; border-radius:18px 18px 0 0;
-    max-height:90dvh; overflow-y:auto; padding:24px 20px;
+    max-height:88dvh; overflow-y:auto; padding:24px 20px 36px;
   }
   #reanalyze-box{
     width:100%; max-width:100%; border-radius:18px 18px 0 0;
-    max-height:90dvh;
+    max-height:88dvh; overflow-y:auto;
   }
 
   /* ── Touch targets ── */
