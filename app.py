@@ -387,6 +387,135 @@ def login_ep(req: AuthReq):
 def me(u: dict = Depends(current_user)):
     return {"user_id": u["user_id"], "login": u["login"]}
 
+@app.get("/export")
+def export_data():
+    entries = kuzu_rows(_conn.execute(
+        "MATCH (e:Entry) RETURN e.id,e.ts,e.raw_text,e.narrative,e.archivist_note"))
+    entities = kuzu_rows(_conn.execute(
+        "MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary,e.tags"))
+    missions = kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status,m.ts,m.lore"))
+    tasks = kuzu_rows(_conn.execute(
+        "MATCH (t:Task) RETURN t.id,t.mission_id,t.title,t.status,t.ts,"
+        "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
+        "t.last_reset_ts,t.streak,t.best_streak,t.entry_id"))
+    finances = kuzu_rows(_conn.execute(
+        "MATCH (f:Finance) RETURN f.id,f.amount,f.direction,f.category,f.note,f.ts"))
+    links = kuzu_rows(_conn.execute(
+        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) RETURN a.id,r.label,b.id,r.entry_id"))
+    mentions = kuzu_rows(_conn.execute(
+        "MATCH (e:Entry)-[:MENTIONS]->(n:Entity) RETURN e.id,n.id"))
+    char_file = Path(__file__).parent/"character.json"
+    char = json.loads(char_file.read_text()) if char_file.exists() else {}
+    return {
+        "version": 2,
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "entries":  [{"id":r[0],"ts":r[1],"raw_text":r[2],"narrative":r[3],"archivist_note":r[4]} for r in entries],
+        "entities": [{"id":r[0],"name":r[1],"type":r[2],"summary":r[3],"tags":r[4] or "[]"} for r in entities],
+        "missions": [{"id":r[0],"title":r[1],"description":r[2],"status":r[3],"ts":r[4],"lore":r[5] or ""} for r in missions],
+        "tasks":    [{"id":r[0],"mission_id":r[1],"title":r[2],"status":r[3],"ts":r[4],
+                      "task_type":r[5] or "once","reset_hours":r[6] or 24,
+                      "required_iters":r[7] or 1,"current_iters":r[8] or 0,
+                      "last_reset_ts":r[9] or "","streak":r[10] or 0,"best_streak":r[11] or 0,
+                      "entry_id":r[12] or ""} for r in tasks],
+        "finances": [{"id":r[0],"amount":r[1],"direction":r[2],"category":r[3],"note":r[4],"ts":r[5]} for r in finances],
+        "links":    [{"from":r[0],"label":r[1],"to":r[2],"entry_id":r[3] or ""} for r in links],
+        "mentions": [{"entry_id":r[0],"entity_id":r[1]} for r in mentions],
+        "character": char,
+    }
+
+class ImportReq(BaseModel):
+    data: dict
+
+@app.post("/import")
+def import_data(req: ImportReq):
+    d = req.data
+    if d.get("version",1) < 1:
+        raise HTTPException(400, "Неверный формат")
+    imported = {"entries":0,"entities":0,"missions":0,"tasks":0,"finances":0,"links":0}
+    # Entries
+    for e in d.get("entries",[]):
+        try:
+            _conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":e["id"]})
+            rows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":e["id"]}))
+            if not rows:
+                _conn.execute("CREATE (:Entry {id:$id,ts:$ts,raw_text:$r,narrative:$n,archivist_note:$a})",
+                    {"id":e["id"],"ts":e.get("ts",""),"r":e.get("raw_text",""),
+                     "n":e.get("narrative",""),"a":e.get("archivist_note","")})
+                imported["entries"]+=1
+        except: pass
+    # Entities
+    for e in d.get("entities",[]):
+        try:
+            if not entity_exists(e["id"]):
+                _conn.execute("CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg})",
+                    {"id":e["id"],"n":e["name"],"t":e.get("type","concept"),
+                     "s":e.get("summary",""),"tg":e.get("tags","[]")})
+                imported["entities"]+=1
+        except: pass
+    # Missions
+    for m in d.get("missions",[]):
+        try:
+            rows=kuzu_rows(_conn.execute("MATCH (x:Mission) WHERE x.id=$id RETURN x.id",{"id":m["id"]}))
+            if not rows:
+                _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,lore:$l})",
+                    {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
+                     "s":m.get("status","active"),"ts":m.get("ts",""),"l":m.get("lore","")})
+                imported["missions"]+=1
+        except: pass
+    # Tasks
+    for t in d.get("tasks",[]):
+        try:
+            rows=kuzu_rows(_conn.execute("MATCH (x:Task) WHERE x.id=$id RETURN x.id",{"id":t["id"]}))
+            if not rows:
+                _conn.execute(
+                    "CREATE (:Task {id:$id,mission_id:$mid,title:$ti,status:$s,ts:$ts,"
+                    "task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:$ci,"
+                    "last_reset_ts:$lr,streak:$st,best_streak:$bs,entry_id:$eid})",
+                    {"id":t["id"],"mid":t.get("mission_id",""),"ti":t["title"],
+                     "s":t.get("status","active"),"ts":t.get("ts",""),
+                     "tt":t.get("task_type","once"),"rh":int(t.get("reset_hours",24)),
+                     "ri":int(t.get("required_iters",1)),"ci":int(t.get("current_iters",0)),
+                     "lr":t.get("last_reset_ts",""),"st":int(t.get("streak",0)),
+                     "bs":int(t.get("best_streak",0)),"eid":t.get("entry_id","")})
+                imported["tasks"]+=1
+        except: pass
+    # Finances
+    for f in d.get("finances",[]):
+        try:
+            rows=kuzu_rows(_conn.execute("MATCH (x:Finance) WHERE x.id=$id RETURN x.id",{"id":f["id"]}))
+            if not rows:
+                _conn.execute("CREATE (:Finance {id:$id,amount:$a,direction:$dir,category:$c,note:$n,ts:$ts})",
+                    {"id":f["id"],"a":float(f.get("amount",0)),"dir":f.get("direction","out"),
+                     "c":f.get("category",""),"n":f.get("note",""),"ts":f.get("ts","")})
+                imported["finances"]+=1
+        except: pass
+    # Links
+    for lnk in d.get("links",[]):
+        try:
+            if entity_exists(lnk["from"]) and entity_exists(lnk["to"]):
+                _conn.execute(
+                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                    "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
+                    {"f":lnk["from"],"t":lnk["to"],"l":lnk.get("label",""),"e":lnk.get("entry_id","import")})
+                imported["links"]+=1
+        except: pass
+    # Mentions
+    for mn in d.get("mentions",[]):
+        try:
+            erows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":mn["entry_id"]}))
+            if erows and entity_exists(mn["entity_id"]):
+                _conn.execute(
+                    "MATCH (e:Entry) WHERE e.id=$eid MATCH (n:Entity) WHERE n.id=$nid "
+                    "CREATE (e)-[:MENTIONS]->(n)",{"eid":mn["entry_id"],"nid":mn["entity_id"]})
+        except: pass
+    # Character
+    if d.get("character"):
+        char_file = Path(__file__).parent/"character.json"
+        if not char_file.exists():
+            char_file.write_text(json.dumps(d["character"],ensure_ascii=False,indent=2))
+    return {"ok": True, "imported": imported}
+
 # ─────────────────────────────────────────────────────────────────────────────
 _moon_cache: dict = {"data":None,"ts":0.0}
 
@@ -2145,6 +2274,16 @@ section.active{display:block}
       <button class="pocket-btn" onclick="saveApiKey()">Сохранить Anthropic</button>
       <button class="pocket-btn secondary" onclick="closeSettings()">Закрыть</button>
     </div>
+
+    <div class="settings-label" style="margin-top:22px">Данные</div>
+    <div class="settings-hint" style="margin-bottom:10px">Экспорт — скачать все данные одним файлом. Импорт — залить на другой сервер.</div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="pocket-btn" onclick="exportData()">⬇ Экспорт</button>
+      <label class="pocket-btn" style="cursor:pointer;margin:0">⬆ Импорт
+        <input type="file" accept=".json" style="display:none" onchange="importData(this)">
+      </label>
+      <span id="import-status" style="font-size:11px;font-family:sans-serif;color:var(--ink3)"></span>
+    </div>
   </div>
 </div>
 
@@ -3494,6 +3633,36 @@ function openSettings(){
   document.getElementById('settings-modal').classList.add('open');
 }
 function closeSettings(){ document.getElementById('settings-modal').classList.remove('open'); }
+
+async function exportData(){
+  const r=await fetch('/export');
+  const d=await r.json();
+  const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='liferpg-export-'+new Date().toISOString().slice(0,10)+'.json';
+  a.click();
+}
+async function importData(input){
+  const file=input.files[0]; if(!file) return;
+  const st=document.getElementById('import-status');
+  st.textContent='Загрузка...'; st.style.color='var(--ink3)';
+  try{
+    const text=await file.text();
+    const data=JSON.parse(text);
+    const r=await fetch('/import',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({data})});
+    const res=await r.json();
+    if(res.ok){
+      const imp=res.imported;
+      st.textContent=`✓ Записей: ${imp.entries}, сущностей: ${imp.entities}, путей: ${imp.missions}`;
+      st.style.color='var(--green)';
+      loadJournal(); loadAsides(); loadCharacter();
+    } else { st.textContent='Ошибка: '+(res.detail||'?'); st.style.color='var(--red)'; }
+  }catch(e){ st.textContent='Неверный файл'; st.style.color='var(--red)'; }
+  input.value='';
+}
 async function saveApiKey(){
   const key=document.getElementById('settings-api-key').value.trim();
   if(!key) return;
