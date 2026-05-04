@@ -2,14 +2,15 @@
 Life RPG — Living Narrative OS v4
 Parchment · Knowledge Graph · Колесо Миров · AI Архивариус
 """
-import json, uuid, re, subprocess, time, threading, os
+import json, uuid, re, subprocess, time, threading, os, hashlib, hmac, secrets
 import urllib.request as _ur
 from datetime import datetime
 from pathlib import Path
 
 import kuzu
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 APP_CFG_FILE = Path(__file__).parent / "app_config.json"
@@ -96,6 +97,43 @@ def call_ai_extract(raw: str) -> dict:
 def call_claude_extract(raw: str) -> dict:  # backward compat alias
     return call_ai_extract(raw)
 
+# ── Auth ─────────────────────────────────────────────────────────────────────
+SESSIONS_FILE = Path(__file__).parent / "sessions.json"
+_SECRET = os.environ.get("SESSION_SECRET", "liferpg-secret-change-in-prod")
+
+def _hash_password(pw: str) -> str:
+    return hashlib.sha256((pw + _SECRET).encode()).hexdigest()
+
+def _sessions() -> dict:
+    if SESSIONS_FILE.exists():
+        try: return json.loads(SESSIONS_FILE.read_text())
+        except: pass
+    return {}
+
+def _save_sessions(s: dict):
+    SESSIONS_FILE.write_text(json.dumps(s, ensure_ascii=False))
+
+def _create_token(user_id: str, login: str) -> str:
+    tok = secrets.token_hex(32)
+    s = _sessions(); s[tok] = {"user_id": user_id, "login": login}
+    _save_sessions(s); return tok
+
+def _token_to_user(token: str) -> dict | None:
+    return _sessions().get(token)
+
+_bearer = HTTPBearer(auto_error=False)
+
+def current_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict:
+    if cred:
+        u = _token_to_user(cred.credentials)
+        if u: return u
+    raise HTTPException(401, "Необходима авторизация")
+
+def optional_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict | None:
+    if cred: return _token_to_user(cred.credentials)
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
 DB_PATH   = str(Path(__file__).parent / "liferpg.db")
 _VER_F    = Path(__file__).parent / ".schema_v"
 _SCHEMA   = "5"   # bump → auto-drops all tables and rebuilds
@@ -137,7 +175,16 @@ def _setup():
     _conn.execute("""CREATE NODE TABLE IF NOT EXISTS Mode(
         id STRING, name STRING, description STRING, active STRING,
         started_ts STRING, PRIMARY KEY(id))""")
+    _conn.execute("""CREATE NODE TABLE IF NOT EXISTS User(
+        id STRING, login STRING, password_hash STRING, ts STRING,
+        PRIMARY KEY(id))""")
 _setup()
+
+def _migrate_user_columns():
+    """Add user_id to all node tables (idempotent)."""
+    for tbl in ("Entry","Entity","Mission","Task","Finance","Mode"):
+        try: _conn.execute(f"ALTER TABLE {tbl} ADD user_id STRING DEFAULT 'admin'")
+        except: pass
 
 def _migrate_task_columns():
     """Add new columns without dropping data (idempotent)."""
@@ -193,6 +240,14 @@ def kuzu_rows(r):
     rows=[]
     while r.has_next(): rows.append(r.get_next())
     return rows
+
+def _ensure_admin_user():
+    r = kuzu_rows(_conn.execute("MATCH (u:User) WHERE u.login='admin' RETURN u.id"))
+    if not r:
+        _conn.execute("CREATE (:User {id:'admin',login:'admin',password_hash:$ph,ts:$ts})",
+                      {"ph": _hash_password("admin"), "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+_migrate_user_columns()
+_ensure_admin_user()
 
 def entity_exists(eid):
     r=_conn.execute("MATCH (e:Entity) WHERE e.id=$id RETURN count(e)",{"id":eid})
@@ -302,6 +357,37 @@ def write_entry(raw, data):
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI()
 
+# ── Auth endpoints ───────────────────────────────────────────────────────────
+class AuthReq(BaseModel): login: str; password: str
+
+@app.post("/register")
+def register(req: AuthReq):
+    login = req.login.strip().lower()
+    if not login or len(login) < 2: raise HTTPException(400, "Логин слишком короткий")
+    if not req.password or len(req.password) < 4: raise HTTPException(400, "Пароль слишком короткий")
+    existing = kuzu_rows(_conn.execute("MATCH (u:User) WHERE u.login=$l RETURN u.id", {"l": login}))
+    if existing: raise HTTPException(409, "Логин занят")
+    uid = str(uuid.uuid4())
+    _conn.execute("CREATE (:User {id:$id,login:$l,password_hash:$ph,ts:$ts})",
+                  {"id": uid, "l": login, "ph": _hash_password(req.password),
+                   "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    return {"token": _create_token(uid, login), "login": login, "user_id": uid}
+
+@app.post("/login")
+def login_ep(req: AuthReq):
+    login = req.login.strip().lower()
+    rows = kuzu_rows(_conn.execute(
+        "MATCH (u:User) WHERE u.login=$l RETURN u.id,u.password_hash", {"l": login}))
+    if not rows or rows[0][1] != _hash_password(req.password):
+        raise HTTPException(401, "Неверный логин или пароль")
+    uid, _ = rows[0]
+    return {"token": _create_token(uid, login), "login": login, "user_id": uid}
+
+@app.get("/me")
+def me(u: dict = Depends(current_user)):
+    return {"user_id": u["user_id"], "login": u["login"]}
+
+# ─────────────────────────────────────────────────────────────────────────────
 _moon_cache: dict = {"data":None,"ts":0.0}
 
 @app.get("/moonphase")
@@ -1881,6 +1967,7 @@ section.active{display:block}
     <div class="topbar-date" id="hdr-date"></div>
     <button class="sound-btn" id="sound-btn" onclick="toggleSound()">♪ амбиент</button>
     <div class="topbar-settings" onclick="openSettings()">⚙</div>
+    <div class="topbar-settings" onclick="doLogout()" title="Выйти" style="font-size:13px">⏻</div>
   </div>
 </div>
 
@@ -2150,6 +2237,52 @@ section.active{display:block}
 
 
 <script>
+// ── Auth ─────────────────────────────────────────────────────────────────────
+(function(){
+  const _orig=window.fetch.bind(window);
+  window.fetch=function(url,opts={}){
+    const tok=localStorage.getItem('lrpg_token');
+    if(tok&&typeof url==='string'&&!url.startsWith('http')){
+      opts={...opts,headers:{...(opts.headers||{}),'Authorization':'Bearer '+tok}};
+    }
+    return _orig(url,opts);
+  };
+})();
+
+async function authInit(){
+  const tok=localStorage.getItem('lrpg_token');
+  if(!tok){showLogin();return;}
+  try{
+    const r=await fetch('/me');
+    if(r.ok){const u=await r.json();window._me=u;hideLogin();}
+    else{localStorage.removeItem('lrpg_token');showLogin();}
+  }catch{showLogin();}
+}
+function showLogin(){document.getElementById('login-screen').style.display='flex';}
+function hideLogin(){document.getElementById('login-screen').style.display='none';}
+async function doLogin(){
+  const login=document.getElementById('ls-login').value.trim();
+  const pw=document.getElementById('ls-pw').value;
+  const err=document.getElementById('ls-err');
+  err.textContent='';
+  try{
+    const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({login,password:pw})});
+    if(r.ok){
+      const d=await r.json();
+      localStorage.setItem('lrpg_token',d.token);
+      window._me=d; hideLogin();
+      loadJournal();loadAsides();loadCharacter();
+    } else {
+      const d=await r.json(); err.textContent=d.detail||'Ошибка';
+    }
+  }catch{err.textContent='Нет связи с сервером';}
+}
+function doLogout(){
+  localStorage.removeItem('lrpg_token'); showLogin();
+  document.getElementById('ls-login').value='';
+  document.getElementById('ls-pw').value='';
+}
 // ── State ────────────────────────────────────────────────────────────────────
 let allEntities = [];
 let _openMissions = new Set();   // expanded mission blocks
@@ -3368,7 +3501,10 @@ async function processPendingInbox(){
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
-loadJournal(); loadAsides(); checkApiStatus(); loadCharacter();
+checkApiStatus();
+authInit().then(()=>{
+  if(localStorage.getItem('lrpg_token')) loadJournal(),loadAsides(),loadCharacter();
+});
 // Auto-analyze character if never done or >7 days ago
 fetch('/character/data').then(r=>r.json()).then(d=>{
   const last=d.last_analyzed;
@@ -3376,6 +3512,28 @@ fetch('/character/data').then(r=>r.json()).then(d=>{
   if(stale) fetch('/character/analyze',{method:'POST'}).then(()=>setTimeout(loadCharacter,15000));
 });
 </script>
+<div id="login-screen" style="display:none;position:fixed;inset:0;z-index:9999;
+  background:var(--page);align-items:center;justify-content:center;flex-direction:column">
+  <div style="text-align:center;margin-bottom:32px">
+    <div style="font-size:28px;font-family:'Georgia',serif;color:var(--ink);letter-spacing:2px">Life RPG</div>
+    <div style="font-size:11px;color:var(--ink3);letter-spacing:4px;text-transform:uppercase;margin-top:4px">живая летопись</div>
+  </div>
+  <div style="background:var(--paper);border:1px solid var(--border);border-radius:6px;
+    padding:32px 40px;width:300px;box-shadow:0 4px 24px var(--shadow)">
+    <input id="ls-login" class="dlg-input" placeholder="Логин" style="margin-bottom:10px"
+      onkeydown="if(event.key==='Enter')document.getElementById('ls-pw').focus()">
+    <input id="ls-pw" class="dlg-input" type="password" placeholder="Пароль"
+      onkeydown="if(event.key==='Enter')doLogin()">
+    <div id="ls-err" style="font-size:12px;color:var(--red);font-family:sans-serif;
+      min-height:18px;margin:8px 0"></div>
+    <button onclick="doLogin()" style="width:100%;background:var(--ink);color:var(--page);
+      border:none;padding:10px;font-family:'Georgia',serif;font-size:14px;
+      border-radius:3px;cursor:pointer;letter-spacing:1px">Войти</button>
+  </div>
+  <div style="font-size:10px;color:var(--border);margin-top:24px;font-family:sans-serif">
+    Нет аккаунта? Обратись к Мастеру игры.
+  </div>
+</div>
 </body>
 </html>"""
 
