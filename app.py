@@ -2240,15 +2240,14 @@ section.active{display:block}
 
   /* ── Sidebar → slide-in drawer ── */
   aside{
-    position:fixed; top:0; left:0; bottom:0;
+    position:fixed; top:52px; left:0; bottom:0;
     width:82vw; max-width:320px;
     display:flex !important; flex-direction:column !important;
     overflow-y:auto; overflow-x:hidden;
-    max-height:100dvh; height:100dvh;
     z-index:1200; transform:translateX(-105%);
     transition:transform .28s cubic-bezier(.4,0,.2,1);
     border-right:1.5px solid var(--border); border-bottom:none;
-    background:var(--bg); padding:72px 18px 32px;
+    background:var(--paper2); padding:20px 18px 32px;
     gap:18px; box-shadow: 4px 0 24px rgba(0,0,0,.18);
     grid-row:unset; grid-column:unset;
   }
@@ -2263,8 +2262,8 @@ section.active{display:block}
 
   /* drawer backdrop */
   #drawer-backdrop{
-    display:block; position:fixed; inset:0; z-index:1100;
-    background:rgba(0,0,0,.38); backdrop-filter:blur(1px);
+    display:block; position:fixed; top:52px; left:0; right:0; bottom:0; z-index:1100;
+    background:rgba(0,0,0,.50); backdrop-filter:blur(2px);
     opacity:0; pointer-events:none;
     transition:opacity .25s;
   }
@@ -2296,7 +2295,7 @@ section.active{display:block}
     position:fixed; bottom:0; left:0; right:0;
     height:calc(56px + env(safe-area-inset-bottom));
     padding-bottom:env(safe-area-inset-bottom);
-    background:var(--bg);
+    background:var(--paper2);
     border-top:1.5px solid var(--border);
     z-index:900;
     align-items:stretch;
