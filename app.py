@@ -786,8 +786,8 @@ def today_narrative():
         "MATCH (t:Task) WHERE t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d AND t.current_iters > 0 "
         "RETURN t.title, t.current_iters, t.required_iters",{"d":today}))
     rows2=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.completed_ts STARTS WITH $d RETURN t.title, 1, 1",{"d":today}))
-    all_tasks=rows+rows2
+        "MATCH (t:Task) WHERE t.completed_ts STARTS WITH $d RETURN t.title, t.required_iters",{"d":today}))
+    all_tasks=rows+[[r[0],r[1],r[1]] for r in rows2]
     if not all_tasks: return {"narrative":""}
     task_lines="\n".join(f"- {r[0]} ({r[1]}/{r[2]})" for r in all_tasks)
     p=f"""Ты — Архивариус. Одним абзацем (2-3 предложения) в стиле летописи Морровинда опиши достижения Героя за сегодня.
