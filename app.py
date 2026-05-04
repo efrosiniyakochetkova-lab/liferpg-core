@@ -827,29 +827,50 @@ def _merge_entity(keep_id: str, drop_id: str):
 
 def _run_reanalyze_bg():
     try:
-        # 0. AI: deduplicate similar entities
+        # 0. AI: deduplicate + retype entities
         if _has_any_ai():
             all_ents=kuzu_rows(_conn.execute(
                 "MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary LIMIT 80"))
             if len(all_ents)>1:
-                ent_list="\n".join(f"ID={r[0]} NAME={r[1]} TYPE={r[2]} DESC={r[3] or ''}" for r in all_ents)
-                dedup_p=f"""Ты — Архивариус. Найди дублирующиеся или семантически одинаковые сущности.
+                ent_list="\n".join(f"NAME={r[1]} TYPE={r[2]} DESC={r[3] or ''}" for r in all_ents)
+                dedup_p=f"""Ты — Архивариус. Проверь список сущностей и сделай два дела:
+
+1. Найди семантически одинаковые сущности (Самокат / Электросамокат, TikTok / Тик-ток, Игорь / Игорь Заказчик). Выбери лучшее имя для оставшейся.
+2. Исправь неверные типы. Типы: person (люди), place (места), project (проекты/блоги/каналы), concept (идеи/практики), object (физические предметы), event (события).
 
 Сущности:
 {ent_list}
 
-Критерии дубликата: схожие названия (Самокат / Электросамокат / Scooter), одна суть, описание об одном и том же.
-Верни ТОЛЬКО JSON: {{"merges": [{{"keep_id": "id_оставить", "drop_id": "id_удалить", "reason": "почему одно и то же"}}]}}
-Максимум 10 пар. Если дубликатов нет — верни {{"merges": []}}"""
+Верни ТОЛЬКО JSON:
+{{
+  "merges": [{{"keep_name": "имя_оставить", "drop_name": "имя_удалить"}}],
+  "retypes": [{{"name": "имя_сущности", "new_type": "правильный_тип"}}]
+}}
+Если нечего делать — пустые списки."""
                 t0=_call_any_ai(dedup_p)
                 m0=re.search(r'\{.*\}',t0,re.DOTALL)
                 if m0:
                     try:
-                        for mg in json.loads(m0.group()).get("merges",[]):
-                            kid=mg.get("keep_id",""); did=mg.get("drop_id","")
-                            if kid and did and kid!=did and entity_exists(kid) and entity_exists(did):
-                                print(f"[dedup] merging {did} → {kid}: {mg.get('reason','')}")
+                        parsed=json.loads(m0.group())
+                        for mg in parsed.get("merges",[]):
+                            kname=mg.get("keep_name",""); dname=mg.get("drop_name","")
+                            kid=slug(kname); did=slug(dname)
+                            if kname and dname and kid!=did and entity_exists(kid) and entity_exists(did):
+                                print(f"[dedup] merging '{dname}' → '{kname}'")
                                 _merge_entity(kid,did)
+                            elif kname and dname and not entity_exists(kid) and entity_exists(did):
+                                # keep_name is the better name — rename drop to keep
+                                _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.name=$n, e.id=$kid",
+                                              {"id":did,"n":kname,"kid":kid})
+                                print(f"[dedup] renamed '{dname}' → '{kname}'")
+                        for rt in parsed.get("retypes",[]):
+                            eid=slug(rt.get("name",""))
+                            ntype=rt.get("new_type","")
+                            valid={"person","place","project","concept","object","event","mission"}
+                            if eid and ntype in valid and entity_exists(eid):
+                                _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.type=$t",
+                                              {"id":eid,"t":ntype})
+                                print(f"[retype] '{rt['name']}' → {ntype}")
                     except Exception as ex: print(f"[dedup] {ex}")
 
         # 1. Sync ALL missions to Entity nodes
