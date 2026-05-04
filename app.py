@@ -811,7 +811,7 @@ def oracle(req: OracleReq):
         return {"text":""}
     # Last 5 diary entries
     entries=kuzu_rows(_conn.execute(
-        "MATCH (e:Entry) RETURN e.archivist_text, e.raw_text, e.ts ORDER BY e.ts DESC LIMIT 5"))
+        "MATCH (e:Entry) RETURN e.narrative, e.raw_text, e.ts ORDER BY e.ts DESC LIMIT 5"))
     entry_lines="\n".join(
         f"[{r[2]}] {r[0] or r[1]}" for r in entries if r[0] or r[1]) or "нет записей"
     # Active missions
