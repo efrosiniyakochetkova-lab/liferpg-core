@@ -800,6 +800,44 @@ def today_narrative():
     text=_call_any_ai(p) if _has_any_ai() else ""
     return {"narrative":text.strip()}
 
+class OracleReq(BaseModel):
+    mechanic_type: str  # "moon"|"season"|"patron"|"epoch"|"moon_name"
+    mechanic_value: str
+    mechanic_effect: str = ""
+
+@app.post("/oracle")
+def oracle(req: OracleReq):
+    if not _has_any_ai():
+        return {"text":""}
+    # Last 5 diary entries
+    entries=kuzu_rows(_conn.execute(
+        "MATCH (e:Entry) RETURN e.archivist_text, e.raw_text, e.ts ORDER BY e.ts DESC LIMIT 5"))
+    entry_lines="\n".join(
+        f"[{r[2]}] {r[0] or r[1]}" for r in entries if r[0] or r[1]) or "нет записей"
+    # Active missions
+    missions=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.status='active' RETURN m.title, m.description LIMIT 6"))
+    mission_lines="\n".join(f"- {r[0]}: {r[1] or ''}" for r in missions) or "нет активных путей"
+
+    type_labels={"moon":"Фаза луны","season":"Сезон","patron":"Покровитель",
+                 "epoch":"Эпоха","moon_name":"Луна сезона"}
+    label=type_labels.get(req.mechanic_type, req.mechanic_type)
+    effect_line=f"\nЛорное значение: {req.mechanic_effect}" if req.mechanic_effect else ""
+
+    p=f"""Ты — Архивариус. Говори как пророк — кратко, образно, от второго лица. Без вступлений и заголовков.
+
+Сейчас {label}: {req.mechanic_value}.{effect_line}
+
+Нарратив Героя (последние записи):
+{entry_lines}
+
+Активные Пути Героя:
+{mission_lines}
+
+Дай откровение (3-4 предложения): что означает {req.mechanic_value} для этого конкретного Героя прямо сейчас. Связь с его реальными делами и путями обязательна. Говори о том, что важно именно ему."""
+    text=_call_any_ai(p)
+    return {"text":text.strip()}
+
 @app.get("/config/status")
 def config_status():
     cfg=_app_cfg()
@@ -1346,6 +1384,50 @@ section.active{display:block}
 .pocket-tx-amount.deferred{color:var(--gold)}
 .pocket-section-title{font-size:11px;letter-spacing:3px;text-transform:uppercase;
   font-family:sans-serif;color:var(--ink3);margin-bottom:14px}
+/* ── ORACLE MODAL ── */
+#oracle-modal{display:none;position:fixed;inset:0;background:rgba(44,35,24,.55);z-index:600;
+  align-items:center;justify-content:center}
+#oracle-modal.open{display:flex}
+#oracle-box{background:var(--paper);border:2px solid var(--border);border-radius:4px;
+  padding:32px 36px;width:520px;max-width:90vw;position:relative;
+  box-shadow:0 16px 48px rgba(44,35,24,.25)}
+.oracle-eyebrow{font-size:9px;letter-spacing:3px;text-transform:uppercase;
+  color:var(--ink3);font-family:sans-serif;margin-bottom:8px}
+.oracle-title{font-size:20px;color:var(--ink);margin-bottom:6px}
+.oracle-effect{font-size:12px;color:var(--ink3);font-family:sans-serif;
+  font-style:italic;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border2)}
+.oracle-body{font-size:15px;color:var(--ink2);line-height:1.85;font-style:italic;
+  min-height:80px}
+.oracle-loading{color:var(--ink3);font-family:sans-serif;font-size:13px;animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
+#oracle-close{position:absolute;top:14px;right:16px;background:none;border:none;
+  font-size:22px;cursor:pointer;color:var(--ink3);line-height:1}
+#oracle-close:hover{color:var(--ink)}
+/* ── MECHANIC CARDS ── */
+.mech-section{margin-top:48px;padding-top:32px;border-top:2px solid var(--border2)}
+.mech-section-hdr{margin-bottom:20px}
+.mech-section-title{font-size:11px;letter-spacing:3px;font-family:sans-serif;
+  text-transform:uppercase;font-weight:700;color:var(--ink3)}
+.mech-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.mcard{background:var(--paper2);border:1px solid var(--border2);border-radius:3px;
+  padding:16px 18px;cursor:pointer;transition:all .15s;position:relative;overflow:hidden}
+.mcard:hover{border-color:var(--gold);box-shadow:2px 3px 12px var(--shadow);transform:translateY(-1px)}
+.mcard.current{border-color:var(--gold);background:var(--paper)}
+.mcard.current::after{content:'сейчас';position:absolute;top:10px;right:12px;
+  font-size:9px;font-family:sans-serif;letter-spacing:1.5px;color:var(--gold);
+  text-transform:uppercase}
+.mcard-emoji{font-size:22px;margin-bottom:8px}
+.mcard-name{font-size:15px;color:var(--ink);margin-bottom:4px}
+.mcard-sub{font-size:11px;color:var(--gold);font-family:sans-serif;margin-bottom:6px}
+.mcard-effect{font-size:12px;color:var(--ink3);font-family:sans-serif;
+  line-height:1.5;font-style:italic}
+.mcard-hint{font-size:10px;font-family:sans-serif;color:var(--border);margin-top:10px;
+  border-top:1px solid var(--border2);padding-top:6px}
+.mcard:hover .mcard-hint{color:var(--gold)}
+/* sidebar clickable */
+.cal-clickable{cursor:pointer;border-bottom:1px dotted var(--border);
+  transition:color .12s;display:inline}
+.cal-clickable:hover{color:var(--gold)}
 /* ── JOURNAL daily count ── */
 .daily-done-badge{display:inline-flex;align-items:center;gap:6px;
   font-family:sans-serif;font-size:12px;color:var(--green);
@@ -1508,6 +1590,19 @@ section.active{display:block}
 <div id="input-bar">
   <textarea id="txt" placeholder="Что произошло? Говори свободно... (Cmd+Enter)"></textarea>
   <button id="send-btn" onclick="sendEntry()">Записать →</button>
+</div>
+
+<!-- Oracle Modal -->
+<div id="oracle-modal">
+  <div id="oracle-box">
+    <button id="oracle-close" onclick="closeOracle()">×</button>
+    <div class="oracle-eyebrow" id="oracle-eyebrow">Откровение Архивариуса</div>
+    <div class="oracle-title" id="oracle-title"></div>
+    <div class="oracle-effect" id="oracle-effect"></div>
+    <div class="oracle-body" id="oracle-body">
+      <span class="oracle-loading">Архивариус читает знаки...</span>
+    </div>
+  </div>
 </div>
 
 <!-- Settings Modal -->
@@ -1742,24 +1837,102 @@ const WoW = {
 };
 
 // ── Clock ────────────────────────────────────────────────────────────────────
+function _oc(type,value,effect,label){
+  return `onclick="openOracle('${type}','${value.replace(/'/g,"\\'")}','${(effect||'').replace(/'/g,"\\'")}','${(label||value).replace(/'/g,"\\'")}')"`;}
 function tickClock(){
   const cal=WoW.now();
   const t=new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
   const hdrDate=document.getElementById('hdr-date');
   if(hdrDate) hdrDate.innerHTML=
-    `<span style="color:var(--red)">${cal.phaseEmoji} ${cal.phase}</span>`+
+    `<span class="cal-clickable" ${_oc('moon',cal.phase,cal.phaseEffect,cal.phaseEmoji+' '+cal.phase)} style="color:var(--red)">${cal.phaseEmoji} ${cal.phase}</span>`+
     `<span style="color:var(--ink3)"> · ${t}</span>`;
   const calEl=document.getElementById('sidebar-cal');
   if(calEl) calEl.innerHTML=
-    `<div class="cal-season">${cal.seasonEmoji} ${cal.season}</div>`+
-    `<div class="cal-moon">${cal.phaseEmoji} ${cal.phase} · ${cal.illumination}%</div>`+
-    `<div class="cal-patron">${cal.patronEmoji} ${cal.patron}</div>`+
+    `<div class="cal-season"><span class="cal-clickable" ${_oc('season',cal.season,'Сезон: '+cal.element,cal.seasonEmoji+' '+cal.season)}>${cal.seasonEmoji} ${cal.season}</span></div>`+
+    `<div class="cal-moon"><span class="cal-clickable" ${_oc('moon',cal.phase,cal.phaseEffect,cal.phaseEmoji+' '+cal.phase)}>${cal.phaseEmoji} ${cal.phase} · ${cal.illumination}%</span></div>`+
+    `<div class="cal-patron"><span class="cal-clickable" ${_oc('patron',cal.patron,'',cal.patronEmoji+' '+cal.patron)}>${cal.patronEmoji} ${cal.patron}</span></div>`+
     `<div class="cal-year">${cal.epochYear}-й год · ${cal.epochName}</div>`+
     `<div class="cal-time">${t}</div>`+
-    (cal.phaseEffect?`<div class="cal-effect">${cal.phaseEffect}</div>`:'')+
+    (cal.phaseEffect?`<div class="cal-effect"><span class="cal-clickable" ${_oc('moon',cal.phase,cal.phaseEffect,cal.phaseEmoji+' '+cal.phase)}>${cal.phaseEffect}</span></div>`:'')+
+    (cal.moon?`<div class="cal-sun" style="margin-top:4px"><span class="cal-clickable" ${_oc('moon_name',cal.moon,'',cal.moon)}>${cal.moon}</span></div>`:'')+
     (cal.sunrise?`<div class="cal-sun">☀️ ${cal.sunrise} — ${cal.sunset}</div>`:'');
 }
 tickClock(); setInterval(tickClock,30000);
+
+// ── Oracle ───────────────────────────────────────────────────────────────────
+function openOracle(type,value,effect,label){
+  const m=document.getElementById('oracle-modal');
+  document.getElementById('oracle-title').textContent=label||value;
+  document.getElementById('oracle-effect').textContent=effect||'';
+  document.getElementById('oracle-body').innerHTML='<span class="oracle-loading">Архивариус читает знаки...</span>';
+  m.classList.add('open');
+  fetch('/oracle',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mechanic_type:type,mechanic_value:value,mechanic_effect:effect||''})})
+    .then(r=>r.json()).then(d=>{
+      const body=document.getElementById('oracle-body');
+      if(d.text) body.textContent=d.text;
+      else body.innerHTML='<span style="color:var(--ink3);font-family:sans-serif;font-size:13px">Архивариус молчит — настройте ИИ в ⚙ Настройках.</span>';
+    }).catch(()=>{
+      document.getElementById('oracle-body').innerHTML='<span style="color:var(--red);font-size:12px">Связь с Архивариусом прервана.</span>';
+    });
+}
+function closeOracle(){document.getElementById('oracle-modal').classList.remove('open');}
+document.getElementById('oracle-modal').addEventListener('click',e=>{if(e.target.id==='oracle-modal')closeOracle();});
+
+// ── Mechanics section in База знаний ─────────────────────────────────────────
+function loadMechanics(){
+  const cal=WoW.now();
+  const sections=[
+    {
+      title:'Фазы Луны',
+      hint:'Луна меняется каждые ~3.5 дня. Каждая фаза задаёт тон времени.',
+      items:WoW.PHASES.map(p=>({
+        emoji:p.emoji,name:p.name,sub:'',effect:p.effect,
+        current:cal.phase===p.name,
+        type:'moon',value:p.name,label:p.emoji+' '+p.name
+      }))
+    },
+    {
+      title:'Сезоны Мира',
+      hint:'Пять сезонов сменяют друг друга. Каждый — своё настроение и стихия.',
+      items:WoW.SEASONS.map(s=>({
+        emoji:s.emoji,name:s.name,sub:s.element,
+        effect:'Луны: '+s.moons.join(' · '),
+        current:cal.season===s.name,
+        type:'season',value:s.name,label:s.emoji+' '+s.name
+      }))
+    },
+    {
+      title:'Покровители',
+      hint:'Покровитель меняется каждые ~1.5 месяца. Определяет архетип периода.',
+      items:WoW.PATRONS.map(p=>({
+        emoji:p.emoji,name:p.name,sub:'месяцы '+p.months.join(', '),effect:'',
+        current:cal.patron===p.name,
+        type:'patron',value:p.name,label:p.emoji+' '+p.name
+      }))
+    }
+  ];
+  return `<div class="mech-section">
+    <div class="mech-section-hdr">
+      <div class="mech-section-title">⚙ Механики Мира</div>
+    </div>
+    ${sections.map(s=>`
+      <div style="margin-bottom:32px">
+        <div style="font-size:13px;color:var(--ink2);margin-bottom:4px;font-family:'Georgia',serif">${s.title}</div>
+        <div style="font-size:11px;color:var(--ink3);font-family:sans-serif;margin-bottom:12px">${s.hint}</div>
+        <div class="mech-grid">
+          ${s.items.map(it=>`
+            <div class="mcard${it.current?' current':''}" onclick="openOracle('${it.type}','${it.value.replace(/'/g,"\\'")}','${(it.effect||'').replace(/'/g,"\\'")}','${it.label.replace(/'/g,"\\'")}')">
+              <div class="mcard-emoji">${it.emoji}</div>
+              <div class="mcard-name">${it.name}</div>
+              ${it.sub?`<div class="mcard-sub">${it.sub}</div>`:''}
+              ${it.effect?`<div class="mcard-effect">${it.effect}</div>`:''}
+              <div class="mcard-hint">нажми → откровение Архивариуса</div>
+            </div>`).join('')}
+        </div>
+      </div>`).join('')}
+  </div>`;
+}
 
 // ── Nav ──────────────────────────────────────────────────────────────────────
 const TITLES={journal:'Дневник',missions:'Пути',base:'База знаний',pocket:'Карман'};
@@ -2184,7 +2357,7 @@ async function loadBase(){
     </div>`;
   }).join('');
 
-  el.innerHTML=html||'<div class="empty">База пуста. Записи в журнале породят сущности здесь.</div>';
+  el.innerHTML=(html||'<div class="empty">База пуста. Записи в журнале породят сущности здесь.</div>')+loadMechanics();
 }
 
 // ── Переосмыслить ────────────────────────────────────────────────────────────
