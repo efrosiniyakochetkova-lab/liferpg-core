@@ -799,8 +799,59 @@ def _call_any_ai(prompt_text: str) -> str:
         except Exception as e: print(f"[anthropic_any] {e}")
     return _call_gigachat(prompt_text)
 
+def _merge_entity(keep_id: str, drop_id: str):
+    """Redirect all LINKED rels from drop_id to keep_id, then delete drop node."""
+    try:
+        rels_out=kuzu_rows(_conn.execute(
+            "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE a.id=$id RETURN b.id,r.label,r.entry_id",
+            {"id":drop_id}))
+        rels_in=kuzu_rows(_conn.execute(
+            "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE b.id=$id RETURN a.id,r.label,r.entry_id",
+            {"id":drop_id}))
+        for r in rels_out:
+            if r[0]!=keep_id:
+                try: _conn.execute(
+                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                    "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
+                    {"f":keep_id,"t":r[0],"l":r[1],"e":r[2] or "merge"})
+                except: pass
+        for r in rels_in:
+            if r[0]!=keep_id:
+                try: _conn.execute(
+                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                    "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
+                    {"f":r[0],"t":keep_id,"l":r[1],"e":r[2] or "merge"})
+                except: pass
+        _conn.execute("MATCH (e:Entity) WHERE e.id=$id DELETE e",{"id":drop_id})
+    except Exception as ex: print(f"[merge_entity] {ex}")
+
 def _run_reanalyze_bg():
     try:
+        # 0. AI: deduplicate similar entities
+        if _has_any_ai():
+            all_ents=kuzu_rows(_conn.execute(
+                "MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary LIMIT 80"))
+            if len(all_ents)>1:
+                ent_list="\n".join(f"ID={r[0]} NAME={r[1]} TYPE={r[2]} DESC={r[3] or ''}" for r in all_ents)
+                dedup_p=f"""Ты — Архивариус. Найди дублирующиеся или семантически одинаковые сущности.
+
+Сущности:
+{ent_list}
+
+Критерии дубликата: схожие названия (Самокат / Электросамокат / Scooter), одна суть, описание об одном и том же.
+Верни ТОЛЬКО JSON: {{"merges": [{{"keep_id": "id_оставить", "drop_id": "id_удалить", "reason": "почему одно и то же"}}]}}
+Максимум 10 пар. Если дубликатов нет — верни {{"merges": []}}"""
+                t0=_call_any_ai(dedup_p)
+                m0=re.search(r'\{.*\}',t0,re.DOTALL)
+                if m0:
+                    try:
+                        for mg in json.loads(m0.group()).get("merges",[]):
+                            kid=mg.get("keep_id",""); did=mg.get("drop_id","")
+                            if kid and did and kid!=did and entity_exists(kid) and entity_exists(did):
+                                print(f"[dedup] merging {did} → {kid}: {mg.get('reason','')}")
+                                _merge_entity(kid,did)
+                    except Exception as ex: print(f"[dedup] {ex}")
+
         # 1. Sync ALL missions to Entity nodes
         all_missions=kuzu_rows(_conn.execute(
             "MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status"))
@@ -2700,7 +2751,7 @@ async function loadMissions(){
     const repeatBadge=repeatTotal?`${repeatTotal} повтор.`:'';
     const badge=[badgeText,repeatBadge].filter(Boolean).join(' · ');
 
-    const entTags=(m.entities||[]).map(e=>`<span class="mission-ent-tag" onclick="oracleClick('entity','${e.id}','${(e.name||'').replace(/'/g,"\\'")}');event.stopPropagation()" title="${e.summary||''}">${e.name}</span>`).join('');
+    const entTags=(m.entities||[]).map(e=>`<span class="mission-ent-tag" onclick="openEnt('${(e.name||'').replace(/'/g,"\\'")}');event.stopPropagation()" title="${e.summary||''}">${e.name}</span>`).join('');
     const descHtml=m.description?`<div class="mission-desc-view" id="mdesc-view-${m.id}" onclick="editMissionDesc('${m.id}')" title="Нажми чтобы изменить описание">${m.description}</div>`
       :`<div class="mission-desc-view mission-desc-empty" id="mdesc-view-${m.id}" onclick="editMissionDesc('${m.id}')" title="Добавить описание">+ добавить описание пути...</div>`;
 
@@ -2959,7 +3010,7 @@ async function loadBase(){
   const missionR=await fetch('/missions'); const missions=await missionR.json();
   const missionCards=missions.map(m=>{
     const clr='var(--red)';
-    const entTags=(m.entities||[]).map(e=>`<span class="bcard-rel" onclick="event.stopPropagation();oracleClick('entity','${(e.id||e.name).replace(/'/g,"\\'")}','${(e.summary||'').replace(/'/g,"\\'")}')" style="cursor:pointer">${e.name}</span>`).join('');
+    const entTags=(m.entities||[]).map(e=>`<span class="bcard-rel" onclick="event.stopPropagation();openEnt('${(e.name||'').replace(/'/g,"\\'")}');" style="cursor:pointer">${e.name}</span>`).join('');
     const statusBadge=m.status==='done'?'<span style="font-size:9px;font-family:sans-serif;color:var(--ink3);margin-left:6px">завершён</span>':'';
     return `<div class="bcard" onclick="nav(document.querySelector('[data-s=missions]'))">
       <div class="bcard-stripe" style="background:${clr}"></div>
