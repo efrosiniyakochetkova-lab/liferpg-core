@@ -219,7 +219,7 @@ PROMPT = """Ты — Архивариус, хранитель Живой Лет�
 {{
   "narrative": "2-4 предложения от третьего лица — стиль Morrowind, хроника, величие, конкретные детали",
   "entities": [
-    {{"name":"Имя","type":"person|place|concept|project|event","summary":"одно ёмкое предложение","tags":[]}}
+    {{"name":"Имя","type":"person|place|concept|project|event|object","summary":"одно ёмкое предложение","tags":[]}}
   ],
   "relations": [
     {{"from_entity":"Имя1","to_entity":"Имя2","label":"глагол отношения"}}
@@ -234,7 +234,7 @@ PROMPT = """Ты — Архивариус, хранитель Живой Лет�
 }}
 
 ПРАВИЛА:
-- entities: только реально упомянутые люди, места, идеи, проекты — не выдумывай
+- entities: только реально упомянутые люди, места, идеи, проекты, предметы — не выдумывай; object — физические предметы и инструменты (самокат, камера, ноутбук)
 - relations: только если связь явно следует из текста
 - quests: только конкретные задачи/обязательства, явно упоминаемые
 - Если сущность уже есть в летописи — обновляй summary, не дублируй
@@ -533,6 +533,45 @@ def entity_card(name: str):
             "links_out":[{"from":r[0],"label":r[1],"to":r[2]} for r in out],
             "links_in": [{"from":r[0],"label":r[1],"to":r[2]} for r in inp],
             "mentions":  [{"ts":r[0],"narrative":r[1],"archivist_note":r[2]} for r in ment]}
+
+class EntityCreateReq(BaseModel):
+    name: str
+    type: str = "concept"
+    summary: str = ""
+
+@app.post("/entities")
+def create_entity(req: EntityCreateReq):
+    eid = slug(req.name)
+    if entity_exists(eid):
+        _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.summary=$s",
+                      {"id":eid,"s":req.summary})
+    else:
+        _conn.execute(
+            "CREATE (:Entity {id:$id,name:$name,type:$type,summary:$s,tags:$t})",
+            {"id":eid,"name":req.name,"type":req.type,"s":req.summary,"t":"[]"})
+    return {"id":eid,"name":req.name}
+
+class LinkEntityReq(BaseModel):
+    entity_name: str
+    label: str = "связан с"
+
+@app.post("/missions/{mid}/link-entity")
+def link_entity_to_mission(mid: str, req: LinkEntityReq):
+    rows=kuzu_rows(_conn.execute("MATCH (m:Mission) WHERE m.id=$id RETURN m.title",{"id":mid}))
+    if not rows: raise HTTPException(404)
+    meid="mission_"+slug(rows[0][0])
+    eeid=slug(req.entity_name)
+    if not entity_exists(eeid):
+        _conn.execute("CREATE (:Entity {id:$id,name:$n,type:'concept',summary:'',tags:'[]'})",
+                      {"id":eeid,"n":req.entity_name})
+    if not entity_exists(meid): _sync_mission_entity(mid,rows[0][0],"","active")
+    try:
+        _conn.execute(
+            "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+            "CREATE (a)-[:LINKED{label:$l,entry_id:'manual'}]->(b)",
+            {"f":meid,"t":eeid,"l":req.label})
+    except: pass
+    return {"ok":True}
 
 @app.get("/graph")
 def graph():
@@ -1414,6 +1453,12 @@ section.active{display:block}
   margin-bottom:28px;padding-bottom:16px;border-bottom:2px solid var(--border)}
 .base-heading{font-size:21px;color:var(--ink)}
 .base-topbar-right{display:flex;gap:10px;align-items:center}
+.btn-add-entity{background:none;border:1px dashed var(--border2);color:var(--ink3);
+  font-family:'Georgia',serif;font-size:12px;padding:4px 12px;border-radius:3px;cursor:pointer;transition:all .12s}
+.btn-add-entity:hover{border-color:var(--gold);color:var(--gold)}
+.btn-link-entity{background:none;border:1px dashed var(--border2);color:var(--ink3);
+  font-size:11px;font-family:sans-serif;padding:2px 8px;border-radius:10px;cursor:pointer;transition:all .12s;margin-left:4px}
+.btn-link-entity:hover{border-color:var(--gold);color:var(--gold)}
 .btn-reanalyze{background:var(--red);border:none;color:#fff;font-family:'Georgia',serif;
   font-size:13px;padding:7px 18px;border-radius:3px;cursor:pointer;letter-spacing:.4px}
 .btn-reanalyze:hover{background:#a03010}
@@ -1784,6 +1829,7 @@ section.active{display:block}
         <div class="base-heading">🗄️ База знаний</div>
         <div class="base-topbar-right">
           <button class="btn-reanalyze" onclick="reanalyze()">⟳ Переосмыслить</button>
+          <button class="btn-add-entity" onclick="openEntityDlg('')">+ сущность</button>
         </div>
       </div>
       <div id="base-content">
@@ -1927,6 +1973,26 @@ section.active{display:block}
 
 
 <!-- Dialogs -->
+<div class="dlg" id="entity-dlg">
+  <div class="dlg-box">
+    <div class="dlg-title" id="entity-dlg-title">Новая сущность</div>
+    <input class="dlg-input" id="ent-name" placeholder="Название (Электросамокат, Камера...)">
+    <select class="dlg-input" id="ent-type" style="font-family:'Georgia',serif">
+      <option value="concept">💡 Концепция / идея</option>
+      <option value="person">👤 Человек</option>
+      <option value="place">📍 Место</option>
+      <option value="project">📁 Проект</option>
+      <option value="object">🔧 Предмет / инструмент</option>
+      <option value="event">📅 Событие</option>
+    </select>
+    <textarea class="dlg-textarea" id="ent-summary" placeholder="Одно предложение — что это значит для Героя" rows="2"></textarea>
+    <input class="dlg-input" id="ent-link-mid" type="hidden">
+    <div class="dlg-btns">
+      <button class="btn-sm btn-ok" onclick="saveEntity()">Создать</button>
+      <button class="btn-sm" onclick="closeDlg('entity-dlg')">Отмена</button>
+    </div>
+  </div>
+</div>
 <div class="dlg" id="mission-dlg">
   <div class="dlg-box">
     <div class="dlg-title">Новый путь</div>
@@ -2666,6 +2732,7 @@ async function loadMissions(){
       ${epilogueHtml}
       <div class="mission-actions">
         ${m.status!=='done'?`<button class="btn-quest-add" onclick="openTaskDlg('${m.id}')">+ добавить задание</button>`:''}
+        <button class="btn-link-entity" onclick="openEntityDlg('${m.id}')" title="Привязать сущность к Пути">+ сущность</button>
         ${m.status!=='done'?`<button class="btn-sm btn-ok" onclick="doneMission('${m.id}')">✓ Путь пройден</button>`:''}
         <button class="btn-sm btn-danger" onclick="deleteMission('${m.id}')">× удалить</button>
       </div>
@@ -2693,6 +2760,31 @@ async function saveMissionDesc(mid){
   const val=document.getElementById('mdesc-ta-'+mid).value.trim();
   await fetch(`/missions/${mid}/description`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({description:val})});
   loadMissions();
+}
+function openEntityDlg(mid){
+  document.getElementById('entity-dlg-title').textContent=mid?'Привязать сущность к Пути':'Новая сущность';
+  document.getElementById('ent-name').value='';
+  document.getElementById('ent-summary').value='';
+  document.getElementById('ent-link-mid').value=mid||'';
+  openDlg('entity-dlg');
+  setTimeout(()=>document.getElementById('ent-name').focus(),50);
+}
+async function saveEntity(){
+  const name=document.getElementById('ent-name').value.trim();
+  if(!name) return;
+  const type=document.getElementById('ent-type').value;
+  const summary=document.getElementById('ent-summary').value.trim();
+  const mid=document.getElementById('ent-link-mid').value;
+  await fetch('/entities',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,type,summary})});
+  if(mid){
+    await fetch(`/missions/${mid}/link-entity`,{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({entity_name:name,label:'связан с'})});
+    loadMissions();
+  }
+  closeDlg('entity-dlg');
+  if(document.querySelector('#s-base.active')) loadBase();
 }
 async function saveMission(){
   const t=document.getElementById('m-title').value.trim();
