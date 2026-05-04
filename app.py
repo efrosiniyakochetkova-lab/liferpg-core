@@ -508,8 +508,12 @@ def entities(type: str=""):
     else:
         rows=kuzu_rows(_conn.execute(
             "MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary,e.tags ORDER BY e.type,e.name"))
-    return [{"id":r[0],"name":r[1],"type":r[2],"summary":r[3],
-             "tags":json.loads(r[4]) if r[4] else []} for r in rows]
+    result=[]
+    for r in rows:
+        try: tags=json.loads(r[4]) if r[4] else []
+        except: tags=r[4].split(',') if r[4] else []
+        result.append({"id":r[0],"name":r[1],"type":r[2],"summary":r[3],"tags":tags})
+    return result
 
 @app.get("/entity/{name}")
 def entity_card(name: str):
@@ -546,7 +550,7 @@ def _sync_mission_entity(mid: str, title: str, description: str, status: str="ac
         try:
             _conn.execute(
                 "CREATE (:Entity {id:$id,name:$name,type:'mission',summary:$s,tags:$t})",
-                {"id":eid,"name":title,"s":summary,"t":f"mission,{status}"})
+                {"id":eid,"name":title,"s":summary,"t":json.dumps(["mission",status],ensure_ascii=False)})
         except: pass
 
 @app.get("/missions")
