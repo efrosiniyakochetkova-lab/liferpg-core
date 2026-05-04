@@ -570,6 +570,8 @@ def add_mission(req: MissionReq):
 @app.post("/missions/{mid}/complete")
 def complete_mission(mid: str):
     _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.status='done'",{"id":mid})
+    if _has_any_ai():
+        threading.Thread(target=_gen_epilogue_bg,args=(mid,),daemon=True).start()
     return {"ok":True}
 
 @app.post("/missions/{mid}/delete")
@@ -843,6 +845,86 @@ def config_status():
     cfg=_app_cfg()
     return {"has_key": bool(_get_api_key()), "has_gigachat": bool(cfg.get("gigachat_key")),
             "active": "anthropic" if _get_api_key() else ("gigachat" if cfg.get("gigachat_key") else "none")}
+
+CHAR_FILE = Path(__file__).parent / "character.json"
+
+def _char_data():
+    if CHAR_FILE.exists():
+        try: return json.loads(CHAR_FILE.read_text())
+        except: pass
+    return {"traits":[],"antagonist_name":"","antagonist_desc":"",
+            "last_analyzed":"","season_chronicles":{},"mission_epilogues":{}}
+
+def _save_char(data):
+    CHAR_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+@app.get("/character/data")
+def get_character_data():
+    return _char_data()
+
+@app.post("/character/analyze")
+def analyze_character():
+    if not _has_any_ai(): return {"ok":False,"reason":"no_ai"}
+    entries=kuzu_rows(_conn.execute(
+        "MATCH (e:Entry) RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 20"))
+    if len(entries)<3: return {"ok":False,"reason":"not_enough_entries"}
+    entry_lines="\n".join(f"[{r[1]}] {r[0]}" for r in entries if r[0])
+    missions=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) RETURN m.title, m.status LIMIT 10"))
+    mission_lines="\n".join(f"- {r[0]} ({r[1]})" for r in missions) or "нет"
+    def _bg():
+        try:
+            t1=_call_any_ai(f"""Ты — Архивариус. Выяви 3-4 черты характера Героя, которые проявились в записях сами — не декларированные, а реально видимые в поступках.
+Каждая черта — одно предложение от третьего лица в стиле летописца.
+Записи:\n{entry_lines}
+Верни ТОЛЬКО JSON: {{"traits": ["черта1","черта2","черта3"]}}""")
+            m1=re.search(r'\{.*\}',t1,re.DOTALL)
+            traits=json.loads(m1.group()).get("traits",[]) if m1 else []
+        except: traits=[]
+        try:
+            t2=_call_any_ai(f"""Ты — Архивариус. Найди главное повторяющееся препятствие Героя. Назови его мифическим именем (2-3 слова) и опиши в 1-2 предложениях.
+Записи:\n{entry_lines}\nПути:\n{mission_lines}
+Верни ТОЛЬКО JSON: {{"name":"Имя антагониста","desc":"описание"}}""")
+            m2=re.search(r'\{.*\}',t2,re.DOTALL)
+            antag=json.loads(m2.group()) if m2 else {"name":"","desc":""}
+        except: antag={"name":"","desc":""}
+        data=_char_data()
+        data["traits"]=traits
+        data["antagonist_name"]=antag.get("name","")
+        data["antagonist_desc"]=antag.get("desc","")
+        data["last_analyzed"]=datetime.now().strftime("%Y-%m-%d")
+        _save_char(data)
+    threading.Thread(target=_bg,daemon=True).start()
+    return {"ok":True,"status":"analyzing"}
+
+@app.get("/chronicle/past-moon")
+def past_moon_entry():
+    from datetime import timedelta
+    today=datetime.now()
+    ws=(today-timedelta(days=35)).strftime("%Y-%m-%d %H:%M")
+    we=(today-timedelta(days=25)).strftime("%Y-%m-%d %H:%M")
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (e:Entry) WHERE e.ts >= $s AND e.ts <= $e "
+        "RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 1",{"s":ws,"e":we}))
+    if not rows: return {"entry":None}
+    return {"entry":{"narrative":rows[0][0],"ts":rows[0][1]}}
+
+def _gen_epilogue_bg(mid: str):
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.id=$id RETURN m.title, m.description",{"id":mid}))
+    if not rows: return
+    title,desc=rows[0][0],rows[0][1] or ""
+    tasks=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.mission_id=$id RETURN t.title",{"id":mid}))
+    task_lines="\n".join(f"- {r[0]}" for r in tasks) or "задания не записаны"
+    p=f"""Ты — Архивариус. Путь завершён. Напиши эпическую эпитафию этому отрезку жизни Героя.
+2-3 предложения. Торжественная летопись. Дата завершения: {datetime.now().strftime("%Y-%m-%d")}.
+Путь: {title}\nОписание: {desc}\nЗадания:\n{task_lines}
+Верни только текст эпитафии, без кавычек."""
+    text=_call_any_ai(p)
+    data=_char_data()
+    data.setdefault("mission_epilogues",{})[mid]=text.strip()
+    _save_char(data)
 
 @app.get("/export")
 def export_data():
@@ -1384,6 +1466,45 @@ section.active{display:block}
 .pocket-tx-amount.deferred{color:var(--gold)}
 .pocket-section-title{font-size:11px;letter-spacing:3px;text-transform:uppercase;
   font-family:sans-serif;color:var(--ink3);margin-bottom:14px}
+/* ── SOUND TOGGLE ── */
+.sound-btn{background:none;border:1px solid var(--border2);color:var(--ink3);
+  font-family:sans-serif;font-size:11px;padding:3px 10px;border-radius:10px;
+  cursor:pointer;transition:all .15s;white-space:nowrap}
+.sound-btn:hover{border-color:var(--gold);color:var(--gold)}
+.sound-btn.on{border-color:var(--gold);color:var(--gold);background:rgba(138,92,42,.07)}
+/* ── CHARACTER TRAITS SIDEBAR ── */
+.char-section{margin-top:4px;padding-top:14px;border-top:1px solid var(--border2)}
+.char-trait{font-size:11px;color:var(--ink2);font-family:sans-serif;line-height:1.5;
+  padding:5px 0;border-bottom:.5px solid var(--border2);font-style:italic}
+.char-trait:last-child{border-bottom:none}
+.char-analyze-btn{font-size:10px;font-family:sans-serif;color:var(--ink3);
+  cursor:pointer;padding:4px 0;transition:color .12s;margin-top:6px;display:block}
+.char-analyze-btn:hover{color:var(--gold)}
+/* ── PAST MOON MEMORY ── */
+.past-moon-block{margin:0 0 28px;padding:12px 16px;background:var(--paper2);
+  border-left:2px solid var(--border2);font-family:'Georgia',serif}
+.past-moon-label{font-size:9px;letter-spacing:2px;text-transform:uppercase;
+  color:var(--ink3);font-family:sans-serif;margin-bottom:6px}
+.past-moon-text{font-size:13px;color:var(--ink3);line-height:1.6;font-style:italic}
+.past-moon-ts{font-size:10px;color:var(--border);font-family:sans-serif;margin-top:5px}
+/* ── ANTAGONIST CARD ── */
+.antag-card{background:rgba(139,46,15,.04);border:1px solid rgba(139,46,15,.2);
+  border-radius:3px;padding:18px 20px;margin-bottom:32px;position:relative}
+.antag-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
+  background:var(--red);border-radius:3px 0 0 3px}
+.antag-title{font-size:10px;letter-spacing:2px;text-transform:uppercase;
+  font-family:sans-serif;color:var(--red);margin-bottom:8px}
+.antag-name{font-size:20px;color:var(--ink);margin-bottom:6px}
+.antag-desc{font-size:13px;color:var(--ink2);font-family:sans-serif;
+  line-height:1.65;font-style:italic}
+.antag-hint{font-size:10px;font-family:sans-serif;color:var(--ink3);margin-top:10px}
+/* ── EPILOGUE ── */
+.mission-epilogue{margin:14px 0 0 28px;padding:12px 14px;
+  background:rgba(139,105,20,.05);border-left:2px solid rgba(139,105,20,.35);
+  font-size:12px;color:var(--ink2);font-family:'Georgia',serif;
+  font-style:italic;line-height:1.7}
+.mission-epilogue-label{font-size:9px;letter-spacing:2px;text-transform:uppercase;
+  font-family:sans-serif;color:var(--gold);margin-bottom:6px}
 /* ── ORACLE MODAL ── */
 #oracle-modal{display:none;position:fixed;inset:0;background:rgba(44,35,24,.55);z-index:600;
   align-items:center;justify-content:center}
@@ -1449,6 +1570,7 @@ section.active{display:block}
   <div class="topbar-right">
     <div id="nav-api-status"></div>
     <div class="topbar-date" id="hdr-date"></div>
+    <button class="sound-btn" id="sound-btn" onclick="toggleSound()">♪ амбиент</button>
     <div class="topbar-settings" onclick="openSettings()">⚙</div>
   </div>
 </div>
@@ -1459,6 +1581,7 @@ section.active{display:block}
     <div class="aside-label">Активные пути</div>
     <div id="aside-missions"></div>
   </div>
+  <div class="char-section" id="char-sidebar"></div>
   <div class="aside-bottom">
     <div class="aside-bottom-link" onclick="nav(document.querySelector('[data-s=base]'))">🗄️ База знаний →</div>
   </div>
@@ -1934,6 +2057,146 @@ function loadMechanics(){
   </div>`;
 }
 
+// ── Ambient Sound Engine ─────────────────────────────────────────────────────
+const Amb={
+  ctx:null,_nodes:[],_mg:null,_on:false,_season:null,
+  _init(){
+    if(this.ctx)return;
+    this.ctx=new(window.AudioContext||window.webkitAudioContext)();
+    this._mg=this.ctx.createGain(); this._mg.gain.value=0.45;
+    this._mg.connect(this.ctx.destination);
+  },
+  _buf(sec=4){
+    const b=this.ctx.createBuffer(1,this.ctx.sampleRate*sec,this.ctx.sampleRate);
+    const d=b.getChannelData(0); for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+    const s=this.ctx.createBufferSource(); s.buffer=b; s.loop=true; return s;
+  },
+  _bq(type,freq,Q=1){const f=this.ctx.createBiquadFilter();f.type=type;f.frequency.value=freq;f.Q.value=Q;return f;},
+  _g(v){const g=this.ctx.createGain();g.gain.value=v;return g;},
+  _osc(freq,type='sine'){const o=this.ctx.createOscillator();o.type=type;o.frequency.value=freq;return o;},
+  _lfo(freq,depth,target){const l=this._osc(freq),g=this._g(depth);l.connect(g);g.connect(target);return l;},
+  _add(...n){this._nodes.push(...n);},
+  _start(...n){n.forEach(x=>x.start());this._add(...n);},
+  stop(){this._nodes.forEach(n=>{try{n.stop?.();n.disconnect();}catch(e){}});this._nodes=[];},
+  _wire(src,dst){src.connect(dst);return src;},
+
+  play(season){
+    this._init();
+    if(this.ctx.state==='suspended')this.ctx.resume();
+    this.stop(); this._season=season;
+    if(!this._on)return;
+    const fn=this['_'+season]; if(fn)fn.call(this);
+  },
+
+  /* ПРОБУЖДЕНИЕ — spring wind + bright air */
+  _Пробуждение(){
+    const w=this._buf(4),lp=this._bq('lowpass',450,.4),g=this._g(.05);
+    const lfo=this._lfo(.07,.03,g.gain);
+    w.connect(lp);lp.connect(g);g.connect(this._mg);
+    const b=this._buf(2),bp=this._bq('bandpass',2800,2.5),g2=this._g(.006);
+    const lfo2=this._lfo(.14,.005,g2.gain);
+    b.connect(bp);bp.connect(g2);g2.connect(this._mg);
+    this._start(w,lfo,b,lfo2);
+  },
+
+  /* ЗНОЙ — crickets (AM noise) + heat haze */
+  _Зной(){
+    const n=this._buf(2),bp=this._bq('bandpass',5800,10),g=this._g(.0);
+    const am=this._lfo(15,.025,g.gain);
+    const sw=this._lfo(.04,.015,g.gain);
+    n.connect(bp);bp.connect(g);g.connect(this._mg);
+    const w=this._buf(4),lp=this._bq('lowpass',280,.3),gw=this._g(.018);
+    const lwfo=this._lfo(.05,.015,gw.gain);
+    w.connect(lp);lp.connect(gw);gw.connect(this._mg);
+    this._start(n,am,sw,w,lwfo);
+  },
+
+  /* ЖАТВА — deeper wind + rustle */
+  _Жатва(){
+    const w=this._buf(4),lp=this._bq('lowpass',320,.5),g=this._g(.055);
+    const lfo=this._lfo(.045,.028,g.gain);
+    w.connect(lp);lp.connect(g);g.connect(this._mg);
+    const r=this._buf(1),bp=this._bq('bandpass',1800,3),g2=this._g(.012);
+    const lfo2=this._lfo(.22,.011,g2.gain);
+    r.connect(bp);bp.connect(g2);g2.connect(this._mg);
+    this._start(w,lfo,r,lfo2);
+  },
+
+  /* УГАСАНИЕ — haunting drone + slow wind */
+  _Угасание(){
+    const dr=this._osc(55,'triangle'),g=this._g(.038);
+    const lfo=this._lfo(.025,.02,g.gain);
+    dr.connect(g);g.connect(this._mg);
+    const w=this._buf(4),lp=this._bq('lowpass',250,.4),gw=this._g(.042);
+    const lwfo=this._lfo(.055,.03,gw.gain);
+    w.connect(lp);lp.connect(gw);gw.connect(this._mg);
+    this._start(dr,lfo,w,lwfo);
+  },
+
+  /* МОРОЗ — deep cold wind + sub bass pulse */
+  _Мороз(){
+    const w=this._buf(8),lp=this._bq('lowpass',180,.3),g=this._g(.032);
+    const lfo=this._lfo(.022,.028,g.gain);
+    w.connect(lp);lp.connect(g);g.connect(this._mg);
+    const sub=this._osc(38,'sine'),sg=this._g(.022);
+    const slfo=this._lfo(.035,.018,sg.gain);
+    sub.connect(sg);sg.connect(this._mg);
+    this._start(w,lfo,sub,slfo);
+  }
+};
+
+function toggleSound(){
+  const btn=document.getElementById('sound-btn');
+  Amb._on=!Amb._on;
+  if(Amb._on){
+    Amb.play(WoW.now().season);
+    btn.textContent='♪ амбиент'; btn.classList.add('on');
+  } else {
+    Amb.stop();
+    btn.textContent='♪ амбиент'; btn.classList.remove('on');
+  }
+}
+
+// ── Streak Mythology ──────────────────────────────────────────────────────────
+function streakMythName(n){
+  if(!n||n<3)return n>0?`🔥 ${n}`:'';
+  const tiers=[[100,'Бессмертия'],[60,'Легенды'],[30,'Вечного Пламени'],[14,'Пылающей Цепи'],[7,'Непрерывного Огня'],[3,'Зарождения']];
+  const tier=tiers.find(t=>n>=t[0]);
+  return `🔥 ${n}-й день ${tier?tier[1]:'Начала'}`;
+}
+
+// ── Visual Aging ──────────────────────────────────────────────────────────────
+function entryAgeStyle(tsStr){
+  const days=(Date.now()-new Date(tsStr.replace(' ','T')).getTime())/86400000;
+  if(days<3) return '';
+  if(days<8) return 'opacity:.92;filter:sepia(12%)';
+  if(days<30) return 'opacity:.85;filter:sepia(28%)';
+  if(days<90) return 'opacity:.78;filter:sepia(45%)';
+  return 'opacity:.70;filter:sepia(62%)';
+}
+
+// ── Character Traits ──────────────────────────────────────────────────────────
+async function loadCharacter(){
+  const d=await(await fetch('/character/data')).json();
+  const el=document.getElementById('char-sidebar');
+  if(!el)return;
+  if(!d.traits?.length&&!d.antagonist_name){
+    el.innerHTML=`<div class="aside-label" style="margin-bottom:6px">Облик Героя</div>
+      <span class="char-analyze-btn" onclick="triggerAnalyze()">⟳ Архивариус изучает характер...</span>`;
+    return;
+  }
+  const traitsHtml=d.traits.map(t=>`<div class="char-trait">${t}</div>`).join('');
+  el.innerHTML=`<div class="aside-label" style="margin-bottom:6px">Облик Героя</div>
+    ${traitsHtml}
+    ${d.last_analyzed?`<span class="char-analyze-btn" onclick="triggerAnalyze()" title="Обновить">⟳ обновить · ${d.last_analyzed}</span>`:''}`;
+}
+async function triggerAnalyze(){
+  const el=document.getElementById('char-sidebar');
+  if(el) el.querySelector('.char-analyze-btn,.aside-label')&&(el.innerHTML+='<span style="font-size:10px;font-family:sans-serif;color:var(--ink3)"> анализирует...</span>');
+  await fetch('/character/analyze',{method:'POST'});
+  setTimeout(()=>loadCharacter(),12000);
+}
+
 // ── Nav ──────────────────────────────────────────────────────────────────────
 const TITLES={journal:'Дневник',missions:'Пути',base:'База знаний',pocket:'Карман'};
 function nav(el){
@@ -1964,12 +2227,13 @@ function linkify(text){
 
 // ── Journal ──────────────────────────────────────────────────────────────────
 async function loadJournal(){
-  const [dr,er,ir,doneR,mr,narR]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today'),fetch('/missions'),fetch('/today-narrative')]);
+  const [dr,er,ir,doneR,mr,narR,pmR]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today'),fetch('/missions'),fetch('/today-narrative'),fetch('/chronicle/past-moon')]);
   const diary=await dr.json(); allEntities=await er.json();
   const inboxRaw=await ir.json();
   const doneToday=(await doneR.json()).count||0;
   const missions=await mr.json();
   const todayNarrative=(await narR.json()).narrative||'';
+  const pastMoon=(await pmR.json()).entry||null;
   const today=new Date().toISOString().slice(0,10);
   const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>
     (t.task_type==='repeat'&&t.current_iters>0)
@@ -1987,18 +2251,25 @@ async function loadJournal(){
     if(!byDate[d])byDate[d]=[];
     byDate[d].push(e);
   }
-  el.innerHTML=Object.entries(byDate).map(([date,entries])=>{
+  const calNow=WoW.now();
+  const pastMoonHtml=pastMoon?`<div class="past-moon-block">
+    <div class="past-moon-label">${calNow.phaseEmoji} В прошлую ${calNow.phase}</div>
+    <div class="past-moon-text">${pastMoon.narrative?.slice(0,200)}${pastMoon.narrative?.length>200?'…':''}</div>
+    <div class="past-moon-ts">${pastMoon.ts?.split(' ')[0]||''}</div>
+  </div>`:'';
+  el.innerHTML=pastMoonHtml+Object.entries(byDate).map(([date,entries])=>{
     const cal=WoW.convert(date);
     const items=entries.map(e=>{
       const timeStr=e.ts.includes(' ')?e.ts.split(' ')[1]:'';
       const isPending = pendingIds.has(e.id);
+      const ageStyle=entryAgeStyle(e.ts);
       const archivistHtml=e.archivist_note?
         `<div class="entry-archivist">◆ ${e.archivist_note}</div>`:'';
       const pendingHtml=isPending?
         `<div style="font-size:11px;color:var(--border);font-family:sans-serif;font-style:italic;margin-top:8px">
           ⏳ Архивариус обрабатывает запись...
         </div>`:'';
-      return `<div class="entry">
+      return `<div class="entry" style="${ageStyle}">
         <div class="entry-text">${linkify(e.narrative)}</div>
         ${!isPending&&e.raw&&e.raw!==e.narrative?`<div class="entry-raw">«${e.raw}»</div>`:''}
         ${archivistHtml}
@@ -2100,7 +2371,9 @@ function toggleMission(mid){
 }
 
 async function loadMissions(){
-  const r=await fetch('/missions'); const ms=await r.json();
+  const [r,cd]=await Promise.all([fetch('/missions'),fetch('/character/data')]);
+  const ms=await r.json(); const charData=await cd.json();
+  const epilogues=charData.mission_epilogues||{};
   const el=document.getElementById('missions-list');
   if(!ms.length){
     el.innerHTML='<div class="empty">Нет путей. Добавь первый путь ↗</div>';
@@ -2114,6 +2387,10 @@ async function loadMissions(){
     const totalCount=m.tasks.length;
     const wasOpen=_openMissions.has(m.id);
 
+    const epilogueHtml=epilogues[m.id]?`<div class="mission-epilogue">
+      <div class="mission-epilogue-label">✦ Эпилог</div>
+      ${epilogues[m.id]}
+    </div>`:'';
     let archivistHtml='';
     if(m.status!=='done'){
       if(totalCount===0){
@@ -2139,7 +2416,7 @@ async function loadMissions(){
             <div class="repeat-progress">
               <button class="iter-btn" onclick="tickTask('${t.id}','${m.id}')" ${cycled?'disabled':''}>+1</button>
               <span class="iter-count ${cycled?'done':''}">${t.current_iters}/${t.required_iters}</span>
-              <span class="streak-display">🔥&thinsp;${t.streak}</span>
+              <span class="streak-display">${streakMythName(t.streak)}</span>
               <span class="streak-best">рекорд: ${t.best_streak}</span>
               <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
             </div>
@@ -2180,6 +2457,7 @@ async function loadMissions(){
         ${archivistHtml}
         ${tasks}
       </div>
+      ${epilogueHtml}
       <div class="mission-actions">
         ${m.status!=='done'?`<button class="btn-quest-add" onclick="openTaskDlg('${m.id}')">+ добавить задание</button>`:''}
         ${m.status!=='done'?`<button class="btn-sm btn-ok" onclick="doneMission('${m.id}')">✓ Путь пройден</button>`:''}
@@ -2306,9 +2584,9 @@ async function saveTaskEdit(tid){
 
 // ── Base of Knowledge ─────────────────────────────────────────────────────────
 async function loadBase(){
-  const [er,gr]=await Promise.all([fetch('/entities'),fetch('/graph')]);
+  const [er,gr,cd]=await Promise.all([fetch('/entities'),fetch('/graph'),fetch('/character/data')]);
   const entities=await er.json(); allEntities=entities;
-  const graph=await gr.json();
+  const graph=await gr.json(); const charData=await cd.json();
 
   // Build link map: entity name → outgoing relations
   const linkMap={};
@@ -2357,7 +2635,13 @@ async function loadBase(){
     </div>`;
   }).join('');
 
-  el.innerHTML=(html||'<div class="empty">База пуста. Записи в журнале породят сущности здесь.</div>')+loadMechanics();
+  const antagonistHtml=charData.antagonist_name?`<div class="antag-card">
+    <div class="antag-title">⚔ Антагонист Героя</div>
+    <div class="antag-name">${charData.antagonist_name}</div>
+    <div class="antag-desc">${charData.antagonist_desc}</div>
+    <div class="antag-hint">Архивариус выявил это из твоих записей · ${charData.last_analyzed||''}</div>
+  </div>`:'';
+  el.innerHTML=antagonistHtml+(html||'<div class="empty">База пуста. Записи в журнале породят сущности здесь.</div>')+loadMechanics();
 }
 
 // ── Переосмыслить ────────────────────────────────────────────────────────────
@@ -2610,7 +2894,13 @@ async function processPendingInbox(){
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────
-loadJournal(); loadAsides(); checkApiStatus();
+loadJournal(); loadAsides(); checkApiStatus(); loadCharacter();
+// Auto-analyze character if never done or >7 days ago
+fetch('/character/data').then(r=>r.json()).then(d=>{
+  const last=d.last_analyzed;
+  const stale=!last||(Date.now()-new Date(last).getTime())/86400000>7;
+  if(stale) fetch('/character/analyze',{method:'POST'}).then(()=>setTimeout(loadCharacter,15000));
+});
 </script>
 </body>
 </html>"""
