@@ -4190,8 +4190,9 @@ const LoginAtmo = {
 // ── Init ─────────────────────────────────────────────────────────────────────
 checkApiStatus();
 authInit().then(()=>{
-  if(localStorage.getItem('lrpg_token')) loadJournal(),loadAsides(),loadCharacter();
+  if(localStorage.getItem('lrpg_token')) loadJournal(),loadAsides();
 });
+loadCharacter();
 // Mobile: show input bar on journal tab by default
 (function(){
   if(window.innerWidth<=768){
