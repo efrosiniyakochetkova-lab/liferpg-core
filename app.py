@@ -454,13 +454,20 @@ def import_data(req: ImportReq):
                 imported["entities"]+=1
         except: pass
     # Missions
+    try: _conn.execute("ALTER TABLE Mission ADD lore STRING DEFAULT ''")
+    except: pass
     for m in d.get("missions",[]):
         try:
             rows=kuzu_rows(_conn.execute("MATCH (x:Mission) WHERE x.id=$id RETURN x.id",{"id":m["id"]}))
             if not rows:
-                _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,lore:$l})",
-                    {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
-                     "s":m.get("status","active"),"ts":m.get("ts",""),"l":m.get("lore","")})
+                try:
+                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,lore:$l})",
+                        {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
+                         "s":m.get("status","active"),"ts":m.get("ts",""),"l":m.get("lore","")})
+                except:
+                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts})",
+                        {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
+                         "s":m.get("status","active"),"ts":m.get("ts","")})
                 imported["missions"]+=1
         except: pass
     # Tasks
