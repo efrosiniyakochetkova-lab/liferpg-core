@@ -25,6 +25,12 @@ def _app_cfg():
 def _get_api_key():
     return _app_cfg().get("api_key") or os.environ.get("ANTHROPIC_API_KEY","")
 
+def _get_gigachat_key():
+    return _app_cfg().get("gigachat_key") or os.environ.get("GIGACHAT_API_KEY","")
+
+def _get_gigachat_scope():
+    return _app_cfg().get("gigachat_scope") or os.environ.get("GIGACHAT_SCOPE","GIGACHAT_API_PERS")
+
 _gc_token_cache = {"token": "", "expires": 0.0}
 
 def _get_gigachat_token(key: str, scope: str) -> str:
@@ -51,8 +57,8 @@ def _get_gigachat_token(key: str, scope: str) -> str:
         print(f"[gigachat_token] {e}"); return ""
 
 def _call_gigachat(prompt_text: str) -> str:
-    cfg = _app_cfg()
-    key = cfg.get("gigachat_key",""); scope = cfg.get("gigachat_scope","GIGACHAT_API_PERS")
+    key = _get_gigachat_key()
+    scope = _get_gigachat_scope()
     if not key: return ""
     tok = _get_gigachat_token(key, scope)
     if not tok: return ""
@@ -86,8 +92,7 @@ def call_ai_extract(raw: str) -> dict:
             if m: return json.loads(m.group())
         except Exception as e: print(f"[anthropic] {e}")
     # Try GigaChat
-    cfg = _app_cfg()
-    if cfg.get("gigachat_key"):
+    if _get_gigachat_key():
         try:
             text = _call_gigachat(p)
             m = re.search(r'\{.*\}', text, re.DOTALL)
@@ -136,8 +141,8 @@ def optional_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) 
 
 # ─────────────────────────────────────────────────────────────────────────────
 DB_PATH   = str(_DATA_DIR / "liferpg.db")
-_VER_F    = Path(__file__).parent / ".schema_v"
-_SCHEMA   = "5"   # bump → auto-drops all tables and rebuilds
+_VER_F    = _DATA_DIR / ".schema_v"
+_SCHEMA   = "5"
 
 _db   = kuzu.Database(DB_PATH)
 _conn = kuzu.Connection(_db)
@@ -153,7 +158,8 @@ def _drop_all():
 def _setup():
     cv = _VER_F.read_text().strip() if _VER_F.exists() else "0"
     if cv != _SCHEMA:
-        _drop_all()
+        if os.environ.get("LIFERPG_RESET_SCHEMA") == "1":
+            _drop_all()
         _VER_F.write_text(_SCHEMA)
     _conn.execute("""CREATE NODE TABLE IF NOT EXISTS Entry(
         id STRING, ts STRING, raw_text STRING, narrative STRING,
@@ -560,7 +566,7 @@ class TaskReq(BaseModel):
 class FinanceReq(BaseModel): amount: float; direction: str; category: str=""; note: str=""
 class ModeReq(BaseModel): name: str; description: str = ""
 
-INBOX_FILE = Path(__file__).parent / "inbox.json"
+INBOX_FILE = _DATA_DIR / "inbox.json"
 
 @app.post("/ingest")
 def ingest(req: IngestReq):
@@ -1016,8 +1022,7 @@ _REANALYZE_PROMPT = """Ты — Архивариус. Обнови лор каж
 {{"missions":[{{"id":"...","lore":"..."}}]}}"""
 
 def _has_any_ai() -> bool:
-    cfg = _app_cfg()
-    return bool(_get_api_key() or cfg.get("gigachat_key"))
+    return bool(_get_api_key() or _get_gigachat_key())
 
 def _call_any_ai(prompt_text: str) -> str:
     """Try Anthropic then GigaChat, return raw text."""
@@ -1303,9 +1308,8 @@ def oracle(req: OracleReq):
 
 @app.get("/config/status")
 def config_status():
-    cfg=_app_cfg()
-    return {"has_key": bool(_get_api_key()), "has_gigachat": bool(cfg.get("gigachat_key")),
-            "active": "anthropic" if _get_api_key() else ("gigachat" if cfg.get("gigachat_key") else "none")}
+    return {"has_key": bool(_get_api_key()), "has_gigachat": bool(_get_gigachat_key()),
+            "active": "anthropic" if _get_api_key() else ("gigachat" if _get_gigachat_key() else "none")}
 
 CHAR_FILE = _DATA_DIR / "character.json"
 
