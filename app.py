@@ -74,9 +74,9 @@ def _call_gigachat(prompt_text: str) -> str:
     except Exception as e:
         print(f"[gigachat] {e}"); return ""
 
-def call_ai_extract(raw: str) -> dict:
+def call_ai_extract(raw: str, user_id: str = "admin") -> dict:
     """Call AI (Anthropic or GigaChat). Returns parsed dict or None."""
-    ent_ctx, miss_ctx = build_context()
+    ent_ctx, miss_ctx = build_context(user_id)
     p = PROMPT.format(raw=raw, entities_ctx=ent_ctx or "нет",
                       missions_ctx=miss_ctx or "нет активных путей")
     # Try Anthropic first
@@ -100,8 +100,8 @@ def call_ai_extract(raw: str) -> dict:
         except Exception as e: print(f"[gigachat_parse] {e}")
     return None
 
-def call_claude_extract(raw: str) -> dict:  # backward compat alias
-    return call_ai_extract(raw)
+def call_claude_extract(raw: str, user_id: str = "admin") -> dict:  # backward compat alias
+    return call_ai_extract(raw, user_id)
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 SESSIONS_FILE = _DATA_DIR / "sessions.json"
@@ -138,6 +138,26 @@ def current_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -
 def optional_user(cred: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> dict | None:
     if cred: return _token_to_user(cred.credentials)
     return None
+
+def _uid(user: dict | None) -> str:
+    return user["user_id"] if user else "admin"
+
+def _scoped_id(base_id: str, user_id: str) -> str:
+    return base_id if user_id == "admin" else f"{user_id}:{base_id}"
+
+def _entity_id(name: str, user_id: str) -> str:
+    return _scoped_id(slug(name), user_id)
+
+def _mission_entity_id(mid: str, title: str, user_id: str) -> str:
+    if user_id == "admin":
+        return "mission_" + slug(title)
+    return _scoped_id(f"mission:{mid}", user_id)
+
+def _user_json_file(base_name: str, user_id: str) -> Path:
+    if user_id == "admin":
+        return _DATA_DIR / base_name
+    stem, suffix = base_name.rsplit(".", 1)
+    return _DATA_DIR / f"{stem}.{user_id}.{suffix}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 DB_PATH   = str(_DATA_DIR / "liferpg.db")
@@ -256,15 +276,21 @@ def _ensure_admin_user():
 _migrate_user_columns()
 _ensure_admin_user()
 
-def entity_exists(eid):
-    r=_conn.execute("MATCH (e:Entity) WHERE e.id=$id RETURN count(e)",{"id":eid})
+def entity_exists(eid, user_id: str | None = None):
+    if user_id:
+        r=_conn.execute("MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid RETURN count(e)",
+                        {"id":eid,"uid":user_id})
+    else:
+        r=_conn.execute("MATCH (e:Entity) WHERE e.id=$id RETURN count(e)",{"id":eid})
     return r.get_next()[0]>0 if r.has_next() else False
 
-def build_context():
+def build_context(user_id: str = "admin"):
     ents = kuzu_rows(_conn.execute(
-        "MATCH (e:Entity) RETURN e.name,e.type,e.summary LIMIT 40"))
+        "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.name,e.type,e.summary LIMIT 40",
+        {"uid":user_id}))
     missions = kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) WHERE m.status='active' RETURN m.id,m.title LIMIT 10"))
+        "MATCH (m:Mission) WHERE m.status='active' AND m.user_id=$uid RETURN m.id,m.title LIMIT 10",
+        {"uid":user_id}))
     ent_ctx  = "\n".join(f"- {r[0]} ({r[1]}): {r[2]}" for r in ents)
     miss_ctx = "\n".join(f"  ID={r[0]}: {r[1]}" for r in missions)
     return ent_ctx, miss_ctx
@@ -309,8 +335,8 @@ PROMPT = """Ты — Архивариус, хранитель Живой Лет�
 ЗАПИСЬ ГЕРОЯ:
 {raw}"""
 
-def extract(raw):
-    ent_ctx, miss_ctx = build_context()
+def extract(raw, user_id: str = "admin"):
+    ent_ctx, miss_ctx = build_context(user_id)
     p = PROMPT.format(raw=raw,
                       entities_ctx=ent_ctx or "нет",
                       missions_ctx=miss_ctx or "нет активных путей")
@@ -324,40 +350,42 @@ def extract(raw):
     return {"narrative":raw,"entities":[],"relations":[],"quests":[],
             "archivist_note":"","mission_analysis":[],"_ai_pending":True}
 
-def write_entry(raw, data):
+def write_entry(raw, data, user_id: str = "admin"):
     eid = str(uuid.uuid4())
     ts  = datetime.now().strftime("%Y-%m-%d %H:%M")
     an  = data.get("archivist_note","")
     _conn.execute(
-        "CREATE (:Entry {id:$id,ts:$ts,raw_text:$r,narrative:$n,archivist_note:$an})",
-        {"id":eid,"ts":ts,"r":raw,"n":data.get("narrative",raw),"an":an})
+        "CREATE (:Entry {id:$id,ts:$ts,raw_text:$r,narrative:$n,archivist_note:$an,user_id:$uid})",
+        {"id":eid,"ts":ts,"r":raw,"n":data.get("narrative",raw),"an":an,"uid":user_id})
     for ent in data.get("entities",[]):
-        sid  = slug(ent["name"])
+        sid  = _entity_id(ent["name"], user_id)
         tags = json.dumps(ent.get("tags",[]), ensure_ascii=False)
-        if entity_exists(sid):
+        if entity_exists(sid, user_id):
             _conn.execute(
-                "MATCH (e:Entity) WHERE e.id=$id SET e.summary=$s, e.tags=$t",
-                {"id":sid,"s":ent["summary"],"t":tags})
+                "MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid SET e.summary=$s, e.tags=$t",
+                {"id":sid,"uid":user_id,"s":ent["summary"],"t":tags})
         else:
             _conn.execute(
-                "CREATE (:Entity {id:$id,name:$name,type:$type,summary:$summary,tags:$tags})",
+                "CREATE (:Entity {id:$id,name:$name,type:$type,summary:$summary,tags:$tags,user_id:$uid})",
                 {"id":sid,"name":ent["name"],"type":ent.get("type","concept"),
-                 "summary":ent["summary"],"tags":tags})
+                 "summary":ent["summary"],"tags":tags,"uid":user_id})
         try:
             _conn.execute(
-                "MATCH (en:Entry) WHERE en.id=$eid MATCH (et:Entity) WHERE et.id=$etid"
+                "MATCH (en:Entry) WHERE en.id=$eid AND en.user_id=$uid "
+                "MATCH (et:Entity) WHERE et.id=$etid AND et.user_id=$uid"
                 " CREATE (en)-[:MENTIONS]->(et)",
-                {"eid":eid,"etid":sid})
+                {"eid":eid,"etid":sid,"uid":user_id})
         except: pass
     for rel in data.get("relations",[]):
-        f = slug(rel.get("from_entity",""))
-        t = slug(rel.get("to_entity",""))
-        if f and t and entity_exists(f) and entity_exists(t):
+        f = _entity_id(rel.get("from_entity",""), user_id)
+        t = _entity_id(rel.get("to_entity",""), user_id)
+        if f and t and entity_exists(f, user_id) and entity_exists(t, user_id):
             try:
                 _conn.execute(
-                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t"
+                    "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid "
+                    "MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid"
                     " CREATE (a)-[:LINKED{label:$l,entry_id:$eid}]->(b)",
-                    {"f":f,"t":t,"l":rel.get("label","связан с"),"eid":eid})
+                    {"f":f,"t":t,"uid":user_id,"l":rel.get("label","связан с"),"eid":eid})
             except: pass
     return eid
 
@@ -395,24 +423,33 @@ def me(u: dict = Depends(current_user)):
     return {"user_id": u["user_id"], "login": u["login"]}
 
 @app.get("/export")
-def export_data():
+def export_data(u: dict = Depends(current_user)):
+    uid = _uid(u)
     entries = kuzu_rows(_conn.execute(
-        "MATCH (e:Entry) RETURN e.id,e.ts,e.raw_text,e.narrative,e.archivist_note"))
+        "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.id,e.ts,e.raw_text,e.narrative,e.archivist_note",
+        {"uid":uid}))
     entities = kuzu_rows(_conn.execute(
-        "MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary,e.tags"))
+        "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.id,e.name,e.type,e.summary,e.tags",
+        {"uid":uid}))
     missions = kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status,m.ts,m.lore"))
+        "MATCH (m:Mission) WHERE m.user_id=$uid RETURN m.id,m.title,m.description,m.status,m.ts,m.lore",
+        {"uid":uid}))
     tasks = kuzu_rows(_conn.execute(
-        "MATCH (t:Task) RETURN t.id,t.mission_id,t.title,t.status,t.ts,"
+        "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.id,t.mission_id,t.title,t.status,t.ts,"
         "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
-        "t.last_reset_ts,t.streak,t.best_streak,t.entry_id"))
+        "t.last_reset_ts,t.streak,t.best_streak,t.entry_id",
+        {"uid":uid}))
     finances = kuzu_rows(_conn.execute(
-        "MATCH (f:Finance) RETURN f.id,f.amount,f.direction,f.category,f.note,f.ts"))
+        "MATCH (f:Finance) WHERE f.user_id=$uid RETURN f.id,f.amount,f.direction,f.category,f.note,f.ts",
+        {"uid":uid}))
     links = kuzu_rows(_conn.execute(
-        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) RETURN a.id,r.label,b.id,r.entry_id"))
+        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE a.user_id=$uid AND b.user_id=$uid "
+        "RETURN a.id,r.label,b.id,r.entry_id",
+        {"uid":uid}))
     mentions = kuzu_rows(_conn.execute(
-        "MATCH (e:Entry)-[:MENTIONS]->(n:Entity) RETURN e.id,n.id"))
-    char = json.loads(CHAR_FILE.read_text()) if CHAR_FILE.exists() else {}
+        "MATCH (e:Entry)-[:MENTIONS]->(n:Entity) WHERE e.user_id=$uid AND n.user_id=$uid RETURN e.id,n.id",
+        {"uid":uid}))
+    char = _char_data(uid)
     return {
         "version": 2,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -434,7 +471,8 @@ class ImportReq(BaseModel):
     data: dict
 
 @app.post("/import")
-def import_data(req: ImportReq):
+def import_data(req: ImportReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     d = req.data
     if d.get("version",1) < 1:
         raise HTTPException(400, "Неверный формат")
@@ -445,18 +483,18 @@ def import_data(req: ImportReq):
             _conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":e["id"]})
             rows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":e["id"]}))
             if not rows:
-                _conn.execute("CREATE (:Entry {id:$id,ts:$ts,raw_text:$r,narrative:$n,archivist_note:$a})",
+                _conn.execute("CREATE (:Entry {id:$id,ts:$ts,raw_text:$r,narrative:$n,archivist_note:$a,user_id:$uid})",
                     {"id":e["id"],"ts":e.get("ts",""),"r":e.get("raw_text",""),
-                     "n":e.get("narrative",""),"a":e.get("archivist_note","")})
+                     "n":e.get("narrative",""),"a":e.get("archivist_note",""),"uid":uid})
                 imported["entries"]+=1
         except: pass
     # Entities
     for e in d.get("entities",[]):
         try:
             if not entity_exists(e["id"]):
-                _conn.execute("CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg})",
+                _conn.execute("CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg,user_id:$uid})",
                     {"id":e["id"],"n":e["name"],"t":e.get("type","concept"),
-                     "s":e.get("summary",""),"tg":e.get("tags","[]")})
+                     "s":e.get("summary",""),"tg":e.get("tags","[]"),"uid":uid})
                 imported["entities"]+=1
         except: pass
     # Missions
@@ -467,13 +505,13 @@ def import_data(req: ImportReq):
             rows=kuzu_rows(_conn.execute("MATCH (x:Mission) WHERE x.id=$id RETURN x.id",{"id":m["id"]}))
             if not rows:
                 try:
-                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,lore:$l})",
+                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,lore:$l,user_id:$uid})",
                         {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
-                         "s":m.get("status","active"),"ts":m.get("ts",""),"l":m.get("lore","")})
+                         "s":m.get("status","active"),"ts":m.get("ts",""),"l":m.get("lore",""),"uid":uid})
                 except:
-                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts})",
+                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,user_id:$uid})",
                         {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
-                         "s":m.get("status","active"),"ts":m.get("ts","")})
+                         "s":m.get("status","active"),"ts":m.get("ts",""),"uid":uid})
                 imported["missions"]+=1
         except: pass
     # Tasks
@@ -484,13 +522,13 @@ def import_data(req: ImportReq):
                 _conn.execute(
                     "CREATE (:Task {id:$id,mission_id:$mid,title:$ti,status:$s,ts:$ts,"
                     "task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:$ci,"
-                    "last_reset_ts:$lr,streak:$st,best_streak:$bs,entry_id:$eid})",
+                    "last_reset_ts:$lr,streak:$st,best_streak:$bs,entry_id:$eid,user_id:$uid})",
                     {"id":t["id"],"mid":t.get("mission_id",""),"ti":t["title"],
                      "s":t.get("status","active"),"ts":t.get("ts",""),
                      "tt":t.get("task_type","once"),"rh":int(t.get("reset_hours",24)),
                      "ri":int(t.get("required_iters",1)),"ci":int(t.get("current_iters",0)),
                      "lr":t.get("last_reset_ts",""),"st":int(t.get("streak",0)),
-                     "bs":int(t.get("best_streak",0)),"eid":t.get("entry_id","")})
+                     "bs":int(t.get("best_streak",0)),"eid":t.get("entry_id",""),"uid":uid})
                 imported["tasks"]+=1
         except: pass
     # Finances
@@ -498,33 +536,36 @@ def import_data(req: ImportReq):
         try:
             rows=kuzu_rows(_conn.execute("MATCH (x:Finance) WHERE x.id=$id RETURN x.id",{"id":f["id"]}))
             if not rows:
-                _conn.execute("CREATE (:Finance {id:$id,amount:$a,direction:$dir,category:$c,note:$n,ts:$ts})",
+                _conn.execute("CREATE (:Finance {id:$id,amount:$a,direction:$dir,category:$c,note:$n,ts:$ts,user_id:$uid})",
                     {"id":f["id"],"a":float(f.get("amount",0)),"dir":f.get("direction","out"),
-                     "c":f.get("category",""),"n":f.get("note",""),"ts":f.get("ts","")})
+                     "c":f.get("category",""),"n":f.get("note",""),"ts":f.get("ts",""),"uid":uid})
                 imported["finances"]+=1
         except: pass
     # Links
     for lnk in d.get("links",[]):
         try:
-            if entity_exists(lnk["from"]) and entity_exists(lnk["to"]):
+            if entity_exists(lnk["from"], uid) and entity_exists(lnk["to"], uid):
                 _conn.execute(
-                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                    "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid "
+                    "MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid "
                     "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
-                    {"f":lnk["from"],"t":lnk["to"],"l":lnk.get("label",""),"e":lnk.get("entry_id","import")})
+                    {"f":lnk["from"],"t":lnk["to"],"uid":uid,"l":lnk.get("label",""),"e":lnk.get("entry_id","import")})
                 imported["links"]+=1
         except: pass
     # Mentions
     for mn in d.get("mentions",[]):
         try:
-            erows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":mn["entry_id"]}))
-            if erows and entity_exists(mn["entity_id"]):
+            erows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                          {"id":mn["entry_id"],"uid":uid}))
+            if erows and entity_exists(mn["entity_id"], uid):
                 _conn.execute(
-                    "MATCH (e:Entry) WHERE e.id=$eid MATCH (n:Entity) WHERE n.id=$nid "
-                    "CREATE (e)-[:MENTIONS]->(n)",{"eid":mn["entry_id"],"nid":mn["entity_id"]})
+                    "MATCH (e:Entry) WHERE e.id=$eid AND e.user_id=$uid "
+                    "MATCH (n:Entity) WHERE n.id=$nid AND n.user_id=$uid "
+                    "CREATE (e)-[:MENTIONS]->(n)",{"eid":mn["entry_id"],"nid":mn["entity_id"],"uid":uid})
         except: pass
     # Character
     if d.get("character"):
-        CHAR_FILE.write_text(json.dumps(d["character"],ensure_ascii=False,indent=2))
+        _save_char(d["character"], uid)
     return {"ok": True, "imported": imported}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -569,16 +610,17 @@ class ModeReq(BaseModel): name: str; description: str = ""
 INBOX_FILE = _DATA_DIR / "inbox.json"
 
 @app.post("/ingest")
-def ingest(req: IngestReq):
+def ingest(req: IngestReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     eid = write_entry(req.text, {"narrative": req.text, "entities": [], "relations": [],
-                                  "archivist_note": "", "quests": []})
+                                  "archivist_note": "", "quests": []}, uid)
     if _has_any_ai():
         # AI available — process in background
-        threading.Thread(target=_process_entry_bg, args=(eid, req.text), daemon=True).start()
+        threading.Thread(target=_process_entry_bg, args=(eid, req.text, uid), daemon=True).start()
         # Still write to inbox so JS polling works (removed on completion)
         try:
             inbox = json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-            inbox.append({"id": eid, "text": req.text, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+            inbox.append({"id": eid, "text": req.text, "user_id": uid, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
             INBOX_FILE.write_text(json.dumps(inbox, ensure_ascii=False, indent=2))
         except: pass
         return {"entry_id": eid, "status": "processing", "_ai_pending": True}
@@ -586,72 +628,84 @@ def ingest(req: IngestReq):
         # No API key — write to inbox for manual processing
         try:
             inbox = json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-            inbox.append({"id": eid, "text": req.text, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+            inbox.append({"id": eid, "text": req.text, "user_id": uid, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
             INBOX_FILE.write_text(json.dumps(inbox, ensure_ascii=False, indent=2))
         except: pass
         return {"entry_id": eid, "status": "pending", "_ai_pending": True}
 
 @app.get("/inbox")
-def get_inbox():
+def get_inbox(u: dict = Depends(current_user)):
+    uid = _uid(u)
     if not INBOX_FILE.exists(): return []
-    try: return json.loads(INBOX_FILE.read_text())
+    try:
+        inbox = json.loads(INBOX_FILE.read_text())
+        return [i for i in inbox if i.get("user_id","admin") == uid]
     except: return []
 
 @app.post("/inbox/clear")
-def clear_inbox():
-    if INBOX_FILE.exists(): INBOX_FILE.write_text("[]")
+def clear_inbox(u: dict = Depends(current_user)):
+    uid = _uid(u)
+    if INBOX_FILE.exists():
+        try:
+            inbox = json.loads(INBOX_FILE.read_text())
+            inbox = [i for i in inbox if i.get("user_id","admin") != uid]
+            INBOX_FILE.write_text(json.dumps(inbox, ensure_ascii=False, indent=2))
+        except: INBOX_FILE.write_text("[]")
     return {"ok": True}
 
 @app.post("/inbox/process-pending")
-def process_pending():
+def process_pending(u: dict = Depends(current_user)):
     """Trigger background processing for all stuck inbox entries (no new entries created)."""
+    uid = _uid(u)
     if not _has_any_ai():
         return {"ok": False, "reason": "no_ai"}
     try:
         inbox = json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-        pending = [i for i in inbox if not i.get("type") or i.get("type") == "entry"]
+        pending = [i for i in inbox if i.get("user_id","admin") == uid and (not i.get("type") or i.get("type") == "entry")]
         for item in pending:
             eid = item.get("id","")
             text = item.get("text","") or item.get("raw","")
             if eid and text:
-                threading.Thread(target=_process_entry_bg, args=(eid, text), daemon=True).start()
+                threading.Thread(target=_process_entry_bg, args=(eid, text, uid), daemon=True).start()
         return {"ok": True, "started": len(pending)}
     except Exception as e:
         return {"ok": False, "reason": str(e)}
 
-def _apply_analysis(eid: str, data: dict):
+def _apply_analysis(eid: str, data: dict, user_id: str = "admin"):
     """Apply AI analysis result to DB (shared by update_entry and auto-processing)."""
     narrative = data.get("narrative","")
     an = data.get("archivist_note","")
     if narrative:
         try:
             _conn.execute(
-                "MATCH (e:Entry) WHERE e.id=$id SET e.narrative=$n, e.archivist_note=$an",
-                {"id": eid, "n": narrative, "an": an})
+                "MATCH (e:Entry) WHERE e.id=$id AND e.user_id=$uid SET e.narrative=$n, e.archivist_note=$an",
+                {"id": eid, "uid": user_id, "n": narrative, "an": an})
         except: pass
     for ent in data.get("entities",[]):
-        sid = slug(ent["name"])
+        sid = _entity_id(ent["name"], user_id)
         tags = json.dumps(ent.get("tags",[]), ensure_ascii=False)
-        if entity_exists(sid):
-            _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.summary=$s, e.tags=$t",
-                          {"id":sid,"s":ent["summary"],"t":tags})
+        if entity_exists(sid, user_id):
+            _conn.execute("MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid SET e.summary=$s, e.tags=$t",
+                          {"id":sid,"uid":user_id,"s":ent["summary"],"t":tags})
         else:
-            _conn.execute("CREATE (:Entity {id:$id,name:$name,type:$type,summary:$summary,tags:$tags})",
+            _conn.execute("CREATE (:Entity {id:$id,name:$name,type:$type,summary:$summary,tags:$tags,user_id:$uid})",
                           {"id":sid,"name":ent["name"],"type":ent.get("type","concept"),
-                           "summary":ent["summary"],"tags":tags})
+                           "summary":ent["summary"],"tags":tags,"uid":user_id})
         try:
             _conn.execute(
-                "MATCH (en:Entry) WHERE en.id=$eid MATCH (et:Entity) WHERE et.id=$etid"
-                " CREATE (en)-[:MENTIONS]->(et)", {"eid":eid,"etid":sid})
+                "MATCH (en:Entry) WHERE en.id=$eid AND en.user_id=$uid "
+                "MATCH (et:Entity) WHERE et.id=$etid AND et.user_id=$uid"
+                " CREATE (en)-[:MENTIONS]->(et)", {"eid":eid,"etid":sid,"uid":user_id})
         except: pass
     for rel in data.get("relations",[]):
-        f=slug(rel.get("from_entity","")); t=slug(rel.get("to_entity",""))
-        if f and t and entity_exists(f) and entity_exists(t):
+        f=_entity_id(rel.get("from_entity",""), user_id); t=_entity_id(rel.get("to_entity",""), user_id)
+        if f and t and entity_exists(f, user_id) and entity_exists(t, user_id):
             try:
                 _conn.execute(
-                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t"
+                    "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid "
+                    "MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid"
                     " CREATE (a)-[:LINKED{label:$l,entry_id:$eid}]->(b)",
-                    {"f":f,"t":t,"l":rel.get("label","связан с"),"eid":eid})
+                    {"f":f,"t":t,"uid":user_id,"l":rel.get("label","связан с"),"eid":eid})
             except: pass
     for q in data.get("quests",[]):
         tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -660,80 +714,86 @@ def _apply_analysis(eid: str, data: dict):
         try:
             _conn.execute(
                 "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:$eid,"
-                "task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,completed_ts:''})",
+                "task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,completed_ts:'',user_id:$uid})",
                 {"id":tid,"mid":q.get("mission_id",""),"t":q["title"],"ts":ts,"eid":eid,
-                 "tt":tt,"rh":rh,"ri":ri,"lr":lr})
+                 "tt":tt,"rh":rh,"ri":ri,"lr":lr,"uid":user_id})
         except: pass
     for ma in data.get("mission_analysis",[]):
         lore = ma.get("lore","").strip()
         if lore and ma.get("mission_id"):
             try:
-                _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.lore=$l",
-                              {"id":ma["mission_id"],"l":lore})
+                _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid SET m.lore=$l",
+                              {"id":ma["mission_id"],"uid":user_id,"l":lore})
             except: pass
 
-def _process_entry_bg(eid: str, raw: str):
+def _process_entry_bg(eid: str, raw: str, user_id: str = "admin"):
     """Background thread: call Claude, apply analysis, remove from inbox."""
     try:
-        data = call_claude_extract(raw)
+        data = call_claude_extract(raw, user_id)
         if data:
-            _apply_analysis(eid, data)
+            _apply_analysis(eid, data, user_id)
     except Exception as e:
         print(f"[process_bg] {e}")
     finally:
         # Remove from inbox regardless of success
         try:
             inbox = json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-            inbox = [i for i in inbox if i.get("id") != eid]
+            inbox = [i for i in inbox if not (i.get("id") == eid and i.get("user_id","admin") == user_id)]
             INBOX_FILE.write_text(json.dumps(inbox, ensure_ascii=False, indent=2))
         except: pass
 
 @app.post("/diary/{eid}/update")
-def update_entry(eid: str, req: SaveReq):
+def update_entry(eid: str, req: SaveReq, u: dict = Depends(current_user)):
     """Архивариус (manual/external) обновляет запись после анализа"""
     data = {"narrative": req.narrative, "archivist_note": req.archivist_note,
             "entities": req.entities, "relations": req.relations,
             "quests": req.quests, "mission_analysis": req.mission_analysis}
-    _apply_analysis(eid, data)
+    _apply_analysis(eid, data, _uid(u))
     return {"updated": eid, "quests_created": len(req.quests)}
 
 @app.post("/save")
-def save(req: SaveReq):
+def save(req: SaveReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     data={"narrative":req.narrative,"entities":req.entities,"relations":req.relations,
           "quests":req.quests,"archivist_note":req.archivist_note}
-    eid=write_entry(req.raw_text,data)
+    eid=write_entry(req.raw_text,data,uid)
     for q in req.quests:
         tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
         try:
             _conn.execute(
-                "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:$eid})",
-                {"id":tid,"mid":q.get("mission_id",""),"t":q["title"],"ts":ts,"eid":eid})
+                "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:$eid,user_id:$uid})",
+                {"id":tid,"mid":q.get("mission_id",""),"t":q["title"],"ts":ts,"eid":eid,"uid":uid})
         except: pass
     return {"entry_id":eid,"quests_created":len(req.quests)}
 
 @app.get("/diary")
-def diary(limit: int=60):
+def diary(limit: int=60, u: dict = Depends(current_user)):
+    uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (e:Entry) RETURN e.id,e.ts,e.narrative,e.raw_text,e.archivist_note"
-        " ORDER BY e.ts DESC LIMIT $l",{"l":limit}))
+        "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.id,e.ts,e.narrative,e.raw_text,e.archivist_note"
+        " ORDER BY e.ts DESC LIMIT $l",{"l":limit,"uid":uid}))
     return [{"id":r[0],"ts":r[1],"narrative":r[2],"raw":r[3],"archivist_note":r[4]} for r in rows]
 
 @app.post("/diary/{eid}/delete")
-def delete_entry(eid: str):
-    try: _conn.execute("MATCH (e:Entry)-[r:MENTIONS]->() WHERE e.id=$id DELETE r",{"id":eid})
+def delete_entry(eid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    try: _conn.execute("MATCH (e:Entry)-[r:MENTIONS]->() WHERE e.id=$id AND e.user_id=$uid DELETE r",{"id":eid,"uid":uid})
     except: pass
-    try: _conn.execute("MATCH (e:Entry) WHERE e.id=$id DELETE e",{"id":eid})
+    try: _conn.execute("MATCH (e:Entry) WHERE e.id=$id AND e.user_id=$uid DELETE e",{"id":eid,"uid":uid})
     except: pass
     return {"deleted":eid}
 
 @app.get("/entities")
-def entities(type: str=""):
+def entities(type: str="", u: dict = Depends(current_user)):
+    uid = _uid(u)
     if type:
         rows=kuzu_rows(_conn.execute(
-            "MATCH (e:Entity) WHERE e.type=$t RETURN e.id,e.name,e.type,e.summary,e.tags ORDER BY e.name",{"t":type}))
+            "MATCH (e:Entity) WHERE e.type=$t AND e.user_id=$uid RETURN e.id,e.name,e.type,e.summary,e.tags ORDER BY e.name",
+            {"t":type,"uid":uid}))
     else:
         rows=kuzu_rows(_conn.execute(
-            "MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary,e.tags ORDER BY e.type,e.name"))
+            "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.id,e.name,e.type,e.summary,e.tags ORDER BY e.type,e.name",
+            {"uid":uid}))
     result=[]
     for r in rows:
         try: tags=json.loads(r[4]) if r[4] else []
@@ -742,18 +802,22 @@ def entities(type: str=""):
     return result
 
 @app.get("/entity/{name}")
-def entity_card(name: str):
-    eid=slug(name)
+def entity_card(name: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    eid=_entity_id(name, uid)
     base=kuzu_rows(_conn.execute(
-        "MATCH (e:Entity) WHERE e.id=$id RETURN e.name,e.type,e.summary,e.tags",{"id":eid}))
+        "MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid RETURN e.name,e.type,e.summary,e.tags",{"id":eid,"uid":uid}))
     if not base: raise HTTPException(404,"Not found")
     out=kuzu_rows(_conn.execute(
-        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE a.id=$id RETURN a.name,r.label,b.name",{"id":eid}))
+        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE a.id=$id AND a.user_id=$uid AND b.user_id=$uid RETURN a.name,r.label,b.name",
+        {"id":eid,"uid":uid}))
     inp=kuzu_rows(_conn.execute(
-        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE b.id=$id RETURN a.name,r.label,b.name",{"id":eid}))
+        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE b.id=$id AND a.user_id=$uid AND b.user_id=$uid RETURN a.name,r.label,b.name",
+        {"id":eid,"uid":uid}))
     ment=kuzu_rows(_conn.execute(
         "MATCH (en:Entry)-[:MENTIONS]->(et:Entity) WHERE et.id=$id"
-        " RETURN en.ts,en.narrative,en.archivist_note ORDER BY en.ts DESC LIMIT 5",{"id":eid}))
+        " AND en.user_id=$uid AND et.user_id=$uid RETURN en.ts,en.narrative,en.archivist_note ORDER BY en.ts DESC LIMIT 5",
+        {"id":eid,"uid":uid}))
     return {"name":base[0][0],"type":base[0][1],"summary":base[0][2],
             "tags":json.loads(base[0][3]) if base[0][3] else [],
             "links_out":[{"from":r[0],"label":r[1],"to":r[2]} for r in out],
@@ -766,15 +830,16 @@ class EntityCreateReq(BaseModel):
     summary: str = ""
 
 @app.post("/entities")
-def create_entity(req: EntityCreateReq):
-    eid = slug(req.name)
-    if entity_exists(eid):
-        _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.summary=$s",
-                      {"id":eid,"s":req.summary})
+def create_entity(req: EntityCreateReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    eid = _entity_id(req.name, uid)
+    if entity_exists(eid, uid):
+        _conn.execute("MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid SET e.summary=$s",
+                      {"id":eid,"uid":uid,"s":req.summary})
     else:
         _conn.execute(
-            "CREATE (:Entity {id:$id,name:$name,type:$type,summary:$s,tags:$t})",
-            {"id":eid,"name":req.name,"type":req.type,"s":req.summary,"t":"[]"})
+            "CREATE (:Entity {id:$id,name:$name,type:$type,summary:$s,tags:$t,user_id:$uid})",
+            {"id":eid,"name":req.name,"type":req.type,"s":req.summary,"t":"[]","uid":uid})
     return {"id":eid,"name":req.name}
 
 class LinkEntityReq(BaseModel):
@@ -782,55 +847,61 @@ class LinkEntityReq(BaseModel):
     label: str = "связан с"
 
 @app.post("/missions/{mid}/link-entity")
-def link_entity_to_mission(mid: str, req: LinkEntityReq):
-    rows=kuzu_rows(_conn.execute("MATCH (m:Mission) WHERE m.id=$id RETURN m.title",{"id":mid}))
+def link_entity_to_mission(mid: str, req: LinkEntityReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.title",{"id":mid,"uid":uid}))
     if not rows: raise HTTPException(404)
-    meid="mission_"+slug(rows[0][0])
-    eeid=slug(req.entity_name)
-    if not entity_exists(eeid):
-        _conn.execute("CREATE (:Entity {id:$id,name:$n,type:'concept',summary:'',tags:'[]'})",
-                      {"id":eeid,"n":req.entity_name})
-    if not entity_exists(meid): _sync_mission_entity(mid,rows[0][0],"","active")
+    meid=_mission_entity_id(mid, rows[0][0], uid)
+    eeid=_entity_id(req.entity_name, uid)
+    if not entity_exists(eeid, uid):
+        _conn.execute("CREATE (:Entity {id:$id,name:$n,type:'concept',summary:'',tags:'[]',user_id:$uid})",
+                      {"id":eeid,"n":req.entity_name,"uid":uid})
+    if not entity_exists(meid, uid): _sync_mission_entity(mid,rows[0][0],"","active",uid)
     try:
         _conn.execute(
-            "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+            "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid "
             "CREATE (a)-[:LINKED{label:$l,entry_id:'manual'}]->(b)",
-            {"f":meid,"t":eeid,"l":req.label})
+            {"f":meid,"t":eeid,"uid":uid,"l":req.label})
     except: pass
     return {"ok":True}
 
 @app.get("/graph")
-def graph():
-    rows=kuzu_rows(_conn.execute("MATCH (a:Entity)-[r:LINKED]->(b:Entity) RETURN a.name,r.label,b.name"))
+def graph(u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE a.user_id=$uid AND b.user_id=$uid RETURN a.name,r.label,b.name",
+        {"uid":uid}))
     return [{"from":r[0],"label":r[1],"to":r[2]} for r in rows]
 
-def _sync_mission_entity(mid: str, title: str, description: str, status: str="active"):
+def _sync_mission_entity(mid: str, title: str, description: str, status: str="active", user_id: str = "admin"):
     """Keep Mission mirrored as Entity node of type 'mission'."""
-    eid = "mission_" + slug(title)
+    eid = _mission_entity_id(mid, title, user_id)
     summary = description.strip() if description else title
-    if entity_exists(eid):
-        _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.summary=$s",
-                      {"id":eid,"s":summary})
+    if entity_exists(eid, user_id):
+        _conn.execute("MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid SET e.name=$name,e.summary=$s",
+                      {"id":eid,"uid":user_id,"name":title,"s":summary})
     else:
         try:
             _conn.execute(
-                "CREATE (:Entity {id:$id,name:$name,type:'mission',summary:$s,tags:$t})",
-                {"id":eid,"name":title,"s":summary,"t":json.dumps(["mission",status],ensure_ascii=False)})
+                "CREATE (:Entity {id:$id,name:$name,type:'mission',summary:$s,tags:$t,user_id:$uid})",
+                {"id":eid,"name":title,"s":summary,"t":json.dumps(["mission",status],ensure_ascii=False),"uid":user_id})
         except: pass
 
 @app.get("/missions")
-def get_missions():
+def get_missions(u: dict = Depends(current_user)):
+    uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status,m.ts,m.lore ORDER BY m.ts"))
+        "MATCH (m:Mission) WHERE m.user_id=$uid RETURN m.id,m.title,m.description,m.status,m.ts,m.lore ORDER BY m.ts",
+        {"uid":uid}))
     result=[]
     for r in rows:
         mid=r[0]
         tasks=kuzu_rows(_conn.execute(
-            "MATCH (t:Task) WHERE t.mission_id=$mid "
+            "MATCH (t:Task) WHERE t.mission_id=$mid AND t.user_id=$uid "
             "RETURN t.id,t.title,t.status,t.ts,"
             "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
             "t.last_reset_ts,t.streak,t.best_streak ORDER BY t.ts",
-            {"mid":mid}))
+            {"mid":mid,"uid":uid}))
         task_list=[]
         for t in tasks:
             td={"id":t[0],"title":t[1],"status":t[2],"ts":t[3],
@@ -840,13 +911,13 @@ def get_missions():
             td=_maybe_reset_task(td)
             task_list.append(td)
         # Linked entities
-        eid="mission_"+slug(r[1])
+        eid=_mission_entity_id(mid, r[1], uid)
         linked=kuzu_rows(_conn.execute(
-            "MATCH (m:Entity)-[r:LINKED]->(e:Entity) WHERE m.id=$id RETURN e.id,e.name,e.type,e.summary",
-            {"id":eid}))
+            "MATCH (m:Entity)-[r:LINKED]->(e:Entity) WHERE m.id=$id AND m.user_id=$uid AND e.user_id=$uid RETURN e.id,e.name,e.type,e.summary",
+            {"id":eid,"uid":uid}))
         linked+= kuzu_rows(_conn.execute(
-            "MATCH (e:Entity)-[r:LINKED]->(m:Entity) WHERE m.id=$id RETURN e.id,e.name,e.type,e.summary",
-            {"id":eid}))
+            "MATCH (e:Entity)-[r:LINKED]->(m:Entity) WHERE m.id=$id AND m.user_id=$uid AND e.user_id=$uid RETURN e.id,e.name,e.type,e.summary",
+            {"id":eid,"uid":uid}))
         seen_ids=set()
         entity_tags=[]
         for x in linked:
@@ -861,115 +932,130 @@ class MissionDescReq(BaseModel):
     description: str
 
 @app.patch("/missions/{mid}/description")
-def update_mission_description(mid: str, req: MissionDescReq):
+def update_mission_description(mid: str, req: MissionDescReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) WHERE m.id=$id RETURN m.title,m.status",{"id":mid}))
+        "MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.title,m.status",{"id":mid,"uid":uid}))
     if not rows: raise HTTPException(404)
     title,status=rows[0]
-    _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.description=$d",
-                  {"id":mid,"d":req.description})
-    _sync_mission_entity(mid,title,req.description,status)
+    _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid SET m.description=$d",
+                  {"id":mid,"uid":uid,"d":req.description})
+    _sync_mission_entity(mid,title,req.description,status,uid)
     return {"ok":True}
 
 @app.post("/missions")
-def add_mission(req: MissionReq):
+def add_mission(req: MissionReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     mid=str(uuid.uuid4())
     ts=datetime.now().strftime("%Y-%m-%d %H:%M")
-    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:'active',ts:$ts,lore:''})",
-                  {"id":mid,"t":req.title,"d":req.description,"ts":ts})
-    _sync_mission_entity(mid,req.title,req.description)
+    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:'active',ts:$ts,lore:'',user_id:$uid})",
+                  {"id":mid,"t":req.title,"d":req.description,"ts":ts,"uid":uid})
+    _sync_mission_entity(mid,req.title,req.description,"active",uid)
     return {"id":mid,"title":req.title,"status":"active","tasks":[],"entities":[]}
 
 @app.post("/missions/{mid}/complete")
-def complete_mission(mid: str):
-    _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.status='done'",{"id":mid})
+def complete_mission(mid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid SET m.status='done'",{"id":mid,"uid":uid})
     if _has_any_ai():
-        threading.Thread(target=_gen_epilogue_bg,args=(mid,),daemon=True).start()
+        threading.Thread(target=_gen_epilogue_bg,args=(mid,uid),daemon=True).start()
     return {"ok":True}
 
 @app.post("/missions/{mid}/delete")
-def delete_mission(mid: str):
-    try: _conn.execute("MATCH (t:Task) WHERE t.mission_id=$id DELETE t",{"id":mid})
+def delete_mission(mid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    try: _conn.execute("MATCH (t:Task) WHERE t.mission_id=$id AND t.user_id=$uid DELETE t",{"id":mid,"uid":uid})
     except: pass
-    try: _conn.execute("MATCH (m:Mission) WHERE m.id=$id DELETE m",{"id":mid})
+    try: _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid DELETE m",{"id":mid,"uid":uid})
     except: pass
     return {"deleted":mid}
 
 @app.post("/tasks")
-def add_task(req: TaskReq):
+def add_task(req: TaskReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    exists=kuzu_rows(_conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.id",
+                                   {"id":req.mission_id,"uid":uid}))
+    if not exists: raise HTTPException(404)
     tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
     init_reset = ts if req.task_type == "repeat" else ""
     _conn.execute(
         "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:'',"
         "task_type:$tt,reset_hours:$rh,required_iters:$ri,"
-        "current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0})",
+        "current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,user_id:$uid})",
         {"id":tid,"mid":req.mission_id,"t":req.title,"ts":ts,
-         "tt":req.task_type,"rh":req.reset_hours,"ri":req.required_iters,"lr":init_reset})
+         "tt":req.task_type,"rh":req.reset_hours,"ri":req.required_iters,"lr":init_reset,"uid":uid})
     return {"id":tid,"title":req.title,"status":"active","task_type":req.task_type}
 
 class TaskParamsReq(BaseModel):
     task_type: str = "once"; reset_hours: int = 24; required_iters: int = 1
 
 @app.post("/tasks/{tid}/set-params")
-def set_task_params(tid: str, req: TaskParamsReq):
+def set_task_params(tid: str, req: TaskParamsReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     _conn.execute(
-        "MATCH (t:Task) WHERE t.id=$id SET t.task_type=$tt,t.reset_hours=$rh,t.required_iters=$ri",
-        {"id":tid,"tt":req.task_type,"rh":req.reset_hours,"ri":req.required_iters})
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.task_type=$tt,t.reset_hours=$rh,t.required_iters=$ri",
+        {"id":tid,"uid":uid,"tt":req.task_type,"rh":req.reset_hours,"ri":req.required_iters})
     return {"ok":True}
 
 @app.post("/tasks/{tid}/tick")
-def tick_task(tid: str):
+def tick_task(tid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.id=$id "
-        "RETURN t.current_iters,t.required_iters,t.last_reset_ts",{"id":tid}))
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
+        "RETURN t.current_iters,t.required_iters,t.last_reset_ts",{"id":tid,"uid":uid}))
     if not rows: return {"error":"not found"}
     cur=int(rows[0][0] or 0); req=int(rows[0][1] or 1); lr=rows[0][2] or ""
     new_cur=min(cur+1,req)
     now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
     if not lr: lr=now_s
     cts=now_s if new_cur>=req else ""
-    _conn.execute("MATCH (t:Task) WHERE t.id=$id SET t.current_iters=$c,t.last_reset_ts=$lr,t.completed_ts=$cts",
-                  {"id":tid,"c":new_cur,"lr":lr,"cts":cts})
+    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.current_iters=$c,t.last_reset_ts=$lr,t.completed_ts=$cts",
+                  {"id":tid,"uid":uid,"c":new_cur,"lr":lr,"cts":cts})
     return {"current":new_cur,"required":req,"completed":new_cur>=req}
 
 @app.post("/tasks/{tid}/complete")
-def complete_task(tid: str):
+def complete_task(tid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
     now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
-    _conn.execute("MATCH (t:Task) WHERE t.id=$id SET t.status='done',t.completed_ts=$ts",
-                  {"id":tid,"ts":now_s})
+    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done',t.completed_ts=$ts",
+                  {"id":tid,"uid":uid,"ts":now_s})
     return {"ok":True}
 
 @app.post("/tasks/{tid}/delete")
-def delete_task(tid: str):
-    try: _conn.execute("MATCH (t:Task) WHERE t.id=$id DELETE t",{"id":tid})
+def delete_task(tid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    try: _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid DELETE t",{"id":tid,"uid":uid})
     except: pass
     return {"deleted":tid}
 
 @app.get("/tasks/completed-today")
-def completed_today():
+def completed_today(u: dict = Depends(current_user)):
+    uid = _uid(u)
     today=datetime.now().strftime("%Y-%m-%d")
     # Completed once-tasks
     r1=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.completed_ts STARTS WITH $d RETURN count(t)",{"d":today}))
+        "MATCH (t:Task) WHERE t.user_id=$uid AND t.completed_ts STARTS WITH $d RETURN count(t)",
+        {"d":today,"uid":uid}))
     done=int(r1[0][0]) if r1 else 0
     # Repeat tasks ticked today (any progress, even partial) — exclude already counted
     r2=kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d "
-        "AND t.current_iters > 0 AND (t.completed_ts IS NULL OR NOT t.completed_ts STARTS WITH $d) "
-        "RETURN count(t)",{"d":today}))
+        "AND t.user_id=$uid AND t.current_iters > 0 AND (t.completed_ts IS NULL OR NOT t.completed_ts STARTS WITH $d) "
+        "RETURN count(t)",{"d":today,"uid":uid}))
     partial=int(r2[0][0]) if r2 else 0
     return {"count": done+partial}
 
 @app.post("/entities/{eid}/delete")
-def delete_entity(eid: str):
-    es=slug(eid)
-    try: _conn.execute("MATCH (e:Entity)-[r:LINKED]-() WHERE e.id=$id DELETE r",{"id":es})
+def delete_entity(eid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    es=_entity_id(eid, uid)
+    try: _conn.execute("MATCH (e:Entity)-[r:LINKED]-() WHERE e.id=$id AND e.user_id=$uid DELETE r",{"id":es,"uid":uid})
     except: pass
-    try: _conn.execute("MATCH ()-[r:LINKED]->(e:Entity) WHERE e.id=$id DELETE r",{"id":es})
+    try: _conn.execute("MATCH ()-[r:LINKED]->(e:Entity) WHERE e.id=$id AND e.user_id=$uid DELETE r",{"id":es,"uid":uid})
     except: pass
-    try: _conn.execute("MATCH ()-[r:MENTIONS]->(e:Entity) WHERE e.id=$id DELETE r",{"id":es})
+    try: _conn.execute("MATCH ()-[r:MENTIONS]->(e:Entity) WHERE e.id=$id AND e.user_id=$uid DELETE r",{"id":es,"uid":uid})
     except: pass
-    try: _conn.execute("MATCH (e:Entity) WHERE e.id=$id DELETE e",{"id":es})
+    try: _conn.execute("MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid DELETE e",{"id":es,"uid":uid})
     except: pass
     return {"deleted":es}
 
@@ -978,35 +1064,40 @@ class MergeEntityReq(BaseModel):
     drop_name: str
 
 @app.post("/entities/merge")
-def merge_entities(req: MergeEntityReq):
-    kid=slug(req.keep_name); did=slug(req.drop_name)
-    if not entity_exists(kid): raise HTTPException(404, f"keep not found: {req.keep_name}")
-    if not entity_exists(did): raise HTTPException(404, f"drop not found: {req.drop_name}")
+def merge_entities(req: MergeEntityReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    kid=_entity_id(req.keep_name, uid); did=_entity_id(req.drop_name, uid)
+    if not entity_exists(kid, uid): raise HTTPException(404, f"keep not found: {req.keep_name}")
+    if not entity_exists(did, uid): raise HTTPException(404, f"drop not found: {req.drop_name}")
     if kid==did: raise HTTPException(400, "same entity")
-    _merge_entity(kid, did)
+    _merge_entity(kid, did, uid)
     return {"ok":True,"kept":req.keep_name,"removed":req.drop_name}
 
 class MissionUpdateReq(BaseModel): title: str = ""; description: str = ""
 class TaskUpdateReq(BaseModel): title: str = ""
 
 @app.post("/missions/{mid}/update")
-def update_mission(mid: str, req: MissionUpdateReq):
+def update_mission(mid: str, req: MissionUpdateReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     if req.title:
-        _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.title=$t, m.description=$d",
-                      {"id":mid,"t":req.title,"d":req.description})
+        _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid SET m.title=$t, m.description=$d",
+                      {"id":mid,"uid":uid,"t":req.title,"d":req.description})
+        _sync_mission_entity(mid, req.title, req.description, "active", uid)
     return {"ok":True}
 
 class MissionLoreReq(BaseModel): lore: str
 
 @app.post("/missions/{mid}/lore")
-def set_mission_lore(mid: str, req: MissionLoreReq):
-    _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.lore=$l",{"id":mid,"l":req.lore})
+def set_mission_lore(mid: str, req: MissionLoreReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid SET m.lore=$l",{"id":mid,"uid":uid,"l":req.lore})
     return {"ok":True}
 
 @app.post("/tasks/{tid}/update")
-def update_task(tid: str, req: TaskUpdateReq):
+def update_task(tid: str, req: TaskUpdateReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     if req.title:
-        _conn.execute("MATCH (t:Task) WHERE t.id=$id SET t.title=$t",{"id":tid,"t":req.title})
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.title=$t",{"id":tid,"uid":uid,"t":req.title})
     return {"ok":True}
 
 _REANALYZE_PROMPT = """Ты — Архивариус. Обнови лор каждого активного Пути Героя в стиле летописи Морровинда.
@@ -1037,38 +1128,39 @@ def _call_any_ai(prompt_text: str) -> str:
         except Exception as e: print(f"[anthropic_any] {e}")
     return _call_gigachat(prompt_text)
 
-def _merge_entity(keep_id: str, drop_id: str):
+def _merge_entity(keep_id: str, drop_id: str, user_id: str = "admin"):
     """Redirect all LINKED rels from drop_id to keep_id, then delete drop node."""
     try:
         rels_out=kuzu_rows(_conn.execute(
-            "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE a.id=$id RETURN b.id,r.label,r.entry_id",
-            {"id":drop_id}))
+            "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE a.id=$id AND a.user_id=$uid AND b.user_id=$uid RETURN b.id,r.label,r.entry_id",
+            {"id":drop_id,"uid":user_id}))
         rels_in=kuzu_rows(_conn.execute(
-            "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE b.id=$id RETURN a.id,r.label,r.entry_id",
-            {"id":drop_id}))
+            "MATCH (a:Entity)-[r:LINKED]->(b:Entity) WHERE b.id=$id AND a.user_id=$uid AND b.user_id=$uid RETURN a.id,r.label,r.entry_id",
+            {"id":drop_id,"uid":user_id}))
         for r in rels_out:
             if r[0]!=keep_id:
                 try: _conn.execute(
-                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                    "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid "
                     "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
-                    {"f":keep_id,"t":r[0],"l":r[1],"e":r[2] or "merge"})
+                    {"f":keep_id,"t":r[0],"uid":user_id,"l":r[1],"e":r[2] or "merge"})
                 except: pass
         for r in rels_in:
             if r[0]!=keep_id:
                 try: _conn.execute(
-                    "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                    "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid "
                     "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
-                    {"f":r[0],"t":keep_id,"l":r[1],"e":r[2] or "merge"})
+                    {"f":r[0],"t":keep_id,"uid":user_id,"l":r[1],"e":r[2] or "merge"})
                 except: pass
-        _conn.execute("MATCH (e:Entity) WHERE e.id=$id DETACH DELETE e",{"id":drop_id})
+        _conn.execute("MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid DETACH DELETE e",{"id":drop_id,"uid":user_id})
     except Exception as ex: print(f"[merge_entity] {ex}")
 
-def _run_reanalyze_bg():
+def _run_reanalyze_bg(user_id: str = "admin"):
     try:
         # 0. AI: deduplicate + retype entities
         if _has_any_ai():
             all_ents=kuzu_rows(_conn.execute(
-                "MATCH (e:Entity) RETURN e.id,e.name,e.type,e.summary LIMIT 80"))
+                "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.id,e.name,e.type,e.summary LIMIT 80",
+                {"uid":user_id}))
             if len(all_ents)>1:
                 ent_list="\n".join(f"NAME={r[1]} TYPE={r[2]} DESC={r[3] or ''}" for r in all_ents)
                 dedup_p=f"""Ты — Архивариус. Проверь список сущностей и сделай два дела:
@@ -1092,45 +1184,49 @@ def _run_reanalyze_bg():
                         parsed=json.loads(m0.group())
                         for mg in parsed.get("merges",[]):
                             kname=mg.get("keep_name",""); dname=mg.get("drop_name","")
-                            kid=slug(kname); did=slug(dname)
-                            if kname and dname and kid!=did and entity_exists(kid) and entity_exists(did):
+                            kid=_entity_id(kname, user_id); did=_entity_id(dname, user_id)
+                            if kname and dname and kid!=did and entity_exists(kid, user_id) and entity_exists(did, user_id):
                                 print(f"[dedup] merging '{dname}' → '{kname}'")
-                                _merge_entity(kid,did)
-                            elif kname and dname and not entity_exists(kid) and entity_exists(did):
+                                _merge_entity(kid,did,user_id)
+                            elif kname and dname and not entity_exists(kid, user_id) and entity_exists(did, user_id):
                                 # keep_name doesn't exist yet — create it, merge drop into it
                                 row=kuzu_rows(_conn.execute(
-                                    "MATCH (e:Entity) WHERE e.id=$id RETURN e.type,e.summary,e.tags",{"id":did}))
+                                    "MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid RETURN e.type,e.summary,e.tags",
+                                    {"id":did,"uid":user_id}))
                                 t2,s2,tg2=row[0] if row else ("concept","","[]")
                                 try: _conn.execute(
-                                    "CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg})",
-                                    {"id":kid,"n":kname,"t":t2,"s":s2,"tg":tg2 or "[]"})
+                                    "CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg,user_id:$uid})",
+                                    {"id":kid,"n":kname,"t":t2,"s":s2,"tg":tg2 or "[]","uid":user_id})
                                 except: pass
-                                _merge_entity(kid,did)
+                                _merge_entity(kid,did,user_id)
                                 print(f"[dedup] renamed '{dname}' → '{kname}'")
                         for rt in parsed.get("retypes",[]):
-                            eid=slug(rt.get("name",""))
+                            eid=_entity_id(rt.get("name",""), user_id)
                             ntype=rt.get("new_type","")
                             valid={"person","place","project","concept","object","event","mission"}
-                            if eid and ntype in valid and entity_exists(eid):
-                                _conn.execute("MATCH (e:Entity) WHERE e.id=$id SET e.type=$t",
-                                              {"id":eid,"t":ntype})
+                            if eid and ntype in valid and entity_exists(eid, user_id):
+                                _conn.execute("MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid SET e.type=$t",
+                                              {"id":eid,"uid":user_id,"t":ntype})
                                 print(f"[retype] '{rt['name']}' → {ntype}")
                     except Exception as ex: print(f"[dedup] {ex}")
 
         # 1. Sync ALL missions to Entity nodes
         all_missions=kuzu_rows(_conn.execute(
-            "MATCH (m:Mission) RETURN m.id,m.title,m.description,m.status"))
+            "MATCH (m:Mission) WHERE m.user_id=$uid RETURN m.id,m.title,m.description,m.status",
+            {"uid":user_id}))
         for r in all_missions:
-            try: _sync_mission_entity(r[0],r[1],r[2] or "",r[3] or "active")
+            try: _sync_mission_entity(r[0],r[1],r[2] or "",r[3] or "active",user_id)
             except: pass
 
         if not _has_any_ai(): return
 
         # 2. AI: update lore + find entity links for each mission
         entries=kuzu_rows(_conn.execute(
-            "MATCH (e:Entry) RETURN e.ts,e.narrative ORDER BY e.ts DESC LIMIT 15"))
+            "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.ts,e.narrative ORDER BY e.ts DESC LIMIT 15",
+            {"uid":user_id}))
         entities=kuzu_rows(_conn.execute(
-            "MATCH (e:Entity) WHERE e.type<>'mission' RETURN e.name,e.type LIMIT 40"))
+            "MATCH (e:Entity) WHERE e.type<>'mission' AND e.user_id=$uid RETURN e.name,e.type LIMIT 40",
+            {"uid":user_id}))
         miss_txt="\n".join(f"ID={r[0]} TITLE={r[1]} DESC={r[2] or ''}" for r in all_missions)
         ent_txt="\n".join(f"- {r[0]} ({r[1]})" for r in entities)
         entry_txt="\n".join(f"[{r[0]}] {r[1]}" for r in entries)
@@ -1143,8 +1239,8 @@ def _run_reanalyze_bg():
             for item in data.get("missions",[]):
                 lore=item.get("lore","").strip()
                 if lore and item.get("id"):
-                    try: _conn.execute("MATCH (m:Mission) WHERE m.id=$id SET m.lore=$l",
-                                       {"id":item["id"],"l":lore})
+                    try: _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid SET m.lore=$l",
+                                       {"id":item["id"],"uid":user_id,"l":lore})
                     except: pass
 
         # 3. AI: find connections between entities and missions
@@ -1170,34 +1266,36 @@ def _run_reanalyze_bg():
                     mtitle=lnk.get("mission_title",""); ename=lnk.get("entity_name","")
                     label=lnk.get("label","связан с")
                     if not mtitle or not ename: continue
-                    meid="mission_"+slug(mtitle)
-                    eeid=slug(ename)
-                    if entity_exists(meid) and entity_exists(eeid):
+                    mid_row = next((r for r in all_missions if r[1] == mtitle), None)
+                    meid=_mission_entity_id(mid_row[0], mtitle, user_id) if mid_row else _entity_id("mission_"+mtitle, user_id)
+                    eeid=_entity_id(ename, user_id)
+                    if entity_exists(meid, user_id) and entity_exists(eeid, user_id):
                         try:
                             _conn.execute(
-                                "MATCH (a:Entity) WHERE a.id=$f MATCH (b:Entity) WHERE b.id=$t "
+                                "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid "
                                 "CREATE (a)-[:LINKED{label:$l,entry_id:'reanalyze'}]->(b)",
-                                {"f":meid,"t":eeid,"l":label})
+                                {"f":meid,"t":eeid,"uid":user_id,"l":label})
                         except: pass
     except Exception as e: print(f"[reanalyze_bg] {e}")
     finally:
         try:
             inbox=json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-            inbox=[i for i in inbox if i.get("type")!="reanalyze"]
+            inbox=[i for i in inbox if not (i.get("type")=="reanalyze" and i.get("user_id","admin")==user_id)]
             INBOX_FILE.write_text(json.dumps(inbox,ensure_ascii=False,indent=2))
         except: pass
 
 @app.post("/reanalyze")
-def do_reanalyze():
+def do_reanalyze(u: dict = Depends(current_user)):
+    uid = _uid(u)
     if _has_any_ai():
         try:
             inbox=json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-            inbox=[i for i in inbox if i.get("type")!="reanalyze"]
+            inbox=[i for i in inbox if not (i.get("type")=="reanalyze" and i.get("user_id","admin")==uid)]
             rid="reanalyze_"+datetime.now().strftime("%Y%m%d_%H%M%S")
-            inbox.append({"id":rid,"type":"reanalyze","ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
+            inbox.append({"id":rid,"type":"reanalyze","user_id":uid,"ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
             INBOX_FILE.write_text(json.dumps(inbox,ensure_ascii=False,indent=2))
         except: pass
-        threading.Thread(target=_run_reanalyze_bg,daemon=True).start()
+        threading.Thread(target=_run_reanalyze_bg,args=(uid,),daemon=True).start()
         return {"ok":True,"status":"processing"}
     else:
         return {"ok":False,"status":"no_api_key"}
@@ -1205,7 +1303,7 @@ def do_reanalyze():
 class GigaChatKeyReq(BaseModel): gigachat_key: str; gigachat_scope: str = "GIGACHAT_API_PERS"
 
 @app.post("/config/gigachat")
-def save_gigachat(req: GigaChatKeyReq):
+def save_gigachat(req: GigaChatKeyReq, u: dict = Depends(current_user)):
     cfg=_app_cfg()
     cfg["gigachat_key"]=req.gigachat_key.strip()
     cfg["gigachat_scope"]=req.gigachat_scope.strip()
@@ -1213,29 +1311,32 @@ def save_gigachat(req: GigaChatKeyReq):
     return {"ok":True}
 
 @app.get("/reanalyze/status")
-def reanalyze_status():
+def reanalyze_status(u: dict = Depends(current_user)):
+    uid = _uid(u)
     try:
         inbox=json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-        running=any(i.get("type")=="reanalyze" for i in inbox)
+        running=any(i.get("type")=="reanalyze" and i.get("user_id","admin")==uid for i in inbox)
     except: running=False
     return {"running": running, "has_key": bool(_get_api_key())}
 
 class ApiKeyReq(BaseModel): api_key: str
 
 @app.post("/config/api-key")
-def save_api_key(req: ApiKeyReq):
+def save_api_key(req: ApiKeyReq, u: dict = Depends(current_user)):
     cfg=_app_cfg(); cfg["api_key"]=req.api_key.strip()
     APP_CFG_FILE.write_text(json.dumps(cfg,ensure_ascii=False))
     return {"ok":True,"has_key":bool(cfg["api_key"])}
 
 @app.get("/today-narrative")
-def today_narrative():
+def today_narrative(u: dict = Depends(current_user)):
+    uid = _uid(u)
     today=datetime.now().strftime("%Y-%m-%d")
     rows=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d AND t.current_iters > 0 "
-        "RETURN t.title, t.current_iters, t.required_iters",{"d":today}))
+        "MATCH (t:Task) WHERE t.user_id=$uid AND t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d AND t.current_iters > 0 "
+        "RETURN t.title, t.current_iters, t.required_iters",{"d":today,"uid":uid}))
     rows2=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.completed_ts STARTS WITH $d RETURN t.title, t.required_iters",{"d":today}))
+        "MATCH (t:Task) WHERE t.user_id=$uid AND t.completed_ts STARTS WITH $d RETURN t.title, t.required_iters",
+        {"d":today,"uid":uid}))
     all_tasks=rows+[[r[0],r[1],r[1]] for r in rows2]
     if not all_tasks: return {"narrative":""}
     task_lines="\n".join(f"- {r[0]} ({r[1]}/{r[2]})" for r in all_tasks)
@@ -1255,17 +1356,20 @@ class OracleReq(BaseModel):
     mechanic_effect: str = ""
 
 @app.post("/oracle")
-def oracle(req: OracleReq):
+def oracle(req: OracleReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     if not _has_any_ai():
         return {"text":""}
     # Last 5 diary entries
     entries=kuzu_rows(_conn.execute(
-        "MATCH (e:Entry) RETURN e.narrative, e.raw_text, e.ts ORDER BY e.ts DESC LIMIT 5"))
+        "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.narrative, e.raw_text, e.ts ORDER BY e.ts DESC LIMIT 5",
+        {"uid":uid}))
     entry_lines="\n".join(
         f"[{r[2]}] {r[0] or r[1]}" for r in entries if r[0] or r[1]) or "нет записей"
     # Active missions
     missions=kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) WHERE m.status='active' RETURN m.title, m.description LIMIT 6"))
+        "MATCH (m:Mission) WHERE m.status='active' AND m.user_id=$uid RETURN m.title, m.description LIMIT 6",
+        {"uid":uid}))
     mission_lines="\n".join(f"- {r[0]}: {r[1] or ''}" for r in missions) or "нет активных путей"
 
     type_labels={"moon":"Фаза луны","season":"Сезон","patron":"Покровитель",
@@ -1277,7 +1381,7 @@ def oracle(req: OracleReq):
         stat_meta=next((s for s in HERO_STATS if s["id"]==req.mechanic_value),None)
         stat_name=stat_meta["name"] if stat_meta else req.mechanic_value
         stat_ai=stat_meta["ai"] if stat_meta else ""
-        char=_char_data(); score=char.get("stats",{}).get(req.mechanic_value,None)
+        char=_char_data(uid); score=char.get("stats",{}).get(req.mechanic_value,None)
         score_line=f"\nТекущий показатель Героя: {score}/100" if score is not None else ""
         p=f"""Ты — Архивариус. Говори как наставник — кратко, честно, от второго лица. Без вступлений.
 
@@ -1328,33 +1432,37 @@ HERO_STATS = [
      "ai":"осознание своих теней, принятие сложных частей себя, самоосознанность"},
 ]
 
-def _char_data():
-    if CHAR_FILE.exists():
-        try: return json.loads(CHAR_FILE.read_text())
+def _char_data(user_id: str = "admin"):
+    f = _user_json_file("character.json", user_id)
+    if f.exists():
+        try: return json.loads(f.read_text())
         except: pass
     return {"stats":{},"antagonist_name":"","antagonist_desc":"",
             "last_analyzed":"","mission_epilogues":{}}
 
-def _save_char(data):
-    CHAR_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+def _save_char(data, user_id: str = "admin"):
+    _user_json_file("character.json", user_id).write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 @app.get("/character/data")
-def get_character_data():
-    return _char_data()
+def get_character_data(u: dict = Depends(current_user)):
+    return _char_data(_uid(u))
 
 @app.get("/character/stats-schema")
 def stats_schema():
     return [{"id":s["id"],"name":s["name"],"sub":s["sub"]} for s in HERO_STATS]
 
 @app.post("/character/analyze")
-def analyze_character():
+def analyze_character(u: dict = Depends(current_user)):
+    uid = _uid(u)
     if not _has_any_ai(): return {"ok":False,"reason":"no_ai"}
     entries=kuzu_rows(_conn.execute(
-        "MATCH (e:Entry) RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 20"))
+        "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 20",
+        {"uid":uid}))
     if len(entries)<3: return {"ok":False,"reason":"not_enough_entries"}
     entry_lines="\n".join(f"[{r[1]}] {r[0]}" for r in entries if r[0])
     missions=kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) RETURN m.title, m.status LIMIT 10"))
+        "MATCH (m:Mission) WHERE m.user_id=$uid RETURN m.title, m.status LIMIT 10",
+        {"uid":uid}))
     mission_lines="\n".join(f"- {r[0]} ({r[1]})" for r in missions) or "нет"
     stat_desc="\n".join(f"- {s['id']}: {s['ai']}" for s in HERO_STATS)
     def _bg():
@@ -1383,82 +1491,93 @@ def analyze_character():
             m2=re.search(r'\{.*\}',t2,re.DOTALL)
             antag=json.loads(m2.group()) if m2 else {"name":"","desc":""}
         except: antag={"name":"","desc":""}
-        data=_char_data()
+        data=_char_data(uid)
         data["stats"]=stats
         data["antagonist_name"]=antag.get("name","")
         data["antagonist_desc"]=antag.get("desc","")
         data["last_analyzed"]=datetime.now().strftime("%Y-%m-%d")
-        _save_char(data)
+        _save_char(data, uid)
     threading.Thread(target=_bg,daemon=True).start()
     return {"ok":True,"status":"analyzing"}
 
 @app.get("/chronicle/past-moon")
-def past_moon_entry():
+def past_moon_entry(u: dict = Depends(current_user)):
+    uid = _uid(u)
     from datetime import timedelta
     today=datetime.now()
     ws=(today-timedelta(days=35)).strftime("%Y-%m-%d %H:%M")
     we=(today-timedelta(days=25)).strftime("%Y-%m-%d %H:%M")
     rows=kuzu_rows(_conn.execute(
-        "MATCH (e:Entry) WHERE e.ts >= $s AND e.ts <= $e "
-        "RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 1",{"s":ws,"e":we}))
+        "MATCH (e:Entry) WHERE e.user_id=$uid AND e.ts >= $s AND e.ts <= $e "
+        "RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 1",{"s":ws,"e":we,"uid":uid}))
     if not rows: return {"entry":None}
     return {"entry":{"narrative":rows[0][0],"ts":rows[0][1]}}
 
-def _gen_epilogue_bg(mid: str):
+def _gen_epilogue_bg(mid: str, user_id: str = "admin"):
     rows=kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) WHERE m.id=$id RETURN m.title, m.description",{"id":mid}))
+        "MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.title, m.description",
+        {"id":mid,"uid":user_id}))
     if not rows: return
     title,desc=rows[0][0],rows[0][1] or ""
     tasks=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.mission_id=$id RETURN t.title",{"id":mid}))
+        "MATCH (t:Task) WHERE t.mission_id=$id AND t.user_id=$uid RETURN t.title",
+        {"id":mid,"uid":user_id}))
     task_lines="\n".join(f"- {r[0]}" for r in tasks) or "задания не записаны"
     p=f"""Ты — Архивариус. Путь завершён. Напиши эпическую эпитафию этому отрезку жизни Героя.
 2-3 предложения. Торжественная летопись. Дата завершения: {datetime.now().strftime("%Y-%m-%d")}.
 Путь: {title}\nОписание: {desc}\nЗадания:\n{task_lines}
 Верни только текст эпитафии, без кавычек."""
     text=_call_any_ai(p)
-    data=_char_data()
+    data=_char_data(user_id)
     data.setdefault("mission_epilogues",{})[mid]=text.strip()
-    _save_char(data)
+    _save_char(data, user_id)
 
 @app.get("/finances")
-def get_finances():
+def get_finances(u: dict = Depends(current_user)):
+    uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (f:Finance) RETURN f.id,f.amount,f.direction,f.category,f.note,f.ts"
-        " ORDER BY f.ts DESC LIMIT 60"))
+        "MATCH (f:Finance) WHERE f.user_id=$uid RETURN f.id,f.amount,f.direction,f.category,f.note,f.ts"
+        " ORDER BY f.ts DESC LIMIT 60",{"uid":uid}))
     items=[{"id":r[0],"amount":r[1],"direction":r[2],"category":r[3],"note":r[4],"ts":r[5]} for r in rows]
     inc=sum(i["amount"] for i in items if i["direction"]=="доход")
     exp=sum(i["amount"] for i in items if i["direction"]=="расход")
     return {"balance":inc-exp,"income":inc,"expense":exp,"items":items}
 
 @app.post("/finances")
-def add_finance(req: FinanceReq):
+def add_finance(req: FinanceReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     fid=str(uuid.uuid4())
     _conn.execute(
-        "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:$c,note:$n,ts:$ts})",
+        "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:$c,note:$n,ts:$ts,user_id:$uid})",
         {"id":fid,"a":req.amount,"d":req.direction,"c":req.category,
-         "n":req.note,"ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
+         "n":req.note,"ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
     return {"id":fid}
 
 # ── Pocket ───────────────────────────────────────────────────────────────────
 POCKET_CFG = _DATA_DIR / "pocket_config.json"
 
-def _pocket_cfg():
-    if POCKET_CFG.exists():
-        try: return json.loads(POCKET_CFG.read_text())
+def _pocket_cfg(user_id: str = "admin"):
+    f = _user_json_file("pocket_config.json", user_id)
+    if f.exists():
+        try: return json.loads(f.read_text())
         except: pass
     return {"reserve_pct": 20}
+
+def _save_pocket_cfg(cfg: dict, user_id: str = "admin"):
+    _user_json_file("pocket_config.json", user_id).write_text(json.dumps(cfg,ensure_ascii=False))
 
 class PocketIncomeReq(BaseModel): amount: float; source: str = ""
 class PocketExpenseReq(BaseModel): amount: float; note: str = ""; from_deferred: bool = False
 class PocketCfgReq(BaseModel): reserve_pct: int
 
 @app.get("/pocket")
-def get_pocket():
-    cfg=_pocket_cfg()
+def get_pocket(u: dict = Depends(current_user)):
+    uid = _uid(u)
+    cfg=_pocket_cfg(uid)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (f:Finance) WHERE f.category='pocket' "
-        "RETURN f.id,f.amount,f.direction,f.note,f.ts ORDER BY f.ts DESC"))
+        "MATCH (f:Finance) WHERE f.category='pocket' AND f.user_id=$uid "
+        "RETURN f.id,f.amount,f.direction,f.note,f.ts ORDER BY f.ts DESC",
+        {"uid":uid}))
     items=[{"id":r[0],"amount":float(r[1]),"direction":r[2],"note":r[3],"ts":r[4]} for r in rows]
     balance=sum(i["amount"] for i in items if i["direction"]=="p_income")
     balance-=sum(i["amount"] for i in items if i["direction"]=="p_expense")
@@ -1470,64 +1589,72 @@ def get_pocket():
             "reserve_pct":cfg["reserve_pct"],"transactions":items[:40]}
 
 @app.post("/pocket/income")
-def pocket_income(req: PocketIncomeReq):
-    cfg=_pocket_cfg(); pct=cfg["reserve_pct"]/100
+def pocket_income(req: PocketIncomeReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    cfg=_pocket_cfg(uid); pct=cfg["reserve_pct"]/100
     ts=datetime.now().strftime("%Y-%m-%d %H:%M")
     deferred=round(req.amount*pct,2); spendable=round(req.amount-deferred,2)
     for d,a,n in [("p_income",spendable,req.source or "пополнение"),
                   ("p_deferred",deferred,f"резерв {cfg['reserve_pct']}% от {req.amount}")]:
         _conn.execute(
-            "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts})",
-            {"id":str(uuid.uuid4()),"a":a,"d":d,"n":n,"ts":ts})
+            "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts,user_id:$uid})",
+            {"id":str(uuid.uuid4()),"a":a,"d":d,"n":n,"ts":ts,"uid":uid})
     return {"ok":True,"spendable":spendable,"deferred":deferred}
 
 @app.post("/pocket/expense")
-def pocket_expense(req: PocketExpenseReq):
+def pocket_expense(req: PocketExpenseReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     direction="p_deferred_spend" if req.from_deferred else "p_expense"
     _conn.execute(
-        "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts})",
+        "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts,user_id:$uid})",
         {"id":str(uuid.uuid4()),"a":req.amount,"d":direction,
-         "n":req.note or "расход","ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
+         "n":req.note or "расход","ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
     return {"ok":True}
 
 @app.post("/pocket/config")
-def pocket_config(req: PocketCfgReq):
-    cfg=_pocket_cfg(); cfg["reserve_pct"]=max(0,min(99,req.reserve_pct))
-    POCKET_CFG.write_text(json.dumps(cfg,ensure_ascii=False))
+def pocket_config(req: PocketCfgReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    cfg=_pocket_cfg(uid); cfg["reserve_pct"]=max(0,min(99,req.reserve_pct))
+    _save_pocket_cfg(cfg, uid)
     return {"ok":True,"reserve_pct":cfg["reserve_pct"]}
 
 class PocketAdjustReq(BaseModel): amount: float; note: str = ""; target: str = "balance"
 
 @app.post("/pocket/adjust")
-def pocket_adjust(req: PocketAdjustReq):
+def pocket_adjust(req: PocketAdjustReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     direction = "p_adjust" if req.target == "balance" else "p_deferred_adjust"
     note = req.note or ("корректировка баланса" if req.target == "balance" else "корректировка резерва")
     _conn.execute(
-        "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts})",
+        "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts,user_id:$uid})",
         {"id":str(uuid.uuid4()),"a":req.amount,"d":direction,"n":note,
-         "ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
+         "ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
     return {"ok":True}
 
 @app.get("/modes")
-def get_modes():
+def get_modes(u: dict = Depends(current_user)):
+    uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (m:Mode) RETURN m.id,m.name,m.description,m.active,m.started_ts ORDER BY m.started_ts DESC"))
+        "MATCH (m:Mode) WHERE m.user_id=$uid RETURN m.id,m.name,m.description,m.active,m.started_ts ORDER BY m.started_ts DESC",
+        {"uid":uid}))
     return [{"id":r[0],"name":r[1],"description":r[2],"active":r[3]=="true","started_ts":r[4]} for r in rows]
 
 @app.post("/modes")
-def add_mode(req: ModeReq):
+def add_mode(req: ModeReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
     mid=str(uuid.uuid4())
     _conn.execute(
-        "CREATE (:Mode {id:$id,name:$n,description:$d,active:'true',started_ts:$ts})",
-        {"id":mid,"n":req.name,"d":req.description,"ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
+        "CREATE (:Mode {id:$id,name:$n,description:$d,active:'true',started_ts:$ts,user_id:$uid})",
+        {"id":mid,"n":req.name,"d":req.description,"ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
     return {"id":mid,"name":req.name,"active":True}
 
 @app.post("/modes/{mid}/toggle")
-def toggle_mode(mid: str):
-    rows=kuzu_rows(_conn.execute("MATCH (m:Mode) WHERE m.id=$id RETURN m.active",{"id":mid}))
+def toggle_mode(mid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute("MATCH (m:Mode) WHERE m.id=$id AND m.user_id=$uid RETURN m.active",{"id":mid,"uid":uid}))
     if rows:
         new="false" if rows[0][0]=="true" else "true"
-        _conn.execute("MATCH (m:Mode) WHERE m.id=$id SET m.active=$a",{"id":mid,"a":new})
+        _conn.execute("MATCH (m:Mode) WHERE m.id=$id AND m.user_id=$uid SET m.active=$a",{"id":mid,"uid":uid,"a":new})
     return {"ok":True}
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -4201,21 +4328,21 @@ const LoginAtmo = {
 // ── Init ─────────────────────────────────────────────────────────────────────
 checkApiStatus();
 authInit().then(()=>{
-  if(localStorage.getItem('lrpg_token')) loadJournal(),loadAsides();
+  if(localStorage.getItem('lrpg_token')){
+    loadJournal(); loadAsides(); loadCharacter();
+    fetch('/character/data').then(r=>r.json()).then(d=>{
+      const last=d.last_analyzed;
+      const stale=!last||(Date.now()-new Date(last).getTime())/86400000>7;
+      if(stale) fetch('/character/analyze',{method:'POST'}).then(()=>setTimeout(loadCharacter,15000));
+    });
+  }
 });
-loadCharacter();
 // Mobile: show input bar on journal tab by default
 (function(){
   if(window.innerWidth<=768){
     document.getElementById('input-bar').classList.add('mob-visible');
   }
 })();
-// Auto-analyze character if never done or >7 days ago
-fetch('/character/data').then(r=>r.json()).then(d=>{
-  const last=d.last_analyzed;
-  const stale=!last||(Date.now()-new Date(last).getTime())/86400000>7;
-  if(stale) fetch('/character/analyze',{method:'POST'}).then(()=>setTimeout(loadCharacter,15000));
-});
 </script>
 <div id="login-screen" style="display:none;position:fixed;inset:0;z-index:9999;
   background:#0e0a06;align-items:center;justify-content:center;flex-direction:column">
