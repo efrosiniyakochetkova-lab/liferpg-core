@@ -1345,6 +1345,24 @@ class TaskProgressReq(BaseModel):
     note: str = ""
 class TaskNoteReq(BaseModel):
     note: str = ""
+class TaskMoveReq(BaseModel):
+    branch_id: str
+    parent_id: str = ""
+    before_task_id: str = ""
+
+def _task_descendant_ids(task_id: str, user_id: str) -> list[str]:
+    ids=[]; queue=[task_id]
+    while queue:
+        parent=queue.pop(0)
+        rows=kuzu_rows(_conn.execute(
+            "MATCH (t:Task) WHERE t.parent_id=$pid AND t.user_id=$uid RETURN t.id",
+            {"pid":parent,"uid":user_id}))
+        for r in rows:
+            cid=r[0]
+            if cid not in ids:
+                ids.append(cid)
+                queue.append(cid)
+    return ids
 
 @app.post("/tasks/{tid}/set-params")
 def set_task_params(tid: str, req: TaskParamsReq, u: dict = Depends(current_user)):
@@ -1353,6 +1371,56 @@ def set_task_params(tid: str, req: TaskParamsReq, u: dict = Depends(current_user
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.task_type=$tt,t.reset_hours=$rh,t.required_iters=$ri",
         {"id":tid,"uid":uid,"tt":req.task_type,"rh":req.reset_hours,"ri":req.required_iters})
     return {"ok":True}
+
+@app.post("/tasks/{tid}/move")
+def move_task(tid: str, req: TaskMoveReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    task_rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.parent_id,t.branch_id",
+        {"id":tid,"uid":uid}))
+    if not task_rows: raise HTTPException(404)
+    mid,old_parent,old_branch=task_rows[0]
+    branch_rows=kuzu_rows(_conn.execute(
+        "MATCH (b:QuestBranch) WHERE b.id=$id AND b.user_id=$uid RETURN b.mission_id",
+        {"id":req.branch_id,"uid":uid}))
+    if not branch_rows: raise HTTPException(404, "Ветвь не найдена")
+    if branch_rows[0][0] != mid:
+        raise HTTPException(400, "Квест нельзя перенести в другой Путь")
+
+    parent_id=req.parent_id or ""
+    subtree=[tid]+_task_descendant_ids(tid, uid)
+    if parent_id:
+        if parent_id in subtree:
+            raise HTTPException(400, "Нельзя вложить квест в самого себя")
+        parent_rows=kuzu_rows(_conn.execute(
+            "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id",
+            {"id":parent_id,"uid":uid}))
+        if not parent_rows or parent_rows[0][0] != mid:
+            raise HTTPException(400, "Родительский квест не найден")
+
+    siblings=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.mission_id=$mid AND t.branch_id=$bid AND t.parent_id=$parent AND t.user_id=$uid "
+        "RETURN t.id ORDER BY t.position,t.ts",
+        {"mid":mid,"bid":req.branch_id,"parent":parent_id,"uid":uid}))
+    order=[r[0] for r in siblings if r[0] != tid]
+    before=req.before_task_id or ""
+    if before and before != tid:
+        if before not in order:
+            raise HTTPException(400, "Целевое место не найдено")
+        order.insert(order.index(before), tid)
+    else:
+        order.append(tid)
+
+    for moved_id in subtree:
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.branch_id=$bid",
+                      {"id":moved_id,"uid":uid,"bid":req.branch_id})
+    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.parent_id=$parent",
+                  {"id":tid,"uid":uid,"parent":parent_id})
+    for pos, task_id in enumerate(order):
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.position=$pos",
+                      {"id":task_id,"uid":uid,"pos":pos})
+    _record_quest_event(tid, mid or "", uid, "moved", 0, f"{old_branch or ''}->{req.branch_id}")
+    return {"ok":True,"branch_id":req.branch_id,"parent_id":parent_id,"position":order.index(tid)}
 
 @app.post("/tasks/{tid}/tick")
 def tick_task(tid: str, u: dict = Depends(current_user)):
@@ -2281,13 +2349,17 @@ section.active{display:block}
 .quest-branch-btn{background:none;border:1px dashed var(--border2);color:var(--ink3);
   font-family:sans-serif;font-size:11px;padding:3px 10px;border-radius:3px;cursor:pointer}
 .quest-branch-btn:hover{border-color:var(--gold);color:var(--gold)}
-.quest-branch-body{padding-top:7px}
+.quest-branch-body{padding-top:7px;min-height:28px;border-radius:4px;transition:background .12s,box-shadow .12s}
+.quest-branch-body.drag-over{background:rgba(139,105,20,.07);box-shadow:inset 0 0 0 1px rgba(139,105,20,.25)}
 .quest-empty{font-size:12px;color:var(--ink3);font-family:sans-serif;font-style:italic;
   padding:10px 0}
 .quest-node{position:relative}
+.quest-node[draggable="true"]{cursor:grab}
+.quest-node.dragging{opacity:.45}
 .quest-children{margin-left:22px;padding-left:12px;border-left:1px solid rgba(200,184,154,.6)}
 .quest-item{display:flex;align-items:flex-start;gap:10px;padding:9px 0;
-  border-bottom:.5px solid rgba(200,164,122,.25)}
+  border-bottom:.5px solid rgba(200,164,122,.25);transition:background .12s,box-shadow .12s}
+.quest-item.drop-before{box-shadow:inset 0 2px 0 var(--gold);background:rgba(139,105,20,.05)}
 .quest-item:last-child{border-bottom:none}
 .quest-cb{width:16px;height:16px;border:1.5px solid var(--border);border-radius:2px;
   flex-shrink:0;margin-top:2px;cursor:pointer;display:flex;align-items:center;
@@ -4000,6 +4072,78 @@ function toggleMissionMenu(mid,event){
 }
 document.addEventListener('click',closeMissionMenus);
 
+let _dragTask=null;
+function clearDragTargets(){
+  document.querySelectorAll('.quest-branch-body.drag-over').forEach(el=>el.classList.remove('drag-over'));
+  document.querySelectorAll('.quest-item.drop-before').forEach(el=>el.classList.remove('drop-before'));
+}
+function dragTaskStart(event,tid,mid){
+  if(event.target.closest('button,input,textarea,select,label')){
+    event.preventDefault();
+    return;
+  }
+  _dragTask={tid,mid};
+  event.dataTransfer.effectAllowed='move';
+  event.dataTransfer.setData('text/plain',tid);
+  event.currentTarget.classList.add('dragging');
+}
+function dragTaskEnd(event){
+  event.currentTarget.classList.remove('dragging');
+  _dragTask=null;
+  clearDragTargets();
+}
+function dragTaskOverBranch(event){
+  if(!_dragTask) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect='move';
+  event.currentTarget.classList.add('drag-over');
+}
+function dragTaskLeaveBranch(event){
+  if(!event.currentTarget.contains(event.relatedTarget)){
+    event.currentTarget.classList.remove('drag-over');
+  }
+}
+function dragTaskOverTask(event,tid){
+  if(!_dragTask||_dragTask.tid===tid) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const item=event.currentTarget.children[0];
+  if(item) item.classList.add('drop-before');
+}
+function dragTaskLeaveTask(event){
+  if(!event.currentTarget.contains(event.relatedTarget)){
+    const item=event.currentTarget.children[0];
+    if(item) item.classList.remove('drop-before');
+  }
+}
+async function moveDraggedTask(tid,mid,branchId,parentId='',beforeTaskId=''){
+  const r=await fetch(`/tasks/${tid}/move`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({branch_id:branchId,parent_id:parentId||'',before_task_id:beforeTaskId||''})});
+  if(!r.ok){
+    const d=await r.json().catch(()=>({detail:'Не удалось перенести квест'}));
+    alert(d.detail||'Не удалось перенести квест');
+    return;
+  }
+  _openMissions.add(mid);
+  loadMissions();
+}
+async function dropTaskOnBranch(event,mid,branchId){
+  if(!_dragTask) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const tid=_dragTask.tid;
+  clearDragTargets();
+  await moveDraggedTask(tid,mid,branchId,'','');
+}
+async function dropTaskBefore(event,mid,branchId,parentId,beforeTaskId){
+  if(!_dragTask||_dragTask.tid===beforeTaskId) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const tid=_dragTask.tid;
+  clearDragTargets();
+  await moveDraggedTask(tid,mid,branchId,parentId||'',beforeTaskId);
+}
+
 async function loadMissions(){
   const [r,cd]=await Promise.all([fetch('/missions'),fetch('/character/data')]);
   const ms=await r.json(); const charData=await cd.json();
@@ -4073,7 +4217,12 @@ async function loadMissions(){
       lead=`<div class="quest-cb ${isDone?'done':''}" onclick="doneTask('${jsArg(t.id)}','${jsArg(m.id)}')">${isDone?'✓':''}</div>`;
     }
 
-    return `<div class="quest-node">
+    return `<div class="quest-node" draggable="true"
+      ondragstart="dragTaskStart(event,'${jsArg(t.id)}','${jsArg(m.id)}')"
+      ondragend="dragTaskEnd(event)"
+      ondragover="dragTaskOverTask(event,'${jsArg(t.id)}')"
+      ondragleave="dragTaskLeaveTask(event)"
+      ondrop="dropTaskBefore(event,'${jsArg(m.id)}','${jsArg(branchId)}','${jsArg(t.parent_id||'')}','${jsArg(t.id)}')">
       <div class="quest-item ${kind==='ritual'?'repeat-task':''}">
         ${lead}
         <div class="quest-info">
@@ -4115,7 +4264,10 @@ async function loadMissions(){
           </div>
           ${branchMenu(m,b,isDefault)}
         </div>
-        <div class="quest-branch-body">${body}</div>
+        <div class="quest-branch-body"
+          ondragover="dragTaskOverBranch(event)"
+          ondragleave="dragTaskLeaveBranch(event)"
+          ondrop="dropTaskOnBranch(event,'${jsArg(m.id)}','${jsArg(b.id)}')">${body}</div>
       </div>`;
     }).join('');
 
