@@ -4,7 +4,7 @@ Parchment · Knowledge Graph · Колесо Миров · AI Архивариу
 """
 import json, uuid, re, subprocess, time, threading, os, hashlib, hmac, secrets
 import urllib.request as _ur
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import kuzu
@@ -266,6 +266,14 @@ def _migrate_quest_engine_columns():
         ("record_enabled",      "STRING", "'false'"),
         ("record_value",        "DOUBLE", "0"),
         ("record_label",        "STRING", "''"),
+        ("timer_record_mode",   "STRING", "'none'"),
+        ("timer_period_hours",  "INT64",  "24"),
+        ("timer_period_started_ts","STRING","''"),
+        ("timer_period_seconds","INT64",  "0"),
+        ("timer_last_period_seconds","INT64","0"),
+        ("timer_best_period_seconds","INT64","0"),
+        ("timer_last_session_seconds","INT64","0"),
+        ("timer_best_session_seconds","INT64","0"),
     ]:
         try: _conn.execute(f"ALTER TABLE Task ADD {col} {dtype} DEFAULT {default}")
         except: pass
@@ -365,6 +373,95 @@ def _timer_effective_seconds(total: int, started_ts: str) -> int:
     except:
         return total
 
+def _dt_from_s(ts: str) -> datetime | None:
+    if not ts: return None
+    try: return datetime.strptime(ts, "%Y-%m-%d %H:%M")
+    except: return None
+
+def _s_from_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+def _timer_current_period_effective(task: dict) -> int:
+    seconds=int(task.get("timer_period_seconds") or 0)
+    if task.get("timer_record_mode") != "period":
+        return seconds
+    started=_dt_from_s(task.get("timer_started_ts") or "")
+    period_started=_dt_from_s(task.get("timer_period_started_ts") or "")
+    if started and period_started:
+        seg_start=max(started, period_started)
+        if datetime.now() > seg_start:
+            seconds += int((datetime.now() - seg_start).total_seconds())
+    return max(0, seconds)
+
+def _sync_timer_period_state(task: dict, user_id: str) -> dict:
+    """Roll elapsed timer periods, preserving historical stats in Task columns."""
+    if (task.get("timer_record_mode") or "none") != "period":
+        if int(task.get("timer_best_session_seconds") or 0) <= 0 and float(task.get("record_value") or 0) > 0:
+            task["timer_best_session_seconds"]=int(float(task.get("record_value") or 0))
+        return task
+    now=datetime.now()
+    period_hours=max(1, int(task.get("timer_period_hours") or 24))
+    period_len=timedelta(hours=period_hours)
+    period_started=_dt_from_s(task.get("timer_period_started_ts") or "")
+    if not period_started or period_started > now:
+        period_started=now
+        task["timer_period_started_ts"]=_s_from_dt(period_started)
+        try:
+            _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_period_started_ts=$ts",
+                          {"id":task["id"],"uid":user_id,"ts":task["timer_period_started_ts"]})
+        except: pass
+        return task
+
+    raw_total=int(task.get("timer_total_seconds") or 0)
+    period_seconds=int(task.get("timer_period_seconds") or 0)
+    last_period=int(task.get("timer_last_period_seconds") or 0)
+    best_period=int(task.get("timer_best_period_seconds") or 0)
+    started=_dt_from_s(task.get("timer_started_ts") or "")
+    total_add=0
+    rolled=False
+
+    while now >= period_started + period_len:
+        period_end=period_started + period_len
+        final_seconds=period_seconds
+        if started and started < period_end:
+            seg_start=max(started, period_started)
+            if period_end > seg_start:
+                seg=int((period_end - seg_start).total_seconds())
+                final_seconds += seg
+                total_add += seg
+        last_period=max(0, final_seconds)
+        best_period=max(best_period, last_period)
+        period_started=period_end
+        period_seconds=0
+        rolled=True
+
+    if rolled:
+        if total_add and started:
+            raw_total += total_add
+            task["timer_started_ts"]=_s_from_dt(period_started)
+        task.update({
+            "timer_total_seconds":raw_total,
+            "timer_period_started_ts":_s_from_dt(period_started),
+            "timer_period_seconds":period_seconds,
+            "timer_last_period_seconds":last_period,
+            "timer_best_period_seconds":best_period,
+            "record_value":float(best_period),
+        })
+        try:
+            _conn.execute(
+                "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+                "t.timer_total_seconds=$total,t.timer_started_ts=$started,"
+                "t.timer_period_started_ts=$period_started,t.timer_period_seconds=$period_seconds,"
+                "t.timer_last_period_seconds=$last_period,t.timer_best_period_seconds=$best_period,"
+                "t.record_value=$record",
+                {"id":task["id"],"uid":user_id,"total":raw_total,
+                 "started":task.get("timer_started_ts") or "",
+                 "period_started":task["timer_period_started_ts"],
+                 "period_seconds":period_seconds,"last_period":last_period,
+                 "best_period":best_period,"record":float(best_period)})
+        except Exception as e: print(f"[timer_period_roll] {e}")
+    return task
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def slug(name):
     s = re.sub(r"[\s\-]+","_", name.lower().strip())
@@ -449,7 +546,9 @@ def _quest_snapshot(tid: str, user_id: str) -> dict | None:
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN "
         "t.id,t.mission_id,t.title,t.status,t.quest_kind,t.branch_id,t.parent_id,t.progress_mode,"
         "t.target_value,t.progress_value,t.current_iters,t.required_iters,t.timer_total_seconds,"
-        "t.quest_description,t.notes,t.record_enabled,t.record_value,t.record_label",
+        "t.timer_started_ts,t.quest_description,t.notes,t.record_enabled,t.record_value,t.record_label,"
+        "t.timer_record_mode,t.timer_period_hours,t.timer_period_started_ts,t.timer_period_seconds,"
+        "t.timer_last_period_seconds,t.timer_best_period_seconds,t.timer_last_session_seconds,t.timer_best_session_seconds",
         {"id":tid,"uid":user_id}))
     if not rows: return None
     t=rows[0]; mid=t[1]
@@ -463,14 +562,29 @@ def _quest_snapshot(tid: str, user_id: str) -> dict | None:
     linked=kuzu_rows(_conn.execute(
         "MATCH (m:Entity)-[r:LINKED]->(e:Entity) WHERE m.id=$id AND m.user_id=$uid AND e.user_id=$uid RETURN e.name,e.type,e.summary",
         {"id":eid,"uid":user_id}))
+    task={"id":t[0],"mission_id":mid,"title":t[2],"status":t[3],"quest_kind":t[4] or "task",
+          "branch_id":t[5] or "","parent_id":t[6] or "","progress_mode":t[7] or "check",
+          "target_value":float(t[8] or 1),"progress_value":float(t[9] or 0),
+          "current_iters":int(t[10] or 0),"required_iters":int(t[11] or 1),
+          "timer_total_seconds":int(t[12] or 0),"timer_started_ts":t[13] or "",
+          "quest_description":t[14] or "",
+          "notes":t[15] or "","record_enabled":(t[16] or "false")=="true",
+          "record_value":float(t[17] or 0),"record_label":t[18] or "",
+          "timer_record_mode":t[19] or ("session" if (t[16] or "false")=="true" and (t[4] or "")=="timer" else "none"),
+          "timer_period_hours":int(t[20] or 24),"timer_period_started_ts":t[21] or "",
+          "timer_period_seconds":int(t[22] or 0),
+          "timer_last_period_seconds":int(t[23] or 0),
+          "timer_best_period_seconds":int(t[24] or 0),
+          "timer_last_session_seconds":int(t[25] or 0),
+          "timer_best_session_seconds":int(t[26] or t[17] or 0)}
+    task=_sync_timer_period_state(task, user_id)
+    task["timer_current_period_seconds"]=_timer_current_period_effective(task)
+    if task.get("timer_record_mode") == "period":
+        task["timer_best_period_seconds"]=max(int(task.get("timer_best_period_seconds") or 0),
+                                              int(task.get("timer_current_period_seconds") or 0))
+    task["timer_total_seconds"]=_timer_effective_seconds(int(task.get("timer_total_seconds") or 0), task.get("timer_started_ts") or "")
     return {
-        "task":{"id":t[0],"mission_id":mid,"title":t[2],"status":t[3],"quest_kind":t[4] or "task",
-                "branch_id":t[5] or "","parent_id":t[6] or "","progress_mode":t[7] or "check",
-                "target_value":float(t[8] or 1),"progress_value":float(t[9] or 0),
-                "current_iters":int(t[10] or 0),"required_iters":int(t[11] or 1),
-                "timer_total_seconds":int(t[12] or 0),"quest_description":t[13] or "",
-                "notes":t[14] or "","record_enabled":(t[15] or "false")=="true",
-                "record_value":float(t[16] or 0),"record_label":t[17] or ""},
+        "task":task,
         "mission":{"title":mrows[0][0] if mrows else "Путь","description":mrows[0][1] if mrows else "",
                    "lore":mrows[0][2] if mrows else ""},
         "branch":{"title":brows[0][0] if brows else "Основная"},
@@ -721,7 +835,9 @@ def export_data(u: dict = Depends(current_user)):
         "t.last_reset_ts,t.streak,t.best_streak,t.entry_id,t.completed_ts,"
         "t.quest_kind,t.branch_id,t.parent_id,t.position,t.progress_mode,t.target_value,t.progress_value,"
         "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes,"
-        "t.is_current,t.quest_description,t.description_updated_ts,t.record_enabled,t.record_value,t.record_label",
+        "t.is_current,t.quest_description,t.description_updated_ts,t.record_enabled,t.record_value,t.record_label,"
+        "t.timer_record_mode,t.timer_period_hours,t.timer_period_started_ts,t.timer_period_seconds,"
+        "t.timer_last_period_seconds,t.timer_best_period_seconds,t.timer_last_session_seconds,t.timer_best_session_seconds",
         {"uid":uid}))
     branches = kuzu_rows(_conn.execute(
         "MATCH (b:QuestBranch) WHERE b.user_id=$uid RETURN b.id,b.mission_id,b.title,b.status,b.position,b.ts",
@@ -764,7 +880,14 @@ def export_data(u: dict = Depends(current_user)):
                       "is_current":r[27] or "false","quest_description":r[28] or "",
                       "description_updated_ts":r[29] or "",
                       "record_enabled":r[30] or "false","record_value":r[31] or 0,
-                      "record_label":r[32] or ""} for r in tasks],
+                      "record_label":r[32] or "",
+                      "timer_record_mode":r[33] or "none","timer_period_hours":r[34] or 24,
+                      "timer_period_started_ts":r[35] or "",
+                      "timer_period_seconds":r[36] or 0,
+                      "timer_last_period_seconds":r[37] or 0,
+                      "timer_best_period_seconds":r[38] or 0,
+                      "timer_last_session_seconds":r[39] or 0,
+                      "timer_best_session_seconds":r[40] or 0} for r in tasks],
         "events":   [{"id":r[0],"task_id":r[1],"mission_id":r[2],"event_type":r[3],
                       "value":r[4] or 0,"note":r[5] or "","ts":r[6]} for r in events],
         "path_entity_contexts": [{"id":r[0],"mission_id":r[1],"entity_id":r[2],
@@ -849,7 +972,11 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
                     "target_value:$target,progress_value:$progress,timer_total_seconds:$timer,timer_started_ts:$timer_started,"
                     "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes,"
                     "is_current:$current,quest_description:$qdesc,description_updated_ts:$dts,"
-                    "record_enabled:$record_enabled,record_value:$record_value,record_label:$record_label})",
+                    "record_enabled:$record_enabled,record_value:$record_value,record_label:$record_label,"
+                    "timer_record_mode:$timer_record_mode,timer_period_hours:$timer_period_hours,"
+                    "timer_period_started_ts:$timer_period_started_ts,timer_period_seconds:$timer_period_seconds,"
+                    "timer_last_period_seconds:$timer_last_period_seconds,timer_best_period_seconds:$timer_best_period_seconds,"
+                    "timer_last_session_seconds:$timer_last_session_seconds,timer_best_session_seconds:$timer_best_session_seconds})",
                     {"id":t["id"],"mid":t.get("mission_id",""),"ti":t["title"],
                      "s":t.get("status","active"),"ts":t.get("ts",""),
                      "tt":t.get("task_type","once"),"rh":int(t.get("reset_hours",24)),
@@ -869,7 +996,15 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
                      "dts":t.get("description_updated_ts",""),
                      "record_enabled":t.get("record_enabled","false"),
                      "record_value":float(t.get("record_value",0) or 0),
-                     "record_label":t.get("record_label","")})
+                     "record_label":t.get("record_label",""),
+                     "timer_record_mode":t.get("timer_record_mode","session" if t.get("record_enabled")=="true" and t.get("quest_kind")=="timer" else "none"),
+                     "timer_period_hours":int(t.get("timer_period_hours",24) or 24),
+                     "timer_period_started_ts":t.get("timer_period_started_ts",""),
+                     "timer_period_seconds":int(t.get("timer_period_seconds",0) or 0),
+                     "timer_last_period_seconds":int(t.get("timer_last_period_seconds",0) or 0),
+                     "timer_best_period_seconds":int(t.get("timer_best_period_seconds",0) or 0),
+                     "timer_last_session_seconds":int(t.get("timer_last_session_seconds",0) or 0),
+                     "timer_best_session_seconds":int(t.get("timer_best_session_seconds",t.get("record_value",0)) or 0)})
                 imported["tasks"]+=1
         except: pass
     # Finances
@@ -976,6 +1111,7 @@ class TaskReq(BaseModel):
     notes: str = ""
     is_current: bool = False; quest_description: str = ""
     record_enabled: bool = False; record_label: str = ""
+    timer_record_mode: str = "none"; timer_period_hours: int = 24
 class BranchReq(BaseModel):
     title: str
 class PathEntityContextReq(BaseModel):
@@ -1371,7 +1507,9 @@ def get_missions(u: dict = Depends(current_user)):
             "t.last_reset_ts,t.streak,t.best_streak,t.completed_ts,"
             "t.quest_kind,t.branch_id,t.parent_id,t.position,t.progress_mode,t.target_value,t.progress_value,"
             "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes,"
-            "t.is_current,t.quest_description,t.description_updated_ts,t.record_enabled,t.record_value,t.record_label "
+            "t.is_current,t.quest_description,t.description_updated_ts,t.record_enabled,t.record_value,t.record_label,"
+            "t.timer_record_mode,t.timer_period_hours,t.timer_period_started_ts,t.timer_period_seconds,"
+            "t.timer_last_period_seconds,t.timer_best_period_seconds,t.timer_last_session_seconds,t.timer_best_session_seconds "
             "ORDER BY t.position,t.ts",
             {"mid":mid,"uid":uid}))
         task_list=[]
@@ -1384,13 +1522,26 @@ def get_missions(u: dict = Depends(current_user)):
                 "branch_id":t[13] or _default_branch_id(mid),"parent_id":t[14] or "",
                 "position":int(t[15] or 0),"progress_mode":t[16] or ("count" if (t[4] or "")=="repeat" else "check"),
                 "target_value":float(t[17] or t[6] or 1),"progress_value":float(t[18] or t[7] or 0),
-                "timer_total_seconds":_timer_effective_seconds(int(t[19] or 0), t[20] or ""),
+                "timer_total_seconds":int(t[19] or 0),
                 "timer_started_ts":t[20] or "","unlock_rule":t[21] or "",
                 "unlock_payload":t[22] or "","locked":(t[23] or "false")=="true","notes":t[24] or "",
                 "is_current":(t[25] or "false")=="true","quest_description":t[26] or "",
                 "description_updated_ts":t[27] or "",
                 "record_enabled":(t[28] or "false")=="true","record_value":float(t[29] or 0),
-                "record_label":t[30] or ""}
+                "record_label":t[30] or "",
+                "timer_record_mode":t[31] or ("session" if (t[28] or "false")=="true" and (t[12] or "")=="timer" else "none"),
+                "timer_period_hours":int(t[32] or 24),"timer_period_started_ts":t[33] or "",
+                "timer_period_seconds":int(t[34] or 0),
+                "timer_last_period_seconds":int(t[35] or 0),
+                "timer_best_period_seconds":int(t[36] or 0),
+                "timer_last_session_seconds":int(t[37] or 0),
+                "timer_best_session_seconds":int(t[38] or t[29] or 0)}
+            td=_sync_timer_period_state(td, uid)
+            td["timer_current_period_seconds"]=_timer_current_period_effective(td)
+            if td.get("timer_record_mode") == "period":
+                td["timer_best_period_seconds"]=max(int(td.get("timer_best_period_seconds") or 0),
+                                                    int(td.get("timer_current_period_seconds") or 0))
+            td["timer_total_seconds"]=_timer_effective_seconds(int(td.get("timer_total_seconds") or 0), td.get("timer_started_ts") or "")
             td=_maybe_reset_task(td)
             task_list.append(td)
         # Linked entities
@@ -1513,6 +1664,15 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
     kind=req.quest_kind or ("ritual" if req.task_type == "repeat" else "task")
     progress_mode=req.progress_mode or ("count" if req.task_type == "repeat" else "check")
     task_type = "repeat" if kind == "ritual" or req.task_type == "repeat" else "once"
+    timer_record_mode = (req.timer_record_mode or "none").strip().lower()
+    if timer_record_mode not in ("none","session","period"):
+        timer_record_mode = "none"
+    if kind == "timer" and req.record_enabled and timer_record_mode == "none":
+        timer_record_mode = "session"
+    if kind != "timer":
+        timer_record_mode = "none"
+    timer_period_hours = max(1, int(req.timer_period_hours or 24))
+    timer_period_started_ts = ts if timer_record_mode == "period" else ""
     init_reset = ts if task_type == "repeat" else ""
     target_value = float(req.target_value or req.required_iters or 1)
     if task_type == "repeat":
@@ -1529,7 +1689,11 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
         "target_value:$target,progress_value:0,timer_total_seconds:$timer,timer_started_ts:'',"
         "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes,"
         "is_current:$current,quest_description:$qdesc,description_updated_ts:$dts,"
-        "record_enabled:$record_enabled,record_value:0,record_label:$record_label,user_id:$uid})",
+        "record_enabled:$record_enabled,record_value:0,record_label:$record_label,"
+        "timer_record_mode:$timer_record_mode,timer_period_hours:$timer_period_hours,"
+        "timer_period_started_ts:$timer_period_started_ts,timer_period_seconds:0,"
+        "timer_last_period_seconds:0,timer_best_period_seconds:0,"
+        "timer_last_session_seconds:0,timer_best_session_seconds:0,user_id:$uid})",
         {"id":tid,"mid":req.mission_id,"t":req.title,"ts":ts,
          "tt":task_type,"rh":req.reset_hours,"ri":req.required_iters,"lr":init_reset,
          "kind":kind,"bid":branch_id,"parent":req.parent_id,"position":position,
@@ -1538,8 +1702,9 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
          "locked":"true" if req.locked else "false","notes":req.notes,
          "current":"true" if req.is_current else "false","qdesc":req.quest_description,
          "dts":_now_s() if req.quest_description else "",
-         "record_enabled":"true" if req.record_enabled else "false",
-         "record_label":req.record_label,"uid":uid})
+         "record_enabled":"true" if (req.record_enabled or timer_record_mode != "none") else "false",
+         "record_label":req.record_label,"timer_record_mode":timer_record_mode,
+         "timer_period_hours":timer_period_hours,"timer_period_started_ts":timer_period_started_ts,"uid":uid})
     _record_quest_event(tid, req.mission_id, uid, "created", 0, kind)
     return {"id":tid,"title":req.title,"status":"active","task_type":task_type,"quest_kind":kind,"branch_id":branch_id}
 
@@ -1556,6 +1721,9 @@ class TaskCardReq(BaseModel):
     improve: bool = False
 class TaskCurrentReq(BaseModel):
     is_current: bool = True
+class TaskTimerRecordReq(BaseModel):
+    mode: str = "none"
+    period_hours: int = 24
 class TaskMoveReq(BaseModel):
     branch_id: str
     parent_id: str = ""
@@ -1619,6 +1787,53 @@ def set_task_current(tid: str, req: TaskCurrentReq, u: dict = Depends(current_us
     _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.is_current=$cur",
                   {"id":tid,"uid":uid,"cur":"true" if req.is_current else "false"})
     return {"ok":True,"is_current":req.is_current}
+
+@app.get("/tasks/{tid}/timer-record")
+def get_timer_record(tid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    snap=_quest_snapshot(tid, uid)
+    if not snap: raise HTTPException(404)
+    task=snap["task"]
+    if task.get("quest_kind") != "timer":
+        raise HTTPException(400, "Это не таймер")
+    return {"task":task}
+
+@app.post("/tasks/{tid}/timer-record")
+def set_timer_record(tid: str, req: TaskTimerRecordReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    mode=(req.mode or "none").strip().lower()
+    if mode not in ("none","session","period"):
+        raise HTTPException(400, "Неверный режим рекорда")
+    hours=max(1, int(req.period_hours or 24))
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.quest_kind,t.timer_record_mode,t.timer_period_hours,t.record_value,t.timer_best_session_seconds",
+        {"id":tid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    kind,old_mode,old_hours,old_record,old_best_session=rows[0]
+    if (kind or "") != "timer":
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.quest_kind='timer',t.progress_mode='timer'",
+                      {"id":tid,"uid":uid})
+    now_s=_now_s()
+    record_enabled="true" if mode != "none" else "false"
+    best_session=int(old_best_session or old_record or 0)
+    if mode == "period":
+        _conn.execute(
+            "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+            "t.timer_record_mode='period',t.timer_period_hours=$hours,t.record_enabled='true',"
+            "t.timer_period_started_ts=$started,t.timer_period_seconds=0,"
+            "t.timer_last_period_seconds=$last,t.timer_best_period_seconds=$best,t.record_value=$record",
+            {"id":tid,"uid":uid,"hours":hours,
+             "started":now_s,"last":0,"best":0,"record":0.0})
+    else:
+        record_value=float(best_session if mode == "session" else 0)
+        _conn.execute(
+            "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+            "t.timer_record_mode=$mode,t.timer_period_hours=$hours,t.record_enabled=$enabled,"
+            "t.record_value=$record,t.timer_best_session_seconds=$best_session",
+            {"id":tid,"uid":uid,"mode":mode,"hours":hours,"enabled":record_enabled,
+             "record":record_value,"best_session":best_session})
+    snap=_quest_snapshot(tid, uid)
+    return {"ok":True,"task":snap["task"] if snap else {}}
 
 @app.post("/tasks/{tid}/move")
 def move_task(tid: str, req: TaskMoveReq, u: dict = Depends(current_user)):
@@ -1733,21 +1948,52 @@ def start_task_timer(tid: str, u: dict = Depends(current_user)):
 def stop_task_timer(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.timer_total_seconds,t.timer_started_ts,t.record_enabled,t.record_value",
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN "
+        "t.mission_id,t.timer_total_seconds,t.timer_started_ts,t.record_enabled,t.record_value,"
+        "t.timer_record_mode,t.timer_period_hours,t.timer_period_started_ts,t.timer_period_seconds,"
+        "t.timer_last_period_seconds,t.timer_best_period_seconds,t.timer_last_session_seconds,t.timer_best_session_seconds",
         {"id":tid,"uid":uid}))
     if not rows: raise HTTPException(404)
-    mid,total,started,record_enabled,record_value=rows[0]
+    (mid,total,started,record_enabled,record_value,mode,period_hours,period_started,period_seconds,
+     last_period,best_period,last_session,best_session)=rows[0]
+    task={"id":tid,"timer_total_seconds":int(total or 0),"timer_started_ts":started or "",
+          "record_enabled":(record_enabled or "false")=="true","record_value":float(record_value or 0),
+          "timer_record_mode":mode or ("session" if (record_enabled or "false")=="true" else "none"),
+          "timer_period_hours":int(period_hours or 24),"timer_period_started_ts":period_started or "",
+          "timer_period_seconds":int(period_seconds or 0),
+          "timer_last_period_seconds":int(last_period or 0),
+          "timer_best_period_seconds":int(best_period or 0),
+          "timer_last_session_seconds":int(last_session or 0),
+          "timer_best_session_seconds":int(best_session or record_value or 0)}
+    task=_sync_timer_period_state(task, uid)
+    total=int(task.get("timer_total_seconds") or 0)
+    started=task.get("timer_started_ts") or ""
     new_total=_timer_effective_seconds(int(total or 0), started or "")
     session_delta=max(0, new_total - int(total or 0))
+    mode=task.get("timer_record_mode") or "none"
+    best_session=max(int(task.get("timer_best_session_seconds") or 0), int(session_delta))
+    period_seconds=int(task.get("timer_period_seconds") or 0)
+    best_period=int(task.get("timer_best_period_seconds") or 0)
+    record_value=float(task.get("record_value") or 0)
+    if mode == "period":
+        period_seconds += int(session_delta)
+        best_period=max(best_period, period_seconds)
+        record_value=float(best_period)
+    elif mode == "session":
+        record_value=float(best_session)
     _conn.execute(
-        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_total_seconds=$total,t.timer_started_ts='',t.progress_value=$hours",
-        {"id":tid,"uid":uid,"total":new_total,"hours":round(new_total/3600, 3)})
-    if (record_enabled or "false")=="true" and session_delta > float(record_value or 0):
-        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.record_value=$v",
-                      {"id":tid,"uid":uid,"v":float(session_delta)})
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+        "t.timer_total_seconds=$total,t.timer_started_ts='',t.progress_value=$hours,"
+        "t.timer_last_session_seconds=$last_session,t.timer_best_session_seconds=$best_session,"
+        "t.timer_period_seconds=$period_seconds,t.timer_best_period_seconds=$best_period,t.record_value=$record",
+        {"id":tid,"uid":uid,"total":new_total,"hours":round(new_total/3600, 3),
+         "last_session":int(session_delta),"best_session":best_session,
+         "period_seconds":period_seconds,"best_period":best_period,"record":record_value})
     _record_quest_event(tid, mid or "", uid, "timer_stopped", float(session_delta))
     _write_quest_journal_event(tid, uid, "timer_stopped", float(session_delta))
-    return {"ok":True,"timer_total_seconds":new_total}
+    return {"ok":True,"timer_total_seconds":new_total,"last_session_seconds":int(session_delta),
+            "best_session_seconds":best_session,"current_period_seconds":period_seconds,
+            "best_period_seconds":best_period}
 
 @app.post("/tasks/{tid}/note")
 def save_task_note(tid: str, req: TaskNoteReq, u: dict = Depends(current_user)):
@@ -2774,6 +3020,12 @@ section.active{display:block}
 .quest-card-textarea:focus{border-color:var(--gold)}
 .quest-card-meta{font-size:11px;color:var(--ink3);font-family:sans-serif;line-height:1.6;margin-bottom:10px}
 .quest-record{font-size:10px;color:var(--gold);font-family:sans-serif;margin-left:2px}
+.timer-record-panel{border:1px solid var(--border2);background:rgba(139,105,20,.05);
+  padding:10px 12px;margin:8px 0 12px;border-radius:3px}
+.timer-record-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:8px}
+.timer-record-cell{background:var(--paper);border:1px solid var(--border2);padding:7px 8px;border-radius:3px}
+.timer-record-label{font-size:9px;letter-spacing:1.2px;text-transform:uppercase;color:var(--ink3);font-family:sans-serif}
+.timer-record-value{font-size:13px;color:var(--ink);font-family:sans-serif;margin-top:3px}
 
 /* ── REPEAT TASKS ── */
 .quest-item.repeat-task{background:rgba(139,105,20,.04);border-left:2px solid rgba(139,105,20,.28);padding-left:10px}
@@ -3622,11 +3874,24 @@ section.active{display:block}
     <div id="t-timer-opts" class="dlg-hint" style="display:none;margin-bottom:10px">
       Таймер будет копить общее время. Его можно запускать и останавливать прямо в ветви.
     </div>
+    <div id="t-timer-record-row" style="display:none;margin-bottom:12px">
+      <div class="dlg-label">Рекорд таймера</div>
+      <select class="dlg-input" id="t-timer-record-mode" onchange="toggleTaskKindOpts()" style="font-family:'Georgia',serif">
+        <option value="none">Без рекорда</option>
+        <option value="session">Сессии: последняя / лучшая</option>
+        <option value="period">Периоды: текущий / прошлый / лучший</option>
+      </select>
+      <div id="t-timer-period-row" style="display:none;align-items:center;gap:6px;margin-top:8px">
+        <input class="dlg-input" id="t-period-hours" type="number" min="1" value="24"
+          style="width:90px;margin-bottom:0" placeholder="Часов">
+        <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">часов в периоде</span>
+      </div>
+    </div>
     <label style="display:flex;align-items:center;gap:7px;margin:6px 0 8px;font-family:sans-serif;font-size:12px;color:var(--ink2);cursor:pointer">
       <input type="checkbox" id="t-current"> актуально сейчас
     </label>
     <label id="t-record-row" style="display:none;align-items:center;gap:7px;margin:0 0 12px;font-family:sans-serif;font-size:12px;color:var(--ink2);cursor:pointer">
-      <input type="checkbox" id="t-record"> вести рекорд
+      <input type="checkbox" id="t-record"> вести рекорд счётчика
     </label>
     <input type="hidden" id="t-mid">
     <input type="hidden" id="t-branch">
@@ -4300,8 +4565,8 @@ async function loadAsides(){
       return `${t.current_iters||0}/${t.required_iters||1}${timeLeft?' · '+timeLeft:''}`;
     }
     if(kind==='timer'){
-      const rec=t.record_enabled&&t.record_value?` · рекорд ${fmtDuration(t.record_value)}`:'';
-      return `таймер · всего ${fmtDuration(t.timer_total_seconds||0)}${rec}`;
+      const rec=timerRecordSummary(t,true);
+      return `таймер · всего ${fmtDuration(t.timer_total_seconds||0)}${rec?' · '+rec:''}`;
     }
     if(kind==='counter'){
       const cur=Number(t.progress_value||0);
@@ -4333,11 +4598,89 @@ function questKindName(kind, taskType=''){
   const k=kind||((taskType||'')==='repeat'?'ritual':'task');
   return {task:'квест',ritual:'ритуал',timer:'таймер',counter:'счётчик'}[k]||'квест';
 }
+function timerRecordMode(task){
+  return task?.timer_record_mode || (task?.record_enabled?'session':'none');
+}
+function timerRecordSummary(task,compact=false){
+  const mode=timerRecordMode(task);
+  if(mode==='period'){
+    const cur=fmtDuration(task.timer_current_period_seconds||task.timer_period_seconds||0);
+    const last=fmtDuration(task.timer_last_period_seconds||0);
+    const best=fmtDuration(task.timer_best_period_seconds||0);
+    return compact
+      ?`период ${task.timer_period_hours||24}ч: ${cur} · рекорд ${best}`
+      :`Период ${task.timer_period_hours||24}ч: сейчас ${cur}, прошлый ${last}, лучший ${best}`;
+  }
+  if(mode==='session'){
+    const last=fmtDuration(task.timer_last_session_seconds||0);
+    const best=fmtDuration(task.timer_best_session_seconds||task.record_value||0);
+    return compact?`сессия ${last} · рекорд ${best}`:`Сессия: последняя ${last}, лучшая ${best}`;
+  }
+  return '';
+}
 function questRecordText(task){
+  if((task?.quest_kind||'')==='timer') return timerRecordSummary(task,false);
   if(!task?.record_enabled) return '';
   const kind=task.quest_kind||'task';
-  if(kind==='timer') return `Рекорд: ${fmtDuration(task.record_value||0)}`;
   return `Рекорд: ${Number(task.record_value||0).toLocaleString('ru-RU')}`;
+}
+function timerRecordPanel(task){
+  if((task?.quest_kind||'')!=='timer') return '';
+  const mode=timerRecordMode(task);
+  const modeLabel={none:'без рекорда',session:'сессии',period:'периоды'}[mode]||'без рекорда';
+  const cells=mode==='period'
+    ?[
+      ['текущий период',fmtDuration(task.timer_current_period_seconds||task.timer_period_seconds||0)],
+      ['прошлый период',fmtDuration(task.timer_last_period_seconds||0)],
+      ['лучший период',fmtDuration(task.timer_best_period_seconds||0)]
+    ]
+    :[
+      ['последняя сессия',fmtDuration(task.timer_last_session_seconds||0)],
+      ['лучшая сессия',fmtDuration(task.timer_best_session_seconds||task.record_value||0)],
+      ['всего',fmtDuration(task.timer_total_seconds||0)]
+    ];
+  return `<div class="timer-record-panel">
+    <div class="quest-card-meta">Режим рекорда: ${modeLabel}${mode==='period'?` · период ${task.timer_period_hours||24}ч`:''}</div>
+    <div class="timer-record-grid">${cells.map(c=>`<div class="timer-record-cell">
+      <div class="timer-record-label">${c[0]}</div><div class="timer-record-value">${c[1]}</div>
+    </div>`).join('')}</div>
+  </div>`;
+}
+function timerRecordSettings(task){
+  if((task?.quest_kind||'')!=='timer') return '';
+  const mode=timerRecordMode(task);
+  return `<div class="ent-sec">Рекорды таймера</div>
+    ${timerRecordPanel(task)}
+    <div class="timer-record-panel">
+      <select class="dlg-input" id="timer-card-mode" onchange="toggleTimerCardPeriodRow()" style="font-family:'Georgia',serif;margin-bottom:8px">
+        <option value="none" ${mode==='none'?'selected':''}>Без рекорда</option>
+        <option value="session" ${mode==='session'?'selected':''}>Сессии: последняя / лучшая</option>
+        <option value="period" ${mode==='period'?'selected':''}>Периоды: текущий / прошлый / лучший</option>
+      </select>
+      <div id="timer-card-period-row" style="display:${mode==='period'?'flex':'none'};align-items:center;gap:6px;margin-bottom:10px">
+        <input class="dlg-input" id="timer-card-period-hours" type="number" min="1" value="${task.timer_period_hours||24}"
+          style="width:90px;margin-bottom:0">
+        <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">часов в периоде</span>
+      </div>
+      <button class="ent-merge-btn" onclick="saveTimerRecordSettings('${_jsEsc(task.id)}','${_jsEsc(task.mission_id||'')}')">Сохранить режим рекорда</button>
+    </div>`;
+}
+function toggleTimerCardPeriodRow(){
+  const mode=document.getElementById('timer-card-mode')?.value||'none';
+  const row=document.getElementById('timer-card-period-row');
+  if(row) row.style.display=mode==='period'?'flex':'none';
+}
+async function saveTimerRecordSettings(tid,mid=''){
+  const mode=document.getElementById('timer-card-mode')?.value||'none';
+  const period_hours=parseInt(document.getElementById('timer-card-period-hours')?.value)||24;
+  const r=await fetch(`/tasks/${tid}/timer-record`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode,period_hours})});
+  if(!r.ok) return;
+  if(mid) _openMissions.add(mid);
+  const active=document.querySelector('section.active');
+  if(active?.id==='s-missions') loadMissions();
+  loadAsides();
+  openTaskCard(tid);
 }
 async function toggleTaskCurrent(tid,mid='',isCurrent=true){
   const r=await fetch(`/tasks/${tid}/current`,{method:'POST',headers:{'Content-Type':'application/json'},
@@ -4371,6 +4714,7 @@ async function openTaskCard(tid){
     <div class="quest-card-meta">${task.is_current?'актуально сейчас':'не в активных'}${rec?' · '+_entEsc(rec):''}</div>
     ${entities?`<div class="mission-entities" style="margin:4px 0 12px">${entities}</div>`:''}
     ${task.notes?`<div class="ent-sec">Заметки игрока</div><div class="ent-summary">${_entEsc(task.notes)}</div>`:''}
+    ${timerRecordSettings(task)}
     <div class="ent-sec">Карточка задания</div>
     <textarea class="quest-card-textarea" id="quest-card-desc" placeholder="Что происходит в этом квесте, зачем он нужен, что важно помнить...">${_entEsc(d.description||'')}</textarea>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -4563,7 +4907,10 @@ async function loadMissions(){
     const currentBtn=`<button class="quest-tool ${t.is_current?'current':''}" onclick="toggleTaskCurrent('${jsArg(t.id)}','${jsArg(m.id)}',${t.is_current?'false':'true'});event.stopPropagation()">${t.is_current?'★ актуально':'☆ в актуальные'}</button>`;
     const editBtn=`<button class="btn-edit-inline" onclick="editTask('${jsArg(t.id)}');event.stopPropagation()" title="Переименовать">✎</button>`;
     const delBtn=`<button class="quest-del" onclick="deleteTask('${jsArg(t.id)}','${jsArg(m.id)}')" title="Удалить">×</button>`;
-    const recordHtml=t.record_enabled?`<span class="quest-record">рекорд: ${kind==='timer'?fmtDuration(t.record_value||0):Number(t.record_value||0).toLocaleString('ru-RU')}</span>`:'';
+    const timerRec=kind==='timer'?timerRecordSummary(t,true):'';
+    const recordHtml=kind==='timer'
+      ?(timerRec?`<span class="quest-record">${timerRec}</span>`:'')
+      :(t.record_enabled?`<span class="quest-record">рекорд: ${Number(t.record_value||0).toLocaleString('ru-RU')}</span>`:'');
     let lead='';
     let controls=`<div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
 
@@ -4744,6 +5091,8 @@ function openTaskDlg(mid,branchId='',parentId=''){
   document.getElementById('t-iters').value='1';
   document.getElementById('t-hours').value='24';
   document.getElementById('t-target').value='1';
+  document.getElementById('t-timer-record-mode').value='none';
+  document.getElementById('t-period-hours').value='24';
   document.getElementById('t-current').checked=false;
   document.getElementById('t-record').checked=false;
   const taskRadio=document.querySelector('input[name="t-kind"][value="task"]');
@@ -4767,12 +5116,15 @@ async function saveTask(){
   const progressMode=kind==='ritual'?'count':kind==='timer'?'timer':kind==='counter'?'number':'check';
   const targetValue=kind==='ritual'?iters:(kind==='counter'?target:1);
   const current=document.getElementById('t-current')?.checked||false;
-  const record=!!document.getElementById('t-record')?.checked&&(kind==='timer'||kind==='counter');
+  const timerRecordMode=kind==='timer'?(document.getElementById('t-timer-record-mode')?.value||'none'):'none';
+  const periodHours=parseInt(document.getElementById('t-period-hours')?.value)||24;
+  const record=(kind==='timer'&&timerRecordMode!=='none') || (!!document.getElementById('t-record')?.checked&&kind==='counter');
   await fetch('/tasks',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
       mission_id:mid,title:t,task_type:taskType,required_iters:iters,reset_hours:hours,
       quest_kind:kind,progress_mode:progressMode,branch_id:branchId,parent_id:parentId,
-      target_value:targetValue,is_current:current,record_enabled:record
+      target_value:targetValue,is_current:current,record_enabled:record,
+      timer_record_mode:timerRecordMode,timer_period_hours:periodHours
     })});
   closeDlg('task-dlg');
   document.getElementById('t-title').value='';
@@ -4794,8 +5146,13 @@ function toggleTaskKindOpts(){
   if(counter) counter.style.display=kind==='counter'?'block':'none';
   const timer=document.getElementById('t-timer-opts');
   if(timer) timer.style.display=kind==='timer'?'block':'none';
+  const timerRecord=document.getElementById('t-timer-record-row');
+  if(timerRecord) timerRecord.style.display=kind==='timer'?'block':'none';
+  const timerRecordMode=document.getElementById('t-timer-record-mode')?.value||'none';
+  const periodRow=document.getElementById('t-timer-period-row');
+  if(periodRow) periodRow.style.display=(kind==='timer'&&timerRecordMode==='period')?'flex':'none';
   const record=document.getElementById('t-record-row');
-  if(record) record.style.display=(kind==='timer'||kind==='counter')?'flex':'none';
+  if(record) record.style.display=kind==='counter'?'flex':'none';
 }
 function toggleRepeatOpts(){
   toggleTaskKindOpts();
