@@ -631,23 +631,34 @@ def _generate_quest_description(snap: dict, user_id: str, player_note: str = "")
 def _quest_journal_fallback(snap: dict, event_type: str, value: float = 0.0) -> str:
     task=snap["task"]; mission=snap["mission"]
     linked=", ".join(e["name"] for e in snap.get("entities",[])[:4])
-    tail=f" В орбите этого шага: {linked}." if linked else ""
+    path=f" на Пути «{mission['title']}»"
+    context=f" Это связано с {linked}." if linked else ""
     if event_type=="timer_stopped":
-        return f"Герой провёл {_duration_ru(value)} в деле «{task['title']}», продвигая Путь «{mission['title']}».{tail}"
+        return f"Я занимался «{task['title']}» {_duration_ru(value)}{path}. Важно помнить: время становится силой, когда я направляю его не только на свой результат, но и на пользу, которую смогу передать дальше.{context}"
     if event_type=="tick":
-        return f"Герой отметил продвижение в ритуале «{task['title']}»: {task['current_iters']}/{task['required_iters']}.{tail}"
+        return f"Я сделал шаг в ритуале «{task['title']}»: {task['current_iters']}/{task['required_iters']}{path}. Малое повторение собирает намерение: я учусь превращать привычку в действие ради большего, чем просто отметка.{context}"
     if event_type=="progress":
-        return f"Герой продвинул счётчик «{task['title']}» до {task['progress_value']:g}/{task['target_value']:g}.{tail}"
+        return f"Я продвинул задачу «{task['title']}» до {task['progress_value']:g}/{task['target_value']:g}{path}. Это не просто число: я проверяю, становится ли движение точнее, честнее и полезнее.{context}"
     if event_type=="completed":
-        return f"Герой завершил поручение «{task['title']}» на Пути «{mission['title']}».{tail}"
-    return f"Герой сделал шаг в задании «{task['title']}».{tail}"
+        return f"Я завершил «{task['title']}»{path}. Этот шаг закрыт, но его смысл надо унести дальше: взять из него ясность, дисциплину и больше готовности отдавать через дело.{context}"
+    return f"Я сделал шаг в задании «{task['title']}»{path}. Смысл шага в том, чтобы моё действие стало чуть менее случайным и чуть более направленным.{context}"
+
+def _quest_event_meaning(event_type: str, value: float) -> str:
+    if event_type=="timer_stopped": return f"остановлен таймер, сессия длилась {_duration_ru(value)}"
+    if event_type=="tick": return "отмечен шаг повторяемого ритуала"
+    if event_type=="progress": return f"обновлён прогресс до {value:g}"
+    if event_type=="completed": return "задание выполнено"
+    return "сделан шаг в задании"
 
 def _improve_quest_journal_entry(entry_id: str, snap: dict, event_type: str, value: float, user_id: str):
     if not _has_any_ai(): return
-    prompt=f"""Ты — летописец Life RPG. Перепиши техническое действие в дневниковую запись в духе Morrowind.
-1-2 предложения. Конкретно, без чрезмерного пафоса. Упоминай важные сущности по именам.
+    prompt=f"""Ты — тихий редактор дневника Life RPG.
+Перепиши действие в запись ОТ ПЕРВОГО ЛИЦА: "Я сделал...", "Я занимался...", "Я понял...".
+Стиль: ясный дневник Героя, не поэма, не религиозная проповедь, без слов "каббала", "Творец", "божественный", "святость".
+Скрытый смысл: действие должно мягко приближать Героя к намерению отдавать, приносить пользу, очищать мотив от "получить ради себя" к "сделать ради смысла и пользы".
+1-2 предложения. Конкретно: что сделано, зачем это важно, короткая рефлексия-наставление себе.
 
-Действие: {event_type}
+Действие: {_quest_event_meaning(event_type,value)}
 Значение: {value}
 Задание: {snap['task']['title']}
 Описание задания: {snap['task'].get('quest_description') or _quest_description_fallback(snap)}
@@ -665,14 +676,14 @@ def _improve_quest_journal_entry(entry_id: str, snap: dict, event_type: str, val
     text=_call_any_ai(prompt).strip()
     if text:
         try:
-            _conn.execute("MATCH (e:Entry) WHERE e.id=$id AND e.user_id=$uid SET e.narrative=$n,e.archivist_note=$a",
-                          {"id":entry_id,"uid":user_id,"n":text,"a":"Запись создана по действию квеста."})
+            _conn.execute("MATCH (e:Entry) WHERE e.id=$id AND e.user_id=$uid SET e.narrative=$n,e.archivist_note=''",
+                          {"id":entry_id,"uid":user_id,"n":text})
         except Exception as ex: print(f"[quest_journal_update] {ex}")
 
 def _write_quest_journal_event(tid: str, user_id: str, event_type: str, value: float = 0.0):
     snap=_quest_snapshot(tid, user_id)
     if not snap: return
-    raw=f"quest:{event_type}:{snap['task']['title']}"
+    raw=""
     narrative=_quest_journal_fallback(snap, event_type, value)
     data={"narrative":narrative,"archivist_note":"","entities":[],"relations":[]}
     eid=write_entry(raw, data, user_id)
@@ -4497,21 +4508,23 @@ async function loadJournal(){
     const cal=WoW.convert(date);
     const items=entries
       .slice()
-      .sort((a,b)=>String(a.ts||'').localeCompare(String(b.ts||'')))
+      .sort((a,b)=>String(b.ts||'').localeCompare(String(a.ts||'')))
       .map(e=>{
       const timeStr=e.ts.includes(' ')?e.ts.split(' ')[1]:'';
       const isPending = pendingIds.has(e.id);
       const ageStyle=entryAgeStyle(e.ts);
-      const archivistHtml=e.archivist_note?
+      const rawText=String(e.raw||'');
+      const isQuestAction=rawText.startsWith('quest:');
+      const archivistHtml=e.archivist_note&&!isQuestAction?
         `<div class="entry-archivist">◆ ${e.archivist_note}</div>`:'';
       const pendingHtml=isPending?
         `<div style="font-size:11px;color:var(--border);font-family:sans-serif;font-style:italic;margin-top:8px">
           ⏳ Архивариус обрабатывает запись...
         </div>`:'';
       return `<div class="entry" style="${ageStyle}">
-        ${timeStr?`<div class="entry-stamp">${timeStr} · ${cal.phaseEmoji} ${cal.phase}</div>`:''}
+        ${timeStr?`<div class="entry-stamp">${timeStr}</div>`:''}
         <div class="entry-text">${linkify(e.narrative)}</div>
-        ${!isPending&&e.raw&&e.raw!==e.narrative?`<div class="entry-raw">«${e.raw}»</div>`:''}
+        ${!isPending&&!isQuestAction&&e.raw&&e.raw!==e.narrative?`<div class="entry-raw">«${e.raw}»</div>`:''}
         ${archivistHtml}
         ${pendingHtml}
       </div>`;
