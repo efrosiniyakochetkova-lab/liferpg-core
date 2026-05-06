@@ -1252,8 +1252,8 @@ def delete_branch(bid: str, u: dict = Depends(current_user)):
         raise HTTPException(400, "Основную ветвь нельзя удалить")
     default_bid=_ensure_default_branch(mid, uid)
     _conn.execute(
-        "MATCH (t:Task) WHERE t.branch_id=$bid AND t.user_id=$uid SET t.branch_id=$default",
-        {"bid":bid,"uid":uid,"default":default_bid})
+        "MATCH (t:Task) WHERE t.branch_id=$bid AND t.user_id=$uid SET t.branch_id=$default_bid",
+        {"bid":bid,"uid":uid,"default_bid":default_bid})
     _conn.execute("MATCH (b:QuestBranch) WHERE b.id=$id AND b.user_id=$uid DELETE b",
                   {"id":bid,"uid":uid})
     return {"ok":True,"moved_to":default_bid,"deleted":title}
@@ -4280,7 +4280,12 @@ async function renameBranch(bid,current,mid){
 }
 async function deleteBranch(bid,mid){
   if(!confirm('Удалить ветвь? Задания переедут в Основную.')) return;
-  await fetch(`/branches/${bid}/delete`,{method:'POST'});
+  const r=await fetch(`/branches/${bid}/delete`,{method:'POST'});
+  if(!r.ok){
+    const d=await r.json().catch(()=>({detail:'Не удалось удалить ветвь'}));
+    alert(d.detail||'Не удалось удалить ветвь');
+    return;
+  }
   _openMissions.add(mid); loadMissions();
 }
 async function progressTask(tid,mid,delta){
