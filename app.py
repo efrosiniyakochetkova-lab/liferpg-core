@@ -153,6 +153,9 @@ def _mission_entity_id(mid: str, title: str, user_id: str) -> str:
         return "mission_" + slug(title)
     return _scoped_id(f"mission:{mid}", user_id)
 
+def _path_entity_context_id(mid: str, entity_id: str, user_id: str) -> str:
+    return _scoped_id(f"pathctx:{mid}:{entity_id}", user_id)
+
 def _user_json_file(base_name: str, user_id: str) -> Path:
     if user_id == "admin":
         return _DATA_DIR / base_name
@@ -171,7 +174,7 @@ def _drop_all():
     for t in ["LINKED","MENTIONS"]:      # rels first
         try: _conn.execute(f"DROP TABLE {t}")
         except: pass
-    for t in ["Entry","Entity","Mission","Task","Finance","Mode"]:
+    for t in ["Entry","Entity","Mission","Task","QuestBranch","QuestEvent","PathEntityContext","Finance","Mode"]:
         try: _conn.execute(f"DROP TABLE {t}")
         except: pass
 
@@ -196,6 +199,15 @@ def _setup():
     _conn.execute("""CREATE NODE TABLE IF NOT EXISTS Task(
         id STRING, mission_id STRING, title STRING, status STRING,
         ts STRING, entry_id STRING, PRIMARY KEY(id))""")
+    _conn.execute("""CREATE NODE TABLE IF NOT EXISTS QuestBranch(
+        id STRING, mission_id STRING, title STRING, status STRING,
+        position INT64, ts STRING, user_id STRING, PRIMARY KEY(id))""")
+    _conn.execute("""CREATE NODE TABLE IF NOT EXISTS QuestEvent(
+        id STRING, task_id STRING, mission_id STRING, event_type STRING,
+        value DOUBLE, note STRING, ts STRING, user_id STRING, PRIMARY KEY(id))""")
+    _conn.execute("""CREATE NODE TABLE IF NOT EXISTS PathEntityContext(
+        id STRING, mission_id STRING, entity_id STRING, note STRING,
+        ai_note STRING, updated_ts STRING, user_id STRING, PRIMARY KEY(id))""")
     _conn.execute("""CREATE NODE TABLE IF NOT EXISTS Finance(
         id STRING, amount DOUBLE, direction STRING, category STRING,
         note STRING, ts STRING, PRIMARY KEY(id))""")
@@ -209,7 +221,7 @@ _setup()
 
 def _migrate_user_columns():
     """Add user_id to all node tables (idempotent)."""
-    for tbl in ("Entry","Entity","Mission","Task","Finance","Mode"):
+    for tbl in ("Entry","Entity","Mission","Task","QuestBranch","QuestEvent","PathEntityContext","Finance","Mode"):
         try: _conn.execute(f"ALTER TABLE {tbl} ADD user_id STRING DEFAULT 'admin'")
         except: pass
 
@@ -231,6 +243,27 @@ def _migrate_task_columns():
     try: _conn.execute("ALTER TABLE Task ADD completed_ts STRING DEFAULT ''")
     except: pass
 _migrate_task_columns()
+
+def _migrate_quest_engine_columns():
+    """Quest Engine columns: branches, tree structure, timers, counters, unlocks."""
+    for col, dtype, default in [
+        ("quest_kind",          "STRING", "'task'"),
+        ("branch_id",           "STRING", "''"),
+        ("parent_id",           "STRING", "''"),
+        ("position",            "INT64",  "0"),
+        ("progress_mode",       "STRING", "'check'"),
+        ("target_value",        "DOUBLE", "1"),
+        ("progress_value",      "DOUBLE", "0"),
+        ("timer_total_seconds", "INT64",  "0"),
+        ("timer_started_ts",    "STRING", "''"),
+        ("unlock_rule",         "STRING", "''"),
+        ("unlock_payload",      "STRING", "''"),
+        ("locked",              "STRING", "'false'"),
+        ("notes",               "STRING", "''"),
+    ]:
+        try: _conn.execute(f"ALTER TABLE Task ADD {col} {dtype} DEFAULT {default}")
+        except: pass
+_migrate_quest_engine_columns()
 
 def _maybe_reset_task(t: dict) -> dict:
     """Check if repeatable task cycle is over; update DB and return updated dict."""
@@ -257,6 +290,74 @@ def _maybe_reset_task(t: dict) -> dict:
         t.update({"current_iters": 0, "last_reset_ts": now_s, "streak": stk, "best_streak": best})
     except: pass
     return t
+
+def _now_s() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def _default_branch_id(mission_id: str) -> str:
+    return f"{mission_id}:main"
+
+def _ensure_default_branch(mission_id: str, user_id: str) -> str:
+    bid = _default_branch_id(mission_id)
+    rows = kuzu_rows(_conn.execute(
+        "MATCH (b:QuestBranch) WHERE b.id=$id AND b.user_id=$uid RETURN b.id",
+        {"id": bid, "uid": user_id}))
+    if not rows:
+        try:
+            _conn.execute(
+                "CREATE (:QuestBranch {id:$id,mission_id:$mid,title:'Основная',status:'active',position:0,ts:$ts,user_id:$uid})",
+                {"id": bid, "mid": mission_id, "ts": _now_s(), "uid": user_id})
+        except: pass
+    return bid
+
+def _ensure_mission_quest_engine(mission_id: str, user_id: str) -> str:
+    bid = _ensure_default_branch(mission_id, user_id)
+    rows = kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.mission_id=$mid AND t.user_id=$uid "
+        "RETURN t.id,t.task_type,t.quest_kind,t.branch_id,t.progress_mode,t.target_value,t.progress_value,t.current_iters,t.required_iters",
+        {"mid": mission_id, "uid": user_id}))
+    for r in rows:
+        tid, task_type, quest_kind, branch_id, progress_mode, target_value, progress_value, current_iters, required_iters = r
+        kind = quest_kind or ("ritual" if task_type == "repeat" else "task")
+        mode = progress_mode or ("count" if task_type == "repeat" else "check")
+        target = float(target_value or required_iters or 1)
+        progress = float(progress_value or current_iters or 0)
+        if task_type == "repeat":
+            kind = "ritual"
+            mode = "count"
+            target = float(required_iters or target or 1)
+            progress = float(current_iters or progress or 0)
+        if not branch_id:
+            branch_id = bid
+        try:
+            _conn.execute(
+                "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
+                "SET t.branch_id=$bid,t.quest_kind=$kind,t.progress_mode=$mode,t.target_value=$target,t.progress_value=$progress",
+                {"id": tid, "uid": user_id, "bid": branch_id, "kind": kind,
+                 "mode": mode, "target": target, "progress": progress})
+        except: pass
+    return bid
+
+def _record_quest_event(task_id: str, mission_id: str, user_id: str, event_type: str,
+                        value: float = 0.0, note: str = ""):
+    try:
+        _conn.execute(
+            "CREATE (:QuestEvent {id:$id,task_id:$tid,mission_id:$mid,event_type:$type,value:$value,note:$note,ts:$ts,user_id:$uid})",
+            {"id": str(uuid.uuid4()), "tid": task_id, "mid": mission_id,
+             "type": event_type, "value": float(value), "note": note,
+             "ts": _now_s(), "uid": user_id})
+    except Exception as e:
+        print(f"[quest_event] {e}")
+
+def _timer_effective_seconds(total: int, started_ts: str) -> int:
+    total = int(total or 0)
+    if not started_ts:
+        return total
+    try:
+        started = datetime.strptime(started_ts, "%Y-%m-%d %H:%M")
+        return max(total, total + int((datetime.now() - started).total_seconds()))
+    except:
+        return total
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def slug(name):
@@ -437,7 +538,18 @@ def export_data(u: dict = Depends(current_user)):
     tasks = kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.id,t.mission_id,t.title,t.status,t.ts,"
         "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
-        "t.last_reset_ts,t.streak,t.best_streak,t.entry_id",
+        "t.last_reset_ts,t.streak,t.best_streak,t.entry_id,t.completed_ts,"
+        "t.quest_kind,t.branch_id,t.parent_id,t.position,t.progress_mode,t.target_value,t.progress_value,"
+        "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes",
+        {"uid":uid}))
+    branches = kuzu_rows(_conn.execute(
+        "MATCH (b:QuestBranch) WHERE b.user_id=$uid RETURN b.id,b.mission_id,b.title,b.status,b.position,b.ts",
+        {"uid":uid}))
+    events = kuzu_rows(_conn.execute(
+        "MATCH (ev:QuestEvent) WHERE ev.user_id=$uid RETURN ev.id,ev.task_id,ev.mission_id,ev.event_type,ev.value,ev.note,ev.ts",
+        {"uid":uid}))
+    path_contexts = kuzu_rows(_conn.execute(
+        "MATCH (pc:PathEntityContext) WHERE pc.user_id=$uid RETURN pc.id,pc.mission_id,pc.entity_id,pc.note,pc.ai_note,pc.updated_ts",
         {"uid":uid}))
     finances = kuzu_rows(_conn.execute(
         "MATCH (f:Finance) WHERE f.user_id=$uid RETURN f.id,f.amount,f.direction,f.category,f.note,f.ts",
@@ -456,11 +568,23 @@ def export_data(u: dict = Depends(current_user)):
         "entries":  [{"id":r[0],"ts":r[1],"raw_text":r[2],"narrative":r[3],"archivist_note":r[4]} for r in entries],
         "entities": [{"id":r[0],"name":r[1],"type":r[2],"summary":r[3],"tags":r[4] or "[]"} for r in entities],
         "missions": [{"id":r[0],"title":r[1],"description":r[2],"status":r[3],"ts":r[4],"lore":r[5] or ""} for r in missions],
+        "branches": [{"id":r[0],"mission_id":r[1],"title":r[2],"status":r[3],"position":r[4] or 0,"ts":r[5]} for r in branches],
         "tasks":    [{"id":r[0],"mission_id":r[1],"title":r[2],"status":r[3],"ts":r[4],
                       "task_type":r[5] or "once","reset_hours":r[6] or 24,
                       "required_iters":r[7] or 1,"current_iters":r[8] or 0,
                       "last_reset_ts":r[9] or "","streak":r[10] or 0,"best_streak":r[11] or 0,
-                      "entry_id":r[12] or ""} for r in tasks],
+                      "entry_id":r[12] or "","completed_ts":r[13] or "",
+                      "quest_kind":r[14] or "task","branch_id":r[15] or "",
+                      "parent_id":r[16] or "","position":r[17] or 0,"progress_mode":r[18] or "check",
+                      "target_value":r[19] or 1,"progress_value":r[20] or 0,
+                      "timer_total_seconds":r[21] or 0,"timer_started_ts":r[22] or "",
+                      "unlock_rule":r[23] or "","unlock_payload":r[24] or "",
+                      "locked":r[25] or "false","notes":r[26] or ""} for r in tasks],
+        "events":   [{"id":r[0],"task_id":r[1],"mission_id":r[2],"event_type":r[3],
+                      "value":r[4] or 0,"note":r[5] or "","ts":r[6]} for r in events],
+        "path_entity_contexts": [{"id":r[0],"mission_id":r[1],"entity_id":r[2],
+                                  "note":r[3] or "","ai_note":r[4] or "",
+                                  "updated_ts":r[5] or ""} for r in path_contexts],
         "finances": [{"id":r[0],"amount":r[1],"direction":r[2],"category":r[3],"note":r[4],"ts":r[5]} for r in finances],
         "links":    [{"from":r[0],"label":r[1],"to":r[2],"entry_id":r[3] or ""} for r in links],
         "mentions": [{"entry_id":r[0],"entity_id":r[1]} for r in mentions],
@@ -491,7 +615,7 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     # Entities
     for e in d.get("entities",[]):
         try:
-            if not entity_exists(e["id"]):
+            if not entity_exists(e["id"], uid):
                 _conn.execute("CREATE (:Entity {id:$id,name:$n,type:$t,summary:$s,tags:$tg,user_id:$uid})",
                     {"id":e["id"],"n":e["name"],"t":e.get("type","concept"),
                      "s":e.get("summary",""),"tg":e.get("tags","[]"),"uid":uid})
@@ -514,21 +638,46 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
                          "s":m.get("status","active"),"ts":m.get("ts",""),"uid":uid})
                 imported["missions"]+=1
         except: pass
+    # Quest branches
+    for b in d.get("branches",[]):
+        try:
+            rows=kuzu_rows(_conn.execute("MATCH (x:QuestBranch) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                         {"id":b["id"],"uid":uid}))
+            if not rows:
+                _conn.execute(
+                    "CREATE (:QuestBranch {id:$id,mission_id:$mid,title:$title,status:$status,position:$pos,ts:$ts,user_id:$uid})",
+                    {"id":b["id"],"mid":b.get("mission_id",""),"title":b.get("title","Основная"),
+                     "status":b.get("status","active"),"pos":int(b.get("position",0)),
+                     "ts":b.get("ts",""),"uid":uid})
+        except: pass
     # Tasks
     for t in d.get("tasks",[]):
         try:
             rows=kuzu_rows(_conn.execute("MATCH (x:Task) WHERE x.id=$id RETURN x.id",{"id":t["id"]}))
             if not rows:
+                branch_id=t.get("branch_id","") or (_ensure_default_branch(t.get("mission_id",""), uid) if t.get("mission_id","") else "")
                 _conn.execute(
                     "CREATE (:Task {id:$id,mission_id:$mid,title:$ti,status:$s,ts:$ts,"
                     "task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:$ci,"
-                    "last_reset_ts:$lr,streak:$st,best_streak:$bs,entry_id:$eid,user_id:$uid})",
+                    "last_reset_ts:$lr,streak:$st,best_streak:$bs,entry_id:$eid,completed_ts:$cts,user_id:$uid,"
+                    "quest_kind:$kind,branch_id:$bid,parent_id:$parent,position:$pos,progress_mode:$pmode,"
+                    "target_value:$target,progress_value:$progress,timer_total_seconds:$timer,timer_started_ts:$timer_started,"
+                    "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes})",
                     {"id":t["id"],"mid":t.get("mission_id",""),"ti":t["title"],
                      "s":t.get("status","active"),"ts":t.get("ts",""),
                      "tt":t.get("task_type","once"),"rh":int(t.get("reset_hours",24)),
                      "ri":int(t.get("required_iters",1)),"ci":int(t.get("current_iters",0)),
                      "lr":t.get("last_reset_ts",""),"st":int(t.get("streak",0)),
-                     "bs":int(t.get("best_streak",0)),"eid":t.get("entry_id",""),"uid":uid})
+                     "bs":int(t.get("best_streak",0)),"eid":t.get("entry_id",""),
+                     "cts":t.get("completed_ts",""),"uid":uid,
+                     "kind":t.get("quest_kind","ritual" if t.get("task_type")=="repeat" else "task"),
+                     "bid":branch_id,"parent":t.get("parent_id",""),"pos":int(t.get("position",0)),
+                     "pmode":t.get("progress_mode","count" if t.get("task_type")=="repeat" else "check"),
+                     "target":float(t.get("target_value",t.get("required_iters",1) or 1)),
+                     "progress":float(t.get("progress_value",t.get("current_iters",0) or 0)),
+                     "timer":int(t.get("timer_total_seconds",0)),"timer_started":t.get("timer_started_ts",""),
+                     "unlock_rule":t.get("unlock_rule",""),"unlock_payload":t.get("unlock_payload",""),
+                     "locked":t.get("locked","false"),"notes":t.get("notes","")})
                 imported["tasks"]+=1
         except: pass
     # Finances
@@ -562,6 +711,30 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
                     "MATCH (e:Entry) WHERE e.id=$eid AND e.user_id=$uid "
                     "MATCH (n:Entity) WHERE n.id=$nid AND n.user_id=$uid "
                     "CREATE (e)-[:MENTIONS]->(n)",{"eid":mn["entry_id"],"nid":mn["entity_id"],"uid":uid})
+        except: pass
+    # Quest events
+    for ev in d.get("events",[]):
+        try:
+            rows=kuzu_rows(_conn.execute("MATCH (x:QuestEvent) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                         {"id":ev["id"],"uid":uid}))
+            if not rows:
+                _conn.execute(
+                    "CREATE (:QuestEvent {id:$id,task_id:$tid,mission_id:$mid,event_type:$type,value:$value,note:$note,ts:$ts,user_id:$uid})",
+                    {"id":ev["id"],"tid":ev.get("task_id",""),"mid":ev.get("mission_id",""),
+                     "type":ev.get("event_type","import"),"value":float(ev.get("value",0)),
+                     "note":ev.get("note",""),"ts":ev.get("ts",""),"uid":uid})
+        except: pass
+    # Path-specific entity contexts
+    for pc in d.get("path_entity_contexts",[]):
+        try:
+            rows=kuzu_rows(_conn.execute("MATCH (x:PathEntityContext) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                         {"id":pc["id"],"uid":uid}))
+            if not rows:
+                _conn.execute(
+                    "CREATE (:PathEntityContext {id:$id,mission_id:$mid,entity_id:$eid,note:$note,ai_note:$ai,updated_ts:$ts,user_id:$uid})",
+                    {"id":pc["id"],"mid":pc.get("mission_id",""),"eid":pc.get("entity_id",""),
+                     "note":pc.get("note",""),"ai":pc.get("ai_note",""),
+                     "ts":pc.get("updated_ts",""),"uid":uid})
         except: pass
     # Character
     if d.get("character"):
@@ -604,6 +777,17 @@ class MissionReq(BaseModel): title: str; description: str = ""
 class TaskReq(BaseModel):
     mission_id: str; title: str
     task_type: str = "once"; reset_hours: int = 24; required_iters: int = 1
+    quest_kind: str = "task"; progress_mode: str = "check"
+    branch_id: str = ""; parent_id: str = ""
+    target_value: float = 1; timer_total_seconds: int = 0
+    unlock_rule: str = ""; unlock_payload: str = ""; locked: bool = False
+    notes: str = ""
+class BranchReq(BaseModel):
+    title: str
+class PathEntityContextReq(BaseModel):
+    entity_name: str
+    note: str = ""
+    improve: bool = False
 class FinanceReq(BaseModel): amount: float; direction: str; category: str=""; note: str=""
 class ModeReq(BaseModel): name: str; description: str = ""
 
@@ -711,12 +895,20 @@ def _apply_analysis(eid: str, data: dict, user_id: str = "admin"):
         tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
         tt=q.get("task_type","once"); rh=int(q.get("reset_hours",24)); ri=int(q.get("required_iters",1))
         lr=ts if tt=="repeat" else ""
+        mid=q.get("mission_id","")
+        bid=_ensure_default_branch(mid, user_id) if mid else ""
+        qkind="ritual" if tt=="repeat" else "task"
+        pmode="count" if tt=="repeat" else "check"
         try:
             _conn.execute(
                 "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:$eid,"
-                "task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,completed_ts:'',user_id:$uid})",
-                {"id":tid,"mid":q.get("mission_id",""),"t":q["title"],"ts":ts,"eid":eid,
-                 "tt":tt,"rh":rh,"ri":ri,"lr":lr,"uid":user_id})
+                "task_type:$tt,reset_hours:$rh,required_iters:$ri,current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,completed_ts:'',"
+                "quest_kind:$kind,branch_id:$bid,parent_id:'',position:0,progress_mode:$pmode,target_value:$target,progress_value:0,"
+                "timer_total_seconds:0,timer_started_ts:'',unlock_rule:'',unlock_payload:'',locked:'false',notes:'',user_id:$uid})",
+                {"id":tid,"mid":mid,"t":q["title"],"ts":ts,"eid":eid,
+                 "tt":tt,"rh":rh,"ri":ri,"lr":lr,"kind":qkind,"bid":bid,
+                 "pmode":pmode,"target":float(ri),"uid":user_id})
+            _record_quest_event(tid, mid, user_id, "created", 0, "from_ai")
         except: pass
     for ma in data.get("mission_analysis",[]):
         lore = ma.get("lore","").strip()
@@ -759,10 +951,16 @@ def save(req: SaveReq, u: dict = Depends(current_user)):
     eid=write_entry(req.raw_text,data,uid)
     for q in req.quests:
         tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
+        mid=q.get("mission_id","")
+        bid=_ensure_default_branch(mid, uid) if mid else ""
         try:
             _conn.execute(
-                "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:$eid,user_id:$uid})",
-                {"id":tid,"mid":q.get("mission_id",""),"t":q["title"],"ts":ts,"eid":eid,"uid":uid})
+                "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:$eid,user_id:$uid,"
+                "task_type:'once',reset_hours:24,required_iters:1,current_iters:0,last_reset_ts:'',streak:0,best_streak:0,completed_ts:'',"
+                "quest_kind:'task',branch_id:$bid,parent_id:'',position:0,progress_mode:'check',target_value:1,progress_value:0,"
+                "timer_total_seconds:0,timer_started_ts:'',unlock_rule:'',unlock_payload:'',locked:'false',notes:''})",
+                {"id":tid,"mid":mid,"t":q["title"],"ts":ts,"eid":eid,"uid":uid,"bid":bid})
+            _record_quest_event(tid, mid, uid, "created", 0, "from_save")
         except: pass
     return {"entry_id":eid,"quests_created":len(req.quests)}
 
@@ -865,6 +1063,76 @@ def link_entity_to_mission(mid: str, req: LinkEntityReq, u: dict = Depends(curre
     except: pass
     return {"ok":True}
 
+@app.get("/missions/{mid}/entity-context")
+def get_path_entity_context(mid: str, entity_name: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    mrows=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.title,m.description",
+        {"id":mid,"uid":uid}))
+    if not mrows: raise HTTPException(404)
+    eid=_entity_id(entity_name, uid)
+    erows=kuzu_rows(_conn.execute(
+        "MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid RETURN e.name,e.type,e.summary",
+        {"id":eid,"uid":uid}))
+    if not erows: raise HTTPException(404, "entity not found")
+    cid=_path_entity_context_id(mid, eid, uid)
+    crows=kuzu_rows(_conn.execute(
+        "MATCH (pc:PathEntityContext) WHERE pc.id=$id AND pc.user_id=$uid RETURN pc.note,pc.ai_note,pc.updated_ts",
+        {"id":cid,"uid":uid}))
+    note,ai_note,updated=("", "", "")
+    if crows:
+        note,ai_note,updated=crows[0][0] or "", crows[0][1] or "", crows[0][2] or ""
+    return {"mission":{"id":mid,"title":mrows[0][0],"description":mrows[0][1] or ""},
+            "entity":{"id":eid,"name":erows[0][0],"type":erows[0][1],"summary":erows[0][2] or ""},
+            "note":note,"ai_note":ai_note,"updated_ts":updated}
+
+@app.post("/missions/{mid}/entity-context")
+def save_path_entity_context(mid: str, req: PathEntityContextReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    mrows=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.title,m.description",
+        {"id":mid,"uid":uid}))
+    if not mrows: raise HTTPException(404)
+    name=req.entity_name.strip()
+    if not name: raise HTTPException(400, "entity_name required")
+    eid=_entity_id(name, uid)
+    if not entity_exists(eid, uid):
+        _conn.execute("CREATE (:Entity {id:$id,name:$n,type:'concept',summary:'',tags:'[]',user_id:$uid})",
+                      {"id":eid,"n":name,"uid":uid})
+    erows=kuzu_rows(_conn.execute(
+        "MATCH (e:Entity) WHERE e.id=$id AND e.user_id=$uid RETURN e.name,e.type,e.summary",
+        {"id":eid,"uid":uid}))
+    entity_name,etype,summary=erows[0][0],erows[0][1],erows[0][2] or ""
+    cid=_path_entity_context_id(mid, eid, uid)
+    old=kuzu_rows(_conn.execute(
+        "MATCH (pc:PathEntityContext) WHERE pc.id=$id AND pc.user_id=$uid RETURN pc.ai_note",
+        {"id":cid,"uid":uid}))
+    ai_note=old[0][0] if old else ""
+    note=req.note.strip()
+    if req.improve and note and _has_any_ai():
+        prompt=f"""Ты — стратег Life RPG. Улучши заметку о сущности внутри конкретного Пути.
+Сделай её практичной: что публиковать/делать, зачем это нужно Пути, какие следующие действия.
+Пиши кратко, по-русски, без воды.
+
+Путь: {mrows[0][0]}
+Описание пути: {mrows[0][1] or ""}
+Сущность: {entity_name} ({etype})
+Сводка сущности: {summary}
+Заметка игрока: {note}
+"""
+        ai_note=_call_any_ai(prompt).strip()
+    ts=_now_s()
+    if old:
+        _conn.execute(
+            "MATCH (pc:PathEntityContext) WHERE pc.id=$id AND pc.user_id=$uid SET pc.note=$note,pc.ai_note=$ai,pc.updated_ts=$ts",
+            {"id":cid,"uid":uid,"note":note,"ai":ai_note or "","ts":ts})
+    else:
+        _conn.execute(
+            "CREATE (:PathEntityContext {id:$id,mission_id:$mid,entity_id:$eid,note:$note,ai_note:$ai,updated_ts:$ts,user_id:$uid})",
+            {"id":cid,"mid":mid,"eid":eid,"note":note,"ai":ai_note or "","ts":ts,"uid":uid})
+    return {"ok":True,"note":note,"ai_note":ai_note or "","updated_ts":ts,
+            "entity":{"id":eid,"name":entity_name,"type":etype,"summary":summary}}
+
 @app.get("/graph")
 def graph(u: dict = Depends(current_user)):
     uid = _uid(u)
@@ -896,18 +1164,33 @@ def get_missions(u: dict = Depends(current_user)):
     result=[]
     for r in rows:
         mid=r[0]
+        _ensure_mission_quest_engine(mid, uid)
+        branches_rows=kuzu_rows(_conn.execute(
+            "MATCH (b:QuestBranch) WHERE b.mission_id=$mid AND b.user_id=$uid "
+            "RETURN b.id,b.title,b.status,b.position,b.ts ORDER BY b.position,b.ts",
+            {"mid":mid,"uid":uid}))
+        branches=[{"id":b[0],"title":b[1],"status":b[2],"position":int(b[3] or 0),"ts":b[4]} for b in branches_rows]
         tasks=kuzu_rows(_conn.execute(
             "MATCH (t:Task) WHERE t.mission_id=$mid AND t.user_id=$uid "
             "RETURN t.id,t.title,t.status,t.ts,"
             "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
-            "t.last_reset_ts,t.streak,t.best_streak ORDER BY t.ts",
+            "t.last_reset_ts,t.streak,t.best_streak,t.completed_ts,"
+            "t.quest_kind,t.branch_id,t.parent_id,t.position,t.progress_mode,t.target_value,t.progress_value,"
+            "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes ORDER BY t.position,t.ts",
             {"mid":mid,"uid":uid}))
         task_list=[]
         for t in tasks:
             td={"id":t[0],"title":t[1],"status":t[2],"ts":t[3],
                 "task_type":t[4] or "once","reset_hours":int(t[5] or 24),
                 "required_iters":int(t[6] or 1),"current_iters":int(t[7] or 0),
-                "last_reset_ts":t[8] or "","streak":int(t[9] or 0),"best_streak":int(t[10] or 0)}
+                "last_reset_ts":t[8] or "","streak":int(t[9] or 0),"best_streak":int(t[10] or 0),
+                "completed_ts":t[11] or "","quest_kind":t[12] or ("ritual" if (t[4] or "")=="repeat" else "task"),
+                "branch_id":t[13] or _default_branch_id(mid),"parent_id":t[14] or "",
+                "position":int(t[15] or 0),"progress_mode":t[16] or ("count" if (t[4] or "")=="repeat" else "check"),
+                "target_value":float(t[17] or t[6] or 1),"progress_value":float(t[18] or t[7] or 0),
+                "timer_total_seconds":_timer_effective_seconds(int(t[19] or 0), t[20] or ""),
+                "timer_started_ts":t[20] or "","unlock_rule":t[21] or "",
+                "unlock_payload":t[22] or "","locked":(t[23] or "false")=="true","notes":t[24] or ""}
             td=_maybe_reset_task(td)
             task_list.append(td)
         # Linked entities
@@ -925,11 +1208,55 @@ def get_missions(u: dict = Depends(current_user)):
                 seen_ids.add(x[0])
                 entity_tags.append({"id":x[0],"name":x[1],"type":x[2],"summary":x[3] or ""})
         result.append({"id":mid,"title":r[1],"description":r[2],"status":r[3],"ts":r[4],
-                        "lore":r[5] or "","tasks":task_list,"entities":entity_tags})
+                        "lore":r[5] or "","branches":branches,"tasks":task_list,"entities":entity_tags})
     return result
 
 class MissionDescReq(BaseModel):
     description: str
+
+@app.post("/missions/{mid}/branches")
+def add_branch(mid: str, req: BranchReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    exists=kuzu_rows(_conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.id",
+                                   {"id":mid,"uid":uid}))
+    if not exists: raise HTTPException(404)
+    title=req.title.strip() or "Новая ветвь"
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (b:QuestBranch) WHERE b.mission_id=$mid AND b.user_id=$uid RETURN count(b)",
+        {"mid":mid,"uid":uid}))
+    pos=int(rows[0][0]) if rows else 0
+    bid=str(uuid.uuid4())
+    _conn.execute(
+        "CREATE (:QuestBranch {id:$id,mission_id:$mid,title:$title,status:'active',position:$pos,ts:$ts,user_id:$uid})",
+        {"id":bid,"mid":mid,"title":title,"pos":pos,"ts":_now_s(),"uid":uid})
+    return {"id":bid,"title":title,"status":"active","position":pos}
+
+@app.post("/branches/{bid}/update")
+def update_branch(bid: str, req: BranchReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    title=req.title.strip()
+    if title:
+        _conn.execute("MATCH (b:QuestBranch) WHERE b.id=$id AND b.user_id=$uid SET b.title=$title",
+                      {"id":bid,"uid":uid,"title":title})
+    return {"ok":True}
+
+@app.post("/branches/{bid}/delete")
+def delete_branch(bid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (b:QuestBranch) WHERE b.id=$id AND b.user_id=$uid RETURN b.mission_id,b.title",
+        {"id":bid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    mid,title=rows[0]
+    if bid == _default_branch_id(mid):
+        raise HTTPException(400, "Основную ветвь нельзя удалить")
+    default_bid=_ensure_default_branch(mid, uid)
+    _conn.execute(
+        "MATCH (t:Task) WHERE t.branch_id=$bid AND t.user_id=$uid SET t.branch_id=$default",
+        {"bid":bid,"uid":uid,"default":default_bid})
+    _conn.execute("MATCH (b:QuestBranch) WHERE b.id=$id AND b.user_id=$uid DELETE b",
+                  {"id":bid,"uid":uid})
+    return {"ok":True,"moved_to":default_bid,"deleted":title}
 
 @app.patch("/missions/{mid}/description")
 def update_mission_description(mid: str, req: MissionDescReq, u: dict = Depends(current_user)):
@@ -951,7 +1278,8 @@ def add_mission(req: MissionReq, u: dict = Depends(current_user)):
     _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:'active',ts:$ts,lore:'',user_id:$uid})",
                   {"id":mid,"t":req.title,"d":req.description,"ts":ts,"uid":uid})
     _sync_mission_entity(mid,req.title,req.description,"active",uid)
-    return {"id":mid,"title":req.title,"status":"active","tasks":[],"entities":[]}
+    bid=_ensure_default_branch(mid, uid)
+    return {"id":mid,"title":req.title,"status":"active","branches":[{"id":bid,"title":"Основная","status":"active","position":0,"ts":ts}],"tasks":[],"entities":[]}
 
 @app.post("/missions/{mid}/complete")
 def complete_mission(mid: str, u: dict = Depends(current_user)):
@@ -964,6 +1292,10 @@ def complete_mission(mid: str, u: dict = Depends(current_user)):
 @app.post("/missions/{mid}/delete")
 def delete_mission(mid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
+    try: _conn.execute("MATCH (ev:QuestEvent) WHERE ev.mission_id=$id AND ev.user_id=$uid DELETE ev",{"id":mid,"uid":uid})
+    except: pass
+    try: _conn.execute("MATCH (b:QuestBranch) WHERE b.mission_id=$id AND b.user_id=$uid DELETE b",{"id":mid,"uid":uid})
+    except: pass
     try: _conn.execute("MATCH (t:Task) WHERE t.mission_id=$id AND t.user_id=$uid DELETE t",{"id":mid,"uid":uid})
     except: pass
     try: _conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid DELETE m",{"id":mid,"uid":uid})
@@ -977,17 +1309,42 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
                                    {"id":req.mission_id,"uid":uid}))
     if not exists: raise HTTPException(404)
     tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
-    init_reset = ts if req.task_type == "repeat" else ""
+    branch_id=req.branch_id or _ensure_default_branch(req.mission_id, uid)
+    kind=req.quest_kind or ("ritual" if req.task_type == "repeat" else "task")
+    progress_mode=req.progress_mode or ("count" if req.task_type == "repeat" else "check")
+    task_type = "repeat" if kind == "ritual" or req.task_type == "repeat" else "once"
+    init_reset = ts if task_type == "repeat" else ""
+    target_value = float(req.target_value or req.required_iters or 1)
+    if task_type == "repeat":
+        target_value = float(req.required_iters or target_value or 1)
+    pos_rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.mission_id=$mid AND t.branch_id=$bid AND t.user_id=$uid RETURN count(t)",
+        {"mid":req.mission_id,"bid":branch_id,"uid":uid}))
+    position=int(pos_rows[0][0]) if pos_rows else 0
     _conn.execute(
         "CREATE (:Task {id:$id,mission_id:$mid,title:$t,status:'active',ts:$ts,entry_id:'',"
         "task_type:$tt,reset_hours:$rh,required_iters:$ri,"
-        "current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,user_id:$uid})",
+        "current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,completed_ts:'',"
+        "quest_kind:$kind,branch_id:$bid,parent_id:$parent,position:$position,progress_mode:$pmode,"
+        "target_value:$target,progress_value:0,timer_total_seconds:$timer,timer_started_ts:'',"
+        "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes,user_id:$uid})",
         {"id":tid,"mid":req.mission_id,"t":req.title,"ts":ts,
-         "tt":req.task_type,"rh":req.reset_hours,"ri":req.required_iters,"lr":init_reset,"uid":uid})
-    return {"id":tid,"title":req.title,"status":"active","task_type":req.task_type}
+         "tt":task_type,"rh":req.reset_hours,"ri":req.required_iters,"lr":init_reset,
+         "kind":kind,"bid":branch_id,"parent":req.parent_id,"position":position,
+         "pmode":progress_mode,"target":target_value,"timer":int(req.timer_total_seconds or 0),
+         "unlock_rule":req.unlock_rule,"unlock_payload":req.unlock_payload,
+         "locked":"true" if req.locked else "false","notes":req.notes,"uid":uid})
+    _record_quest_event(tid, req.mission_id, uid, "created", 0, kind)
+    return {"id":tid,"title":req.title,"status":"active","task_type":task_type,"quest_kind":kind,"branch_id":branch_id}
 
 class TaskParamsReq(BaseModel):
     task_type: str = "once"; reset_hours: int = 24; required_iters: int = 1
+class TaskProgressReq(BaseModel):
+    delta: float = 0
+    value: float | None = None
+    note: str = ""
+class TaskNoteReq(BaseModel):
+    note: str = ""
 
 @app.post("/tasks/{tid}/set-params")
 def set_task_params(tid: str, req: TaskParamsReq, u: dict = Depends(current_user)):
@@ -1002,28 +1359,102 @@ def tick_task(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
-        "RETURN t.current_iters,t.required_iters,t.last_reset_ts",{"id":tid,"uid":uid}))
+        "RETURN t.current_iters,t.required_iters,t.last_reset_ts,t.mission_id,t.progress_value",{"id":tid,"uid":uid}))
     if not rows: return {"error":"not found"}
-    cur=int(rows[0][0] or 0); req=int(rows[0][1] or 1); lr=rows[0][2] or ""
+    cur=int(rows[0][0] or 0); req=int(rows[0][1] or 1); lr=rows[0][2] or ""; mid=rows[0][3] or ""
     new_cur=min(cur+1,req)
+    new_progress=float((rows[0][4] or 0) + 1)
     now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
     if not lr: lr=now_s
     cts=now_s if new_cur>=req else ""
-    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.current_iters=$c,t.last_reset_ts=$lr,t.completed_ts=$cts",
-                  {"id":tid,"uid":uid,"c":new_cur,"lr":lr,"cts":cts})
+    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.current_iters=$c,t.progress_value=$p,t.last_reset_ts=$lr,t.completed_ts=$cts",
+                  {"id":tid,"uid":uid,"c":new_cur,"p":new_progress,"lr":lr,"cts":cts})
+    _record_quest_event(tid, mid, uid, "tick", 1)
     return {"current":new_cur,"required":req,"completed":new_cur>=req}
+
+@app.post("/tasks/{tid}/progress")
+def update_task_progress(tid: str, req: TaskProgressReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
+        "RETURN t.mission_id,t.progress_value,t.target_value,t.required_iters,t.progress_mode",
+        {"id":tid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    mid,current,target,required,mode=rows[0]
+    new_value=float(req.value if req.value is not None else (current or 0) + req.delta)
+    target=float(target or required or 1)
+    completed = bool(target and new_value >= target and mode != "timer")
+    now_s=_now_s() if completed else ""
+    _conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.progress_value=$v,t.completed_ts=$cts",
+        {"id":tid,"uid":uid,"v":new_value,"cts":now_s})
+    if completed:
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done'",
+                      {"id":tid,"uid":uid})
+    _record_quest_event(tid, mid or "", uid, "progress", float(req.delta or 0), req.note)
+    return {"ok":True,"progress_value":new_value,"completed":completed}
+
+@app.post("/tasks/{tid}/timer/start")
+def start_task_timer(tid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.timer_started_ts",
+        {"id":tid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    if not rows[0][1]:
+        _conn.execute(
+            "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_started_ts=$ts,t.quest_kind='timer',t.progress_mode='timer'",
+            {"id":tid,"uid":uid,"ts":_now_s()})
+        _record_quest_event(tid, rows[0][0] or "", uid, "timer_started", 0)
+    return {"ok":True}
+
+@app.post("/tasks/{tid}/timer/stop")
+def stop_task_timer(tid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.timer_total_seconds,t.timer_started_ts",
+        {"id":tid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    mid,total,started=rows[0]
+    new_total=_timer_effective_seconds(int(total or 0), started or "")
+    _conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_total_seconds=$total,t.timer_started_ts='',t.progress_value=$hours",
+        {"id":tid,"uid":uid,"total":new_total,"hours":round(new_total/3600, 3)})
+    _record_quest_event(tid, mid or "", uid, "timer_stopped", float(new_total - int(total or 0)))
+    return {"ok":True,"timer_total_seconds":new_total}
+
+@app.post("/tasks/{tid}/note")
+def save_task_note(tid: str, req: TaskNoteReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.notes",
+        {"id":tid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    mid,old=rows[0]
+    note=req.note.strip()
+    combined=((old or "") + ("\n" if old and note else "") + note).strip()
+    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.notes=$notes",
+                  {"id":tid,"uid":uid,"notes":combined})
+    if note:
+        _record_quest_event(tid, mid or "", uid, "note", 0, note)
+    return {"ok":True,"notes":combined}
 
 @app.post("/tasks/{tid}/complete")
 def complete_task(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
     now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows=kuzu_rows(_conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id",
+                                 {"id":tid,"uid":uid}))
     _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done',t.completed_ts=$ts",
                   {"id":tid,"uid":uid,"ts":now_s})
+    _record_quest_event(tid, rows[0][0] if rows else "", uid, "completed", 1)
     return {"ok":True}
 
 @app.post("/tasks/{tid}/delete")
 def delete_task(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
+    try: _conn.execute("MATCH (ev:QuestEvent) WHERE ev.task_id=$id AND ev.user_id=$uid DELETE ev",{"id":tid,"uid":uid})
+    except: pass
     try: _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid DELETE t",{"id":tid,"uid":uid})
     except: pass
     return {"deleted":tid}
@@ -1800,15 +2231,14 @@ section.active{display:block}
 
 /* ── MISSIONS ── */
 #s-missions{padding:0}
-.missions-wrap{max-width:780px;margin:0 auto;padding:40px 40px 80px}
-.missions-topbar{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:8px}
+.missions-wrap{max-width:920px;margin:0 auto;padding:40px 40px 80px}
+.missions-topbar{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:28px}
 .missions-eyebrow{font-size:10px;letter-spacing:4px;text-transform:uppercase;
   color:var(--red);font-family:sans-serif}
 .missions-heading{font-size:22px;color:var(--ink);margin-bottom:4px}
-.missions-sub{font-size:12px;color:var(--ink3);font-family:sans-serif;margin-bottom:36px}
 .mission-lore{font-size:12px;color:var(--ink3);font-style:italic;margin-top:3px;line-height:1.5;
   font-family:'Georgia',serif;opacity:.85}
-.mission-block{margin-bottom:36px;padding-bottom:32px;border-bottom:1px solid var(--border2)}
+.mission-block{margin-bottom:36px;padding-bottom:32px;border-bottom:1px solid var(--border2);position:relative}
 .mission-block:last-child{border-bottom:none;padding-bottom:0}
 .mission-block-hdr{display:flex;align-items:flex-start;gap:10px;cursor:pointer;
   padding:2px 0;user-select:none}
@@ -1822,11 +2252,40 @@ section.active{display:block}
 .mission-block-chevron{font-size:11px;color:var(--border);margin-top:6px;flex-shrink:0;
   transition:transform .2s}
 .mission-block-chevron.open{transform:rotate(180deg)}
+.mission-more{position:relative;flex-shrink:0;margin-top:-3px}
+.mission-menu-btn{width:28px;height:28px;border:1px solid transparent;background:none;
+  color:var(--ink3);font-family:sans-serif;font-size:18px;line-height:1;border-radius:4px;
+  cursor:pointer;display:flex;align-items:center;justify-content:center}
+.mission-menu-btn:hover{border-color:var(--border2);color:var(--ink)}
+.mission-menu{display:none;position:absolute;right:0;top:31px;z-index:30;background:var(--paper);
+  border:1px solid var(--border);border-radius:4px;box-shadow:0 8px 24px rgba(44,35,24,.18);
+  min-width:150px;padding:5px}
+.mission-menu.open{display:block}
+.mission-menu button{width:100%;background:none;border:none;text-align:left;padding:7px 9px;
+  font-family:sans-serif;font-size:12px;color:var(--ink2);border-radius:3px;cursor:pointer}
+.mission-menu button:hover{background:rgba(139,105,20,.08);color:var(--ink)}
+.mission-menu button.danger{color:var(--red)}
 .mission-desc-text{font-size:13px;color:var(--ink3);font-family:sans-serif;
   line-height:1.65;margin:10px 0 0 30px}
-.quest-chain{margin:16px 0 0 28px;padding-left:16px;
+.quest-chain{margin:18px 0 0 28px;padding-left:16px;
   border-left:1.5px solid var(--border2);display:none}
 .quest-chain.open{display:block}
+.quest-branch{margin-bottom:18px}
+.quest-branch:last-child{margin-bottom:0}
+.quest-branch-head{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:0 0 8px;border-bottom:1px solid rgba(200,184,154,.55)}
+.quest-branch-title{font-size:11px;letter-spacing:2px;text-transform:uppercase;
+  color:var(--ink3);font-family:sans-serif;font-weight:700}
+.quest-branch-count{font-size:10px;color:var(--border);font-family:sans-serif;margin-left:8px}
+.quest-branch-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.quest-branch-btn{background:none;border:1px dashed var(--border2);color:var(--ink3);
+  font-family:sans-serif;font-size:11px;padding:3px 10px;border-radius:3px;cursor:pointer}
+.quest-branch-btn:hover{border-color:var(--gold);color:var(--gold)}
+.quest-branch-body{padding-top:7px}
+.quest-empty{font-size:12px;color:var(--ink3);font-family:sans-serif;font-style:italic;
+  padding:10px 0}
+.quest-node{position:relative}
+.quest-children{margin-left:22px;padding-left:12px;border-left:1px solid rgba(200,184,154,.6)}
 .quest-item{display:flex;align-items:flex-start;gap:10px;padding:9px 0;
   border-bottom:.5px solid rgba(200,164,122,.25)}
 .quest-item:last-child{border-bottom:none}
@@ -1839,6 +2298,24 @@ section.active{display:block}
 .quest-title{font-size:14px;color:var(--ink);line-height:1.45}
 .quest-title.done{text-decoration:line-through;color:var(--ink3)}
 .quest-ts{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-top:2px}
+.quest-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:2px}
+.quest-kind{font-size:9px;font-family:sans-serif;padding:1px 7px;border-radius:8px;letter-spacing:.7px;
+  border:1px solid rgba(139,105,20,.25);background:rgba(139,105,20,.08);color:var(--gold)}
+.quest-kind.timer{border-color:rgba(26,74,107,.25);background:rgba(26,74,107,.08);color:var(--blue)}
+.quest-kind.counter{border-color:rgba(45,92,20,.25);background:rgba(45,92,20,.08);color:var(--green)}
+.quest-note-preview{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-top:4px;
+  line-height:1.45;white-space:pre-wrap}
+.quest-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px}
+.quest-tool{background:none;border:1px solid var(--border2);color:var(--ink3);
+  font-family:sans-serif;font-size:10px;padding:2px 8px;border-radius:3px;cursor:pointer}
+.quest-tool:hover{border-color:var(--gold);color:var(--gold)}
+.quest-tool.primary{background:var(--gold);border-color:var(--gold);color:#fff}
+.quest-tool.primary:hover{background:#a07820;color:#fff}
+.quest-tool.running{background:var(--red);border-color:var(--red);color:#fff}
+.quest-progress-line{display:flex;align-items:center;gap:8px;margin-top:5px;
+  font-size:12px;font-family:sans-serif;color:var(--ink2);flex-wrap:wrap}
+.quest-progress-count{font-weight:700;color:var(--ink)}
+.quest-progress-count.done{color:var(--green)}
 .quest-del{background:none;border:none;color:var(--border2);cursor:pointer;
   font-size:14px;flex-shrink:0;padding:2px;transition:color .12s}
 .quest-del:hover{color:var(--red)}
@@ -1942,6 +2419,14 @@ section.active{display:block}
   font-family:sans-serif;font-size:11px;padding:4px 12px;border-radius:3px;cursor:pointer;
   margin-top:16px}
 .ent-del:hover{background:var(--red);color:#fff}
+.pathctx-textarea{width:100%;box-sizing:border-box;background:var(--paper2);
+  border:1px solid var(--border);color:var(--ink);font-family:'Georgia',serif;
+  font-size:13px;padding:10px 12px;border-radius:3px;outline:none;resize:vertical;
+  min-height:96px;margin:8px 0 10px}
+.pathctx-textarea:focus{border-color:var(--gold)}
+.pathctx-ai{font-size:12px;color:var(--ink2);line-height:1.65;background:rgba(139,105,20,.06);
+  border-left:2px solid rgba(139,105,20,.35);padding:10px 12px;margin-top:8px;
+  white-space:pre-wrap}
 
 /* ── REPEAT TASKS ── */
 .quest-item.repeat-task{background:rgba(139,105,20,.04);border-left:2px solid rgba(139,105,20,.28);padding-left:10px}
@@ -1975,6 +2460,11 @@ section.active{display:block}
 .dlg-box{background:var(--paper);border:2px solid var(--border);border-radius:4px;
   padding:26px;width:440px;box-shadow:0 8px 28px rgba(0,0,0,.2)}
 .dlg-title{font-size:18px;color:var(--ink);margin-bottom:16px}
+.dlg-label{font-size:10px;letter-spacing:2px;text-transform:uppercase;
+  color:var(--ink3);font-family:sans-serif;margin:2px 0 7px}
+.dlg-hint{font-size:12px;color:var(--ink3);font-family:sans-serif;line-height:1.5}
+.quest-kind-picker{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;
+  font-family:sans-serif;font-size:13px;color:var(--ink2)}
 .dlg-input{width:100%;background:var(--paper2);border:1px solid var(--border);color:var(--ink);
   font-family:'Georgia',serif;font-size:14px;padding:10px 12px;border-radius:3px;
   outline:none;margin-bottom:10px}
@@ -2538,7 +3028,6 @@ section.active{display:block}
         </div>
         <button class="btn-add" onclick="openDlg('mission-dlg')">+ Новый путь</button>
       </div>
-      <div class="missions-sub">Пути, по которым идёт Герой. Задания рождаются из записей.</div>
       <div id="missions-list"></div>
     </div>
   </section>
@@ -2751,14 +3240,21 @@ section.active{display:block}
 
 <div class="dlg" id="task-dlg">
   <div class="dlg-box">
-    <div class="dlg-title">Добавить задание</div>
+    <div class="dlg-title" id="task-dlg-title">Добавить квест</div>
     <input class="dlg-input" id="t-title" placeholder="Название задания">
-    <div style="display:flex;gap:16px;margin-bottom:12px;font-family:sans-serif;font-size:13px;color:var(--ink2)">
+    <div class="dlg-label">Тип квеста</div>
+    <div class="quest-kind-picker">
       <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
-        <input type="radio" name="t-type" value="once" checked onchange="toggleRepeatOpts(this)"> Разовое
+        <input type="radio" name="t-kind" value="task" checked onchange="toggleTaskKindOpts()"> Квест
       </label>
       <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
-        <input type="radio" name="t-type" value="repeat" onchange="toggleRepeatOpts(this)"> Повторяемое
+        <input type="radio" name="t-kind" value="ritual" onchange="toggleTaskKindOpts()"> Ритуал
+      </label>
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="radio" name="t-kind" value="timer" onchange="toggleTaskKindOpts()"> Таймер
+      </label>
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="radio" name="t-kind" value="counter" onchange="toggleTaskKindOpts()"> Счётчик
       </label>
     </div>
     <div id="t-repeat-opts" style="display:none;gap:8px;margin-bottom:10px;flex-wrap:wrap">
@@ -2773,7 +3269,15 @@ section.active{display:block}
         <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">ч до сброса</span>
       </div>
     </div>
+    <div id="t-counter-opts" style="display:none;margin-bottom:10px">
+      <input class="dlg-input" id="t-target" type="number" min="1" value="1" placeholder="Цель по счётчику">
+    </div>
+    <div id="t-timer-opts" class="dlg-hint" style="display:none;margin-bottom:10px">
+      Таймер будет копить общее время. Его можно запускать и останавливать прямо в ветви.
+    </div>
     <input type="hidden" id="t-mid">
+    <input type="hidden" id="t-branch">
+    <input type="hidden" id="t-parent">
     <div class="dlg-btns">
       <button class="btn-cancel" onclick="closeDlg('task-dlg')">Отмена</button>
       <button class="btn-primary" onclick="saveTask()">Добавить</button>
@@ -3483,113 +3987,163 @@ function toggleMission(mid){
     _openMissions.add(mid); _closedMissions.delete(mid);
   }
 }
+function closeMissionMenus(){
+  document.querySelectorAll('.mission-menu.open').forEach(m=>m.classList.remove('open'));
+}
+function toggleMissionMenu(mid,event){
+  event?.stopPropagation();
+  const menu=document.getElementById('mmenu-'+mid);
+  if(!menu) return;
+  const open=menu.classList.contains('open');
+  closeMissionMenus();
+  if(!open) menu.classList.add('open');
+}
+document.addEventListener('click',closeMissionMenus);
 
 async function loadMissions(){
   const [r,cd]=await Promise.all([fetch('/missions'),fetch('/character/data')]);
   const ms=await r.json(); const charData=await cd.json();
-  const epilogues=charData.mission_epilogues||{};
   const el=document.getElementById('missions-list');
   if(!ms.length){
     el.innerHTML='<div class="empty">Нет путей. Добавь первый путь ↗</div>';
     return;
   }
   ms.forEach(m=>{ if(!_closedMissions.has(m.id)) _openMissions.add(m.id); });
-  el.innerHTML=ms.map(m=>{
-    const onceDone=m.tasks.filter(t=>t.task_type!=='repeat'&&t.status==='done').length;
-    const onceTotal=m.tasks.filter(t=>t.task_type!=='repeat').length;
-    const repeatTotal=m.tasks.filter(t=>t.task_type==='repeat').length;
-    const totalCount=m.tasks.length;
-    const wasOpen=_openMissions.has(m.id);
+  const htmlEsc=v=>String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const jsArg=v=>String(v??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r?\n/g,'\\n');
+  const defaultBranchId=m=>`${m.id}:main`;
+  const questKind=t=>t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
+  const kindTitle=k=>({task:'квест',ritual:'ритуал',timer:'таймер',counter:'счётчик'}[k]||'квест');
+  const kindClass=k=>k==='timer'?'timer':k==='counter'?'counter':'';
+  const taskProgress=t=>{
+    const cur=Number(t.progress_value||t.current_iters||0);
+    const target=Number(t.target_value||t.required_iters||1);
+    const shown=Number.isInteger(cur)?cur:cur.toFixed(1);
+    const shownTarget=Number.isInteger(target)?target:target.toFixed(1);
+    return {cur,target,shown,shownTarget,done:target>0&&cur>=target};
+  };
+  const taskTree=tasks=>{
+    const ids=new Set(tasks.map(t=>t.id));
+    const map={};
+    tasks.forEach(t=>{
+      const p=(t.parent_id&&ids.has(t.parent_id))?t.parent_id:'';
+      if(!map[p]) map[p]=[];
+      map[p].push(t);
+    });
+    return map;
+  };
+  const renderTask=(t,m,tree)=>{
+    const kind=questKind(t);
+    const isDone=t.status==='done';
+    const notes=(t.notes||'').trim();
+    const branchId=t.branch_id||defaultBranchId(m);
+    const childHtml=(tree[t.id]||[]).map(ch=>renderTask(ch,m,tree)).join('');
+    const badge=`<span class="quest-kind ${kindClass(kind)}">${kindTitle(kind)}</span>`;
+    const title=`<div class="quest-title ${isDone?'done':''}" id="qtitle-${t.id}">${htmlEsc(t.title)}</div>`;
+    const noteHtml=notes?`<div class="quest-note-preview">${htmlEsc(notes.split('\n').slice(-1)[0])}</div>`:'';
+    const addChild=`<button class="quest-tool" onclick="openTaskDlg('${jsArg(m.id)}','${jsArg(branchId)}','${jsArg(t.id)}');event.stopPropagation()">+ шаг</button>`;
+    const noteBtn=`<button class="quest-tool" onclick="addTaskNote('${jsArg(t.id)}','${jsArg(m.id)}');event.stopPropagation()">заметка</button>`;
+    const editBtn=`<button class="btn-edit-inline" onclick="editTask('${jsArg(t.id)}');event.stopPropagation()" title="Переименовать">✎</button>`;
+    const delBtn=`<button class="quest-del" onclick="deleteTask('${jsArg(t.id)}','${jsArg(m.id)}')" title="Удалить">×</button>`;
+    let lead='';
+    let controls=`<div class="quest-tools">${addChild}${noteBtn}</div>`;
 
-    const epilogueHtml=epilogues[m.id]?`<div class="mission-epilogue">
-      <div class="mission-epilogue-label">✦ Эпилог</div>
-      ${epilogues[m.id]}
-    </div>`:'';
-    let archivistHtml='';
-    if(m.status!=='done'){
-      if(totalCount===0){
-        archivistHtml=`<div class="archivist-warning">⚠ Путь во мгле. Архивариус не видит ни одного задания. Поведай о своих намерениях — и путь прояснится.</div>`;
-      } else if(onceDone===onceTotal&&onceTotal>0&&repeatTotal===0){
-        archivistHtml=`<div class="archivist-wisdom">✦ Все разовые задания пройдены. Архивариус полагает: цель близко. Скажи слово — и мир запишет победу.</div>`;
-      }
+    if(kind==='ritual'){
+      const cycled=t.current_iters>=t.required_iters;
+      controls=`<div class="quest-progress-line">
+        <button class="iter-btn" onclick="tickTask('${jsArg(t.id)}','${jsArg(m.id)}')" ${cycled?'disabled':''}>+1</button>
+        <span class="quest-progress-count ${cycled?'done':''}">${t.current_iters||0}/${t.required_iters||1}</span>
+        <span class="streak-display">${streakMythName(t.streak)}</span>
+        <span class="streak-best">рекорд: ${t.best_streak||0}</span>
+        <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
+      </div><div class="quest-tools">${addChild}${noteBtn}</div>`;
+    } else if(kind==='timer'){
+      const running=!!t.timer_started_ts;
+      controls=`<div class="quest-progress-line">
+        <button class="quest-tool ${running?'running':'primary'}" onclick="${running?`stopTimer('${jsArg(t.id)}','${jsArg(m.id)}')`:`startTimer('${jsArg(t.id)}','${jsArg(m.id)}')`};event.stopPropagation()">${running?'стоп':'старт'}</button>
+        <span>всего ${fmtDuration(t.timer_total_seconds||0)}</span>
+      </div><div class="quest-tools">${addChild}${noteBtn}</div>`;
+    } else if(kind==='counter'){
+      const p=taskProgress(t);
+      controls=`<div class="quest-progress-line">
+        <button class="quest-tool primary" onclick="progressTask('${jsArg(t.id)}','${jsArg(m.id)}',1);event.stopPropagation()">+1</button>
+        <span class="quest-progress-count ${p.done?'done':''}">${p.shown}/${p.shownTarget}</span>
+      </div><div class="quest-tools">${addChild}${noteBtn}</div>`;
+    } else {
+      lead=`<div class="quest-cb ${isDone?'done':''}" onclick="doneTask('${jsArg(t.id)}','${jsArg(m.id)}')">${isDone?'✓':''}</div>`;
     }
 
-    const tasks=m.tasks.map(t=>{
-      const isRepeat=t.task_type==='repeat';
-      const cycled=isRepeat&&t.current_iters>=t.required_iters;
-      if(isRepeat){
-        const hrs=t.reset_hours===24?'24ч (ежедн.)':t.reset_hours===1?'1ч':t.reset_hours+'ч';
-        return `
-        <div class="quest-item repeat-task">
-          <div class="quest-info" style="flex:1">
-            <div style="display:flex;align-items:center;gap:7px">
-              <span class="repeat-badge">🔄 повтор</span>
-              <div class="quest-title" id="qtitle-${t.id}">${t.title}</div>
-              <button class="btn-edit-inline" onclick="editTask('${t.id}');event.stopPropagation()" title="Редактировать">✎</button>
-            </div>
-            <div class="repeat-progress">
-              <button class="iter-btn" onclick="tickTask('${t.id}','${m.id}')" ${cycled?'disabled':''}>+1</button>
-              <span class="iter-count ${cycled?'done':''}">${t.current_iters}/${t.required_iters}</span>
-              <span class="streak-display">${streakMythName(t.streak)}</span>
-              <span class="streak-best">рекорд: ${t.best_streak}</span>
-              <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
-            </div>
-          </div>
-          <button class="quest-del" onclick="deleteTask('${t.id}','${m.id}')" title="Удалить">×</button>
-        </div>`;
-      }
-      const isDone=t.status==='done';
-      return `
-      <div class="quest-item">
-        <div class="quest-cb ${isDone?'done':''}" onclick="doneTask('${t.id}','${m.id}')">${isDone?'✓':''}</div>
+    return `<div class="quest-node">
+      <div class="quest-item ${kind==='ritual'?'repeat-task':''}">
+        ${lead}
         <div class="quest-info">
-          <div class="quest-title ${isDone?'done':''}" id="qtitle-${t.id}">${t.title}</div>
-          <div class="quest-ts">${t.ts||''}</div>
+          <div class="quest-meta">${badge}${t.locked?'<span class="quest-kind">закрыто</span>':''}</div>
+          ${title}
+          ${noteHtml}
+          ${controls}
         </div>
-        <button class="btn-edit-inline" onclick="editTask('${t.id}');event.stopPropagation()" title="Редактировать">✎</button>
-        <button class="quest-del" onclick="deleteTask('${t.id}','${m.id}')" title="Удалить">×</button>
+        ${editBtn}
+        ${delBtn}
+      </div>
+      ${childHtml?`<div class="quest-children">${childHtml}</div>`:''}
+    </div>`;
+  };
+  const branchMenu=(m,b,isDefault)=>`<div class="quest-branch-actions">
+    <button class="quest-branch-btn" onclick="openTaskDlg('${jsArg(m.id)}','${jsArg(b.id)}','')">+ квест</button>
+    <button class="quest-branch-btn" onclick="renameBranch('${jsArg(b.id)}','${jsArg(b.title)}','${jsArg(m.id)}')" title="Переименовать">✎</button>
+    ${isDefault?'':`<button class="quest-branch-btn" onclick="deleteBranch('${jsArg(b.id)}','${jsArg(m.id)}')" title="Удалить ветвь">×</button>`}
+  </div>`;
+  el.innerHTML=ms.map(m=>{
+    const branches=(m.branches&&m.branches.length)?m.branches:[{id:defaultBranchId(m),title:'Основная',status:'active',position:0}];
+    const defaultBid=defaultBranchId(m);
+    const doneCount=m.tasks.filter(t=>t.status==='done').length;
+    const ritualCount=m.tasks.filter(t=>questKind(t)==='ritual').length;
+    const timerCount=m.tasks.filter(t=>questKind(t)==='timer').length;
+    const wasOpen=_openMissions.has(m.id);
+    const badge=[`${branches.length} ветв.`,`${m.tasks.length} квестов`,doneCount?`${doneCount} выполн.`:'',ritualCount?`${ritualCount} ритуал.`:'',timerCount?`${timerCount} таймер.`:''].filter(Boolean).join(' · ');
+    const entTags=(m.entities||[]).map(e=>`<span class="mission-ent-tag" onclick="openPathEntity('${jsArg(m.id)}','${jsArg(e.name||'')}');event.stopPropagation()" title="${htmlEsc(e.summary||'')}">${htmlEsc(e.name)}</span>`).join('');
+    const branchHtml=branches.map(b=>{
+      const branchTasks=m.tasks.filter(t=>(t.branch_id||defaultBid)===b.id);
+      const tree=taskTree(branchTasks);
+      const body=(tree['']||[]).map(t=>renderTask(t,m,tree)).join('')||`<div class="quest-empty">Пустая ветвь.</div>`;
+      const isDefault=b.id===defaultBid;
+      return `<div class="quest-branch">
+        <div class="quest-branch-head">
+          <div>
+            <span class="quest-branch-title">${htmlEsc(b.title||'Ветвь')}</span>
+            <span class="quest-branch-count">${branchTasks.length}</span>
+          </div>
+          ${branchMenu(m,b,isDefault)}
+        </div>
+        <div class="quest-branch-body">${body}</div>
       </div>`;
     }).join('');
-
-    const badgeText=onceTotal?`${onceDone}/${onceTotal} разовых`:'';
-    const repeatBadge=repeatTotal?`${repeatTotal} повтор.`:'';
-    const badge=[badgeText,repeatBadge].filter(Boolean).join(' · ');
-
-    const entTags=(m.entities||[]).map(e=>`<span class="mission-ent-tag" onclick="openEnt('${(e.name||'').replace(/'/g,"\\'")}');event.stopPropagation()" title="${e.summary||''}">${e.name}</span>`).join('');
-    const descHtml=m.description?`<div class="mission-desc-view" id="mdesc-view-${m.id}" onclick="editMissionDesc('${m.id}')" title="Нажми чтобы изменить описание">${m.description}</div>`
-      :`<div class="mission-desc-view mission-desc-empty" id="mdesc-view-${m.id}" onclick="editMissionDesc('${m.id}')" title="Добавить описание">+ добавить описание пути...</div>`;
 
     return `
     <div class="mission-block ${m.status==='done'?'done':''}">
       <div class="mission-block-hdr" onclick="toggleMission('${m.id}')">
         <div class="mission-star">${m.status==='done'?'✓':'✦'}</div>
         <div class="mission-block-info">
-          <div class="mission-block-title" id="mtitle-${m.id}">${m.title}</div>
+          <div class="mission-block-title" id="mtitle-${m.id}">${htmlEsc(m.title)}</div>
           ${badge?`<div class="mission-progress-badge">${badge}</div>`:''}
         </div>
         <button class="btn-edit-inline" onclick="editMission('${m.id}');event.stopPropagation()" title="Переименовать">✎</button>
+        <div class="mission-more" onclick="event.stopPropagation()">
+          <button class="mission-menu-btn" onclick="toggleMissionMenu('${m.id}',event)" title="Настройки пути">⋯</button>
+          <div class="mission-menu" id="mmenu-${m.id}">
+            <button onclick="editMission('${m.id}');closeMissionMenus()">Переименовать</button>
+            <button class="danger" onclick="deleteMission('${m.id}');closeMissionMenus()">Удалить путь</button>
+          </div>
+        </div>
         <div class="mission-block-chevron ${wasOpen?'open':''}" id="chev-${m.id}">▾</div>
       </div>
       ${entTags?`<div class="mission-entities">${entTags}</div>`:''}
-      ${descHtml}
-      <div class="mission-desc-edit" id="mdesc-edit-${m.id}" style="display:none">
-        <textarea id="mdesc-ta-${m.id}" rows="3" placeholder="Описание пути — что это значит для Героя, зачем он идёт...">${m.description||''}</textarea>
-        <div style="display:flex;gap:6px;margin-top:5px">
-          <button class="btn-sm btn-ok" onclick="saveMissionDesc('${m.id}')">Сохранить</button>
-          <button class="btn-sm" onclick="cancelMissionDesc('${m.id}')">Отмена</button>
-        </div>
-      </div>
-      ${m.lore?`<div class="mission-lore">${m.lore}</div>`:''}
       <div class="quest-chain ${wasOpen?'open':''}" id="qchain-${m.id}">
-        ${archivistHtml}
-        ${tasks}
+        ${branchHtml}
       </div>
-      ${epilogueHtml}
       <div class="mission-actions">
-        ${m.status!=='done'?`<button class="btn-quest-add" onclick="openTaskDlg('${m.id}')">+ добавить задание</button>`:''}
+        ${m.status!=='done'?`<button class="btn-quest-add" onclick="addBranch('${m.id}')">+ ветвь</button>`:''}
         <button class="btn-link-entity" onclick="openEntityDlg('${m.id}')" title="Привязать сущность к Пути">+ сущность</button>
-        ${m.status!=='done'?`<button class="btn-sm btn-ok" onclick="doneMission('${m.id}')">✓ Путь пройден</button>`:''}
-        <button class="btn-sm btn-danger" onclick="deleteMission('${m.id}')">× удалить</button>
       </div>
     </div>`;
   }).join('');
@@ -3654,27 +4208,43 @@ async function saveMission(){
   if(data.id) _openMissions.add(data.id); // auto-expand new mission
   loadMissions();
 }
-function openTaskDlg(mid){
+function openTaskDlg(mid,branchId='',parentId=''){
   document.getElementById('t-mid').value=mid;
+  document.getElementById('t-branch').value=branchId||'';
+  document.getElementById('t-parent').value=parentId||'';
+  document.getElementById('task-dlg-title').textContent=parentId?'Добавить шаг':'Добавить квест';
+  document.getElementById('t-title').value='';
+  const taskRadio=document.querySelector('input[name="t-kind"][value="task"]');
+  if(taskRadio) taskRadio.checked=true;
+  toggleTaskKindOpts();
   openDlg('task-dlg');
   setTimeout(()=>document.getElementById('t-title').focus(),50);
 }
 async function saveTask(){
   const t=document.getElementById('t-title').value.trim();
   const mid=document.getElementById('t-mid').value;
+  const branchId=document.getElementById('t-branch').value;
+  const parentId=document.getElementById('t-parent').value;
   if(!t) return;
-  const typeEl=document.querySelector('input[name="t-type"]:checked');
-  const taskType=typeEl?typeEl.value:'once';
+  const kindEl=document.querySelector('input[name="t-kind"]:checked');
+  const kind=kindEl?kindEl.value:'task';
   const iters=parseInt(document.getElementById('t-iters')?.value)||1;
   const hours=parseInt(document.getElementById('t-hours')?.value)||24;
+  const target=parseFloat(document.getElementById('t-target')?.value)||1;
+  const taskType=kind==='ritual'?'repeat':'once';
+  const progressMode=kind==='ritual'?'count':kind==='timer'?'timer':kind==='counter'?'number':'check';
+  const targetValue=kind==='ritual'?iters:(kind==='counter'?target:1);
   await fetch('/tasks',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({mission_id:mid,title:t,task_type:taskType,required_iters:iters,reset_hours:hours})});
+    body:JSON.stringify({
+      mission_id:mid,title:t,task_type:taskType,required_iters:iters,reset_hours:hours,
+      quest_kind:kind,progress_mode:progressMode,branch_id:branchId,parent_id:parentId,
+      target_value:targetValue
+    })});
   closeDlg('task-dlg');
   document.getElementById('t-title').value='';
-  const onceRadio=document.querySelector('input[name="t-type"][value="once"]');
-  if(onceRadio) onceRadio.checked=true;
-  const repeatOpts=document.getElementById('t-repeat-opts');
-  if(repeatOpts) repeatOpts.style.display='none';
+  const taskRadio=document.querySelector('input[name="t-kind"][value="task"]');
+  if(taskRadio) taskRadio.checked=true;
+  toggleTaskKindOpts();
   _openMissions.add(mid);
   loadMissions();
 }
@@ -3682,9 +4252,64 @@ async function tickTask(tid,mid){
   await fetch(`/tasks/${tid}/tick`,{method:'POST'});
   _openMissions.add(mid); loadMissions();
 }
-function toggleRepeatOpts(el){
+function toggleTaskKindOpts(){
+  const kind=document.querySelector('input[name="t-kind"]:checked')?.value||'task';
   const opts=document.getElementById('t-repeat-opts');
-  if(opts) opts.style.display=el.value==='repeat'?'flex':'none';
+  if(opts) opts.style.display=kind==='ritual'?'flex':'none';
+  const counter=document.getElementById('t-counter-opts');
+  if(counter) counter.style.display=kind==='counter'?'block':'none';
+  const timer=document.getElementById('t-timer-opts');
+  if(timer) timer.style.display=kind==='timer'?'block':'none';
+}
+function toggleRepeatOpts(){
+  toggleTaskKindOpts();
+}
+async function addBranch(mid){
+  const title=prompt('Название ветви');
+  if(!title||!title.trim()) return;
+  await fetch(`/missions/${mid}/branches`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({title:title.trim()})});
+  _openMissions.add(mid); loadMissions();
+}
+async function renameBranch(bid,current,mid){
+  const title=prompt('Новое название ветви',current||'');
+  if(!title||!title.trim()) return;
+  await fetch(`/branches/${bid}/update`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({title:title.trim()})});
+  _openMissions.add(mid); loadMissions();
+}
+async function deleteBranch(bid,mid){
+  if(!confirm('Удалить ветвь? Задания переедут в Основную.')) return;
+  await fetch(`/branches/${bid}/delete`,{method:'POST'});
+  _openMissions.add(mid); loadMissions();
+}
+async function progressTask(tid,mid,delta){
+  await fetch(`/tasks/${tid}/progress`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({delta})});
+  _openMissions.add(mid); loadMissions();
+}
+async function startTimer(tid,mid){
+  await fetch(`/tasks/${tid}/timer/start`,{method:'POST'});
+  _openMissions.add(mid); loadMissions();
+}
+async function stopTimer(tid,mid){
+  await fetch(`/tasks/${tid}/timer/stop`,{method:'POST'});
+  _openMissions.add(mid); loadMissions();
+}
+async function addTaskNote(tid,mid){
+  const note=prompt('Заметка к квесту');
+  if(!note||!note.trim()) return;
+  await fetch(`/tasks/${tid}/note`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({note:note.trim()})});
+  _openMissions.add(mid); loadMissions();
+}
+function fmtDuration(seconds){
+  seconds=Math.max(0,parseInt(seconds||0));
+  const h=Math.floor(seconds/3600);
+  const m=Math.floor((seconds%3600)/60);
+  if(h>=1) return `${h}ч ${m}м`;
+  if(m>=1) return `${m}м`;
+  return '0м';
 }
 async function doneMission(id){
   await fetch(`/missions/${id}/complete`,{method:'POST'}); loadMissions();
@@ -3873,6 +4498,39 @@ function _pollReanalyze(){
 }
 
 // ── Entity Modal ─────────────────────────────────────────────────────────────
+function _entEsc(v){
+  return String(v??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function _jsEsc(v){
+  return String(v??'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r?\n/g,'\\n');
+}
+async function openPathEntity(mid,name){
+  const r=await fetch(`/missions/${mid}/entity-context?entity_name=${encodeURIComponent(name)}`);
+  if(!r.ok){openEnt(name);return;}
+  const d=await r.json();
+  const e=d.entity||{};
+  const m=d.mission||{};
+  const clr=TYPE_COLORS[e.type]||'var(--ink3)';
+  document.getElementById('ent-content').innerHTML=`
+    <div class="ent-name" style="color:${clr}">${ICONS[e.type]||'◆'} ${_entEsc(e.name)}</div>
+    <div class="ent-type" style="color:${clr}">внутри Пути: ${_entEsc(m.title)}</div>
+    <div class="ent-summary">${_entEsc(e.summary||'Пока нет общей сводки в базе знаний.')}</div>
+    <div class="ent-sec">Контекст в этом Пути</div>
+    <textarea class="pathctx-textarea" id="pathctx-note" placeholder="Например: какой контент здесь выкладывать, какую роль играет сущность, что попробовать дальше...">${_entEsc(d.note||'')}</textarea>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="ent-merge-btn" onclick="savePathEntityContext('${_jsEsc(mid)}','${_jsEsc(e.name)}',false)">Сохранить</button>
+      <button class="ent-merge-btn" onclick="savePathEntityContext('${_jsEsc(mid)}','${_jsEsc(e.name)}',true)">ИИ улучшить</button>
+      <button class="ent-merge-btn" onclick="openEnt('${_jsEsc(e.name)}')">Открыть в базе</button>
+    </div>
+    ${d.ai_note?`<div class="ent-sec">Версия ИИ</div><div class="pathctx-ai">${_entEsc(d.ai_note)}</div>`:''}`;
+  document.getElementById('ent-modal').classList.add('open');
+}
+async function savePathEntityContext(mid,name,improve){
+  const note=document.getElementById('pathctx-note')?.value||'';
+  const r=await fetch(`/missions/${mid}/entity-context`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({entity_name:name,note,improve})});
+  if(r.ok) openPathEntity(mid,name);
+}
 async function openEnt(name){
   const r=await fetch('/entity/'+encodeURIComponent(name));
   if(!r.ok) return;
@@ -4326,23 +4984,27 @@ const LoginAtmo = {
 };
 
 // ── Init ─────────────────────────────────────────────────────────────────────
-checkApiStatus();
-authInit().then(()=>{
-  if(localStorage.getItem('lrpg_token')){
-    loadJournal(); loadAsides(); loadCharacter();
-    fetch('/character/data').then(r=>r.json()).then(d=>{
-      const last=d.last_analyzed;
-      const stale=!last||(Date.now()-new Date(last).getTime())/86400000>7;
-      if(stale) fetch('/character/analyze',{method:'POST'}).then(()=>setTimeout(loadCharacter,15000));
-    });
-  }
-});
-// Mobile: show input bar on journal tab by default
-(function(){
+function bootLifeRpg(){
+  checkApiStatus();
+  authInit().then(()=>{
+    if(localStorage.getItem('lrpg_token')){
+      loadJournal(); loadAsides(); loadCharacter();
+      fetch('/character/data').then(r=>r.json()).then(d=>{
+        const last=d.last_analyzed;
+        const stale=!last||(Date.now()-new Date(last).getTime())/86400000>7;
+        if(stale) fetch('/character/analyze',{method:'POST'}).then(()=>setTimeout(loadCharacter,15000));
+      });
+    }
+  });
   if(window.innerWidth<=768){
     document.getElementById('input-bar').classList.add('mob-visible');
   }
-})();
+}
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded',bootLifeRpg);
+}else{
+  bootLifeRpg();
+}
 </script>
 <div id="login-screen" style="display:none;position:fixed;inset:0;z-index:9999;
   background:#0e0a06;align-items:center;justify-content:center;flex-direction:column">
