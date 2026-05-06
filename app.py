@@ -260,6 +260,12 @@ def _migrate_quest_engine_columns():
         ("unlock_payload",      "STRING", "''"),
         ("locked",              "STRING", "'false'"),
         ("notes",               "STRING", "''"),
+        ("is_current",          "STRING", "'false'"),
+        ("quest_description",   "STRING", "''"),
+        ("description_updated_ts","STRING","''"),
+        ("record_enabled",      "STRING", "'false'"),
+        ("record_value",        "DOUBLE", "0"),
+        ("record_label",        "STRING", "''"),
     ]:
         try: _conn.execute(f"ALTER TABLE Task ADD {col} {dtype} DEFAULT {default}")
         except: pass
@@ -390,11 +396,185 @@ def build_context(user_id: str = "admin"):
         "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.name,e.type,e.summary LIMIT 40",
         {"uid":user_id}))
     missions = kuzu_rows(_conn.execute(
-        "MATCH (m:Mission) WHERE m.status='active' AND m.user_id=$uid RETURN m.id,m.title LIMIT 10",
+        "MATCH (m:Mission) WHERE m.status='active' AND m.user_id=$uid RETURN m.id,m.title,m.description LIMIT 10",
         {"uid":user_id}))
     ent_ctx  = "\n".join(f"- {r[0]} ({r[1]}): {r[2]}" for r in ents)
-    miss_ctx = "\n".join(f"  ID={r[0]}: {r[1]}" for r in missions)
+    task_rows = kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.mission_id,t.title,t.quest_kind,t.is_current,t.status ORDER BY t.position,t.ts LIMIT 80",
+        {"uid":user_id}))
+    tasks_by_mid={}
+    for t in task_rows:
+        tasks_by_mid.setdefault(t[0],[]).append(f"{'★ ' if (t[3] or '')=='true' else ''}{t[1]} ({t[2] or 'task'}, {t[4]})")
+    miss_ctx = "\n".join(
+        f"  ID={r[0]}: {r[1]} — {r[2] or ''}\n    Квесты: " + "; ".join(tasks_by_mid.get(r[0],[])[:12])
+        for r in missions)
     return ent_ctx, miss_ctx
+
+def _knowledge_context(user_id: str, limit: int = 80) -> str:
+    ents=kuzu_rows(_conn.execute(
+        "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.name,e.type,e.summary ORDER BY e.name LIMIT $l",
+        {"uid":user_id,"l":limit}))
+    return "\n".join(f"- {r[0]} ({r[1]}): {r[2] or ''}" for r in ents) or "нет"
+
+def _paths_context(user_id: str, limit: int = 120) -> str:
+    missions=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.user_id=$uid RETURN m.id,m.title,m.description,m.status ORDER BY m.ts",
+        {"uid":user_id}))
+    tasks=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.mission_id,t.title,t.quest_kind,t.is_current,t.status,t.parent_id ORDER BY t.position,t.ts LIMIT $l",
+        {"uid":user_id,"l":limit}))
+    by_mid={}
+    for t in tasks:
+        mark="★ " if (t[3] or "")=="true" else ""
+        child=" ↳" if t[5] else ""
+        by_mid.setdefault(t[0],[]).append(f"{child}{mark}{t[1]} ({t[2] or 'task'}, {t[4]})")
+    lines=[]
+    for m in missions:
+        lines.append(f"Путь {m[1]} [{m[3]}]: {m[2] or ''}")
+        for task_line in by_mid.get(m[0],[])[:20]:
+            lines.append(f"  - {task_line}")
+    return "\n".join(lines) or "нет"
+
+def _duration_ru(seconds: int | float) -> str:
+    seconds=max(0,int(seconds or 0))
+    h=seconds//3600
+    m=(seconds%3600)//60
+    if h and m: return f"{h} ч {m} мин"
+    if h: return f"{h} ч"
+    if m: return f"{m} мин"
+    return "меньше минуты"
+
+def _quest_snapshot(tid: str, user_id: str) -> dict | None:
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN "
+        "t.id,t.mission_id,t.title,t.status,t.quest_kind,t.branch_id,t.parent_id,t.progress_mode,"
+        "t.target_value,t.progress_value,t.current_iters,t.required_iters,t.timer_total_seconds,"
+        "t.quest_description,t.notes,t.record_enabled,t.record_value,t.record_label",
+        {"id":tid,"uid":user_id}))
+    if not rows: return None
+    t=rows[0]; mid=t[1]
+    mrows=kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.id=$mid AND m.user_id=$uid RETURN m.title,m.description,m.lore",
+        {"mid":mid,"uid":user_id}))
+    brows=kuzu_rows(_conn.execute(
+        "MATCH (b:QuestBranch) WHERE b.id=$bid AND b.user_id=$uid RETURN b.title",
+        {"bid":t[5] or "","uid":user_id}))
+    eid=_mission_entity_id(mid, mrows[0][0] if mrows else "", user_id)
+    linked=kuzu_rows(_conn.execute(
+        "MATCH (m:Entity)-[r:LINKED]->(e:Entity) WHERE m.id=$id AND m.user_id=$uid AND e.user_id=$uid RETURN e.name,e.type,e.summary",
+        {"id":eid,"uid":user_id}))
+    return {
+        "task":{"id":t[0],"mission_id":mid,"title":t[2],"status":t[3],"quest_kind":t[4] or "task",
+                "branch_id":t[5] or "","parent_id":t[6] or "","progress_mode":t[7] or "check",
+                "target_value":float(t[8] or 1),"progress_value":float(t[9] or 0),
+                "current_iters":int(t[10] or 0),"required_iters":int(t[11] or 1),
+                "timer_total_seconds":int(t[12] or 0),"quest_description":t[13] or "",
+                "notes":t[14] or "","record_enabled":(t[15] or "false")=="true",
+                "record_value":float(t[16] or 0),"record_label":t[17] or ""},
+        "mission":{"title":mrows[0][0] if mrows else "Путь","description":mrows[0][1] if mrows else "",
+                   "lore":mrows[0][2] if mrows else ""},
+        "branch":{"title":brows[0][0] if brows else "Основная"},
+        "entities":[{"name":r[0],"type":r[1],"summary":r[2] or ""} for r in linked],
+    }
+
+def _quest_description_fallback(snap: dict) -> str:
+    task=snap["task"]; mission=snap["mission"]; branch=snap["branch"]
+    kind={"ritual":"ритуал","timer":"испытание времени","counter":"счётчик продвижения","task":"поручение"}.get(task["quest_kind"],"поручение")
+    bits=[f"«{task['title']}» — {kind} в Пути «{mission['title']}»."]
+    if branch.get("title"): bits.append(f"Ветвь: {branch['title']}.")
+    if task.get("notes"): bits.append(task["notes"].split("\n")[-1])
+    elif mission.get("lore"): bits.append(mission["lore"])
+    elif mission.get("description"): bits.append(mission["description"])
+    return " ".join(bits).strip()
+
+def _generate_quest_description(snap: dict, user_id: str, player_note: str = "") -> str:
+    fallback=_quest_description_fallback(snap)
+    if not _has_any_ai():
+        return player_note or fallback
+    ents="\n".join(f"- {e['name']} ({e['type']}): {e['summary']}" for e in snap.get("entities",[])) or "нет"
+    prompt=f"""Ты — квест-дизайнер Life RPG в духе дневника Morrowind и карточек заданий World of Warcraft.
+Создай короткое описание задания: 2-4 предложения, конкретно, без пафосной воды, но с ощущением эпоса.
+
+Задание: {snap['task']['title']}
+Тип: {snap['task']['quest_kind']}
+Путь: {snap['mission']['title']}
+Ветвь: {snap['branch']['title']}
+Лор пути: {snap['mission'].get('lore') or snap['mission'].get('description') or ''}
+Сущности Пути:
+{ents}
+Пояснение игрока: {player_note or snap['task'].get('notes') or ''}
+
+База знаний:
+{_knowledge_context(user_id)}
+
+Стратегическая карта Путей:
+{_paths_context(user_id)}
+
+Верни только текст описания."""
+    text=_call_any_ai(prompt).strip()
+    return text or player_note or fallback
+
+def _quest_journal_fallback(snap: dict, event_type: str, value: float = 0.0) -> str:
+    task=snap["task"]; mission=snap["mission"]
+    linked=", ".join(e["name"] for e in snap.get("entities",[])[:4])
+    tail=f" В орбите этого шага: {linked}." if linked else ""
+    if event_type=="timer_stopped":
+        return f"Герой провёл {_duration_ru(value)} в деле «{task['title']}», продвигая Путь «{mission['title']}».{tail}"
+    if event_type=="tick":
+        return f"Герой отметил продвижение в ритуале «{task['title']}»: {task['current_iters']}/{task['required_iters']}.{tail}"
+    if event_type=="progress":
+        return f"Герой продвинул счётчик «{task['title']}» до {task['progress_value']:g}/{task['target_value']:g}.{tail}"
+    if event_type=="completed":
+        return f"Герой завершил поручение «{task['title']}» на Пути «{mission['title']}».{tail}"
+    return f"Герой сделал шаг в задании «{task['title']}».{tail}"
+
+def _improve_quest_journal_entry(entry_id: str, snap: dict, event_type: str, value: float, user_id: str):
+    if not _has_any_ai(): return
+    prompt=f"""Ты — летописец Life RPG. Перепиши техническое действие в дневниковую запись в духе Morrowind.
+1-2 предложения. Конкретно, без чрезмерного пафоса. Упоминай важные сущности по именам.
+
+Действие: {event_type}
+Значение: {value}
+Задание: {snap['task']['title']}
+Описание задания: {snap['task'].get('quest_description') or _quest_description_fallback(snap)}
+Путь: {snap['mission']['title']}
+Ветвь: {snap['branch']['title']}
+Сущности: {', '.join(e['name'] for e in snap.get('entities',[])) or 'нет'}
+
+База знаний:
+{_knowledge_context(user_id)}
+
+Карта Путей:
+{_paths_context(user_id)}
+
+Верни только текст записи."""
+    text=_call_any_ai(prompt).strip()
+    if text:
+        try:
+            _conn.execute("MATCH (e:Entry) WHERE e.id=$id AND e.user_id=$uid SET e.narrative=$n,e.archivist_note=$a",
+                          {"id":entry_id,"uid":user_id,"n":text,"a":"Запись создана по действию квеста."})
+        except Exception as ex: print(f"[quest_journal_update] {ex}")
+
+def _write_quest_journal_event(tid: str, user_id: str, event_type: str, value: float = 0.0):
+    snap=_quest_snapshot(tid, user_id)
+    if not snap: return
+    raw=f"quest:{event_type}:{snap['task']['title']}"
+    narrative=_quest_journal_fallback(snap, event_type, value)
+    data={"narrative":narrative,"archivist_note":"","entities":[],"relations":[]}
+    eid=write_entry(raw, data, user_id)
+    for ent in snap.get("entities",[]):
+        sid=_entity_id(ent["name"], user_id)
+        if entity_exists(sid, user_id):
+            try:
+                _conn.execute(
+                    "MATCH (en:Entry) WHERE en.id=$eid AND en.user_id=$uid "
+                    "MATCH (et:Entity) WHERE et.id=$etid AND et.user_id=$uid"
+                    " CREATE (en)-[:MENTIONS]->(et)",
+                    {"eid":eid,"etid":sid,"uid":user_id})
+            except: pass
+    if _has_any_ai():
+        threading.Thread(target=_improve_quest_journal_entry,
+                         args=(eid,snap,event_type,value,user_id),daemon=True).start()
 
 PROMPT = """Ты — Архивариус, хранитель Живой Летописи. Анализируй запись Героя и верни ТОЛЬКО валидный JSON без markdown.
 
@@ -540,7 +720,8 @@ def export_data(u: dict = Depends(current_user)):
         "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
         "t.last_reset_ts,t.streak,t.best_streak,t.entry_id,t.completed_ts,"
         "t.quest_kind,t.branch_id,t.parent_id,t.position,t.progress_mode,t.target_value,t.progress_value,"
-        "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes",
+        "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes,"
+        "t.is_current,t.quest_description,t.description_updated_ts,t.record_enabled,t.record_value,t.record_label",
         {"uid":uid}))
     branches = kuzu_rows(_conn.execute(
         "MATCH (b:QuestBranch) WHERE b.user_id=$uid RETURN b.id,b.mission_id,b.title,b.status,b.position,b.ts",
@@ -579,7 +760,11 @@ def export_data(u: dict = Depends(current_user)):
                       "target_value":r[19] or 1,"progress_value":r[20] or 0,
                       "timer_total_seconds":r[21] or 0,"timer_started_ts":r[22] or "",
                       "unlock_rule":r[23] or "","unlock_payload":r[24] or "",
-                      "locked":r[25] or "false","notes":r[26] or ""} for r in tasks],
+                      "locked":r[25] or "false","notes":r[26] or "",
+                      "is_current":r[27] or "false","quest_description":r[28] or "",
+                      "description_updated_ts":r[29] or "",
+                      "record_enabled":r[30] or "false","record_value":r[31] or 0,
+                      "record_label":r[32] or ""} for r in tasks],
         "events":   [{"id":r[0],"task_id":r[1],"mission_id":r[2],"event_type":r[3],
                       "value":r[4] or 0,"note":r[5] or "","ts":r[6]} for r in events],
         "path_entity_contexts": [{"id":r[0],"mission_id":r[1],"entity_id":r[2],
@@ -662,7 +847,9 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
                     "last_reset_ts:$lr,streak:$st,best_streak:$bs,entry_id:$eid,completed_ts:$cts,user_id:$uid,"
                     "quest_kind:$kind,branch_id:$bid,parent_id:$parent,position:$pos,progress_mode:$pmode,"
                     "target_value:$target,progress_value:$progress,timer_total_seconds:$timer,timer_started_ts:$timer_started,"
-                    "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes})",
+                    "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes,"
+                    "is_current:$current,quest_description:$qdesc,description_updated_ts:$dts,"
+                    "record_enabled:$record_enabled,record_value:$record_value,record_label:$record_label})",
                     {"id":t["id"],"mid":t.get("mission_id",""),"ti":t["title"],
                      "s":t.get("status","active"),"ts":t.get("ts",""),
                      "tt":t.get("task_type","once"),"rh":int(t.get("reset_hours",24)),
@@ -677,7 +864,12 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
                      "progress":float(t.get("progress_value",t.get("current_iters",0) or 0)),
                      "timer":int(t.get("timer_total_seconds",0)),"timer_started":t.get("timer_started_ts",""),
                      "unlock_rule":t.get("unlock_rule",""),"unlock_payload":t.get("unlock_payload",""),
-                     "locked":t.get("locked","false"),"notes":t.get("notes","")})
+                     "locked":t.get("locked","false"),"notes":t.get("notes",""),
+                     "current":t.get("is_current","false"),"qdesc":t.get("quest_description",""),
+                     "dts":t.get("description_updated_ts",""),
+                     "record_enabled":t.get("record_enabled","false"),
+                     "record_value":float(t.get("record_value",0) or 0),
+                     "record_label":t.get("record_label","")})
                 imported["tasks"]+=1
         except: pass
     # Finances
@@ -782,6 +974,8 @@ class TaskReq(BaseModel):
     target_value: float = 1; timer_total_seconds: int = 0
     unlock_rule: str = ""; unlock_payload: str = ""; locked: bool = False
     notes: str = ""
+    is_current: bool = False; quest_description: str = ""
+    record_enabled: bool = False; record_label: str = ""
 class BranchReq(BaseModel):
     title: str
 class PathEntityContextReq(BaseModel):
@@ -1176,7 +1370,9 @@ def get_missions(u: dict = Depends(current_user)):
             "t.task_type,t.reset_hours,t.required_iters,t.current_iters,"
             "t.last_reset_ts,t.streak,t.best_streak,t.completed_ts,"
             "t.quest_kind,t.branch_id,t.parent_id,t.position,t.progress_mode,t.target_value,t.progress_value,"
-            "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes ORDER BY t.position,t.ts",
+            "t.timer_total_seconds,t.timer_started_ts,t.unlock_rule,t.unlock_payload,t.locked,t.notes,"
+            "t.is_current,t.quest_description,t.description_updated_ts,t.record_enabled,t.record_value,t.record_label "
+            "ORDER BY t.position,t.ts",
             {"mid":mid,"uid":uid}))
         task_list=[]
         for t in tasks:
@@ -1190,7 +1386,11 @@ def get_missions(u: dict = Depends(current_user)):
                 "target_value":float(t[17] or t[6] or 1),"progress_value":float(t[18] or t[7] or 0),
                 "timer_total_seconds":_timer_effective_seconds(int(t[19] or 0), t[20] or ""),
                 "timer_started_ts":t[20] or "","unlock_rule":t[21] or "",
-                "unlock_payload":t[22] or "","locked":(t[23] or "false")=="true","notes":t[24] or ""}
+                "unlock_payload":t[22] or "","locked":(t[23] or "false")=="true","notes":t[24] or "",
+                "is_current":(t[25] or "false")=="true","quest_description":t[26] or "",
+                "description_updated_ts":t[27] or "",
+                "record_enabled":(t[28] or "false")=="true","record_value":float(t[29] or 0),
+                "record_label":t[30] or ""}
             td=_maybe_reset_task(td)
             task_list.append(td)
         # Linked entities
@@ -1327,13 +1527,19 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
         "current_iters:0,last_reset_ts:$lr,streak:0,best_streak:0,completed_ts:'',"
         "quest_kind:$kind,branch_id:$bid,parent_id:$parent,position:$position,progress_mode:$pmode,"
         "target_value:$target,progress_value:0,timer_total_seconds:$timer,timer_started_ts:'',"
-        "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes,user_id:$uid})",
+        "unlock_rule:$unlock_rule,unlock_payload:$unlock_payload,locked:$locked,notes:$notes,"
+        "is_current:$current,quest_description:$qdesc,description_updated_ts:$dts,"
+        "record_enabled:$record_enabled,record_value:0,record_label:$record_label,user_id:$uid})",
         {"id":tid,"mid":req.mission_id,"t":req.title,"ts":ts,
          "tt":task_type,"rh":req.reset_hours,"ri":req.required_iters,"lr":init_reset,
          "kind":kind,"bid":branch_id,"parent":req.parent_id,"position":position,
          "pmode":progress_mode,"target":target_value,"timer":int(req.timer_total_seconds or 0),
          "unlock_rule":req.unlock_rule,"unlock_payload":req.unlock_payload,
-         "locked":"true" if req.locked else "false","notes":req.notes,"uid":uid})
+         "locked":"true" if req.locked else "false","notes":req.notes,
+         "current":"true" if req.is_current else "false","qdesc":req.quest_description,
+         "dts":_now_s() if req.quest_description else "",
+         "record_enabled":"true" if req.record_enabled else "false",
+         "record_label":req.record_label,"uid":uid})
     _record_quest_event(tid, req.mission_id, uid, "created", 0, kind)
     return {"id":tid,"title":req.title,"status":"active","task_type":task_type,"quest_kind":kind,"branch_id":branch_id}
 
@@ -1345,6 +1551,11 @@ class TaskProgressReq(BaseModel):
     note: str = ""
 class TaskNoteReq(BaseModel):
     note: str = ""
+class TaskCardReq(BaseModel):
+    description: str = ""
+    improve: bool = False
+class TaskCurrentReq(BaseModel):
+    is_current: bool = True
 class TaskMoveReq(BaseModel):
     branch_id: str
     parent_id: str = ""
@@ -1371,6 +1582,43 @@ def set_task_params(tid: str, req: TaskParamsReq, u: dict = Depends(current_user
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.task_type=$tt,t.reset_hours=$rh,t.required_iters=$ri",
         {"id":tid,"uid":uid,"tt":req.task_type,"rh":req.reset_hours,"ri":req.required_iters})
     return {"ok":True}
+
+@app.get("/tasks/{tid}/card")
+def get_task_card(tid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    snap=_quest_snapshot(tid, uid)
+    if not snap: raise HTTPException(404)
+    desc=snap["task"].get("quest_description") or _quest_description_fallback(snap)
+    return {"task":snap["task"],"mission":snap["mission"],"branch":snap["branch"],
+            "entities":snap.get("entities",[]),"description":desc,
+            "ai_available":_has_any_ai()}
+
+@app.post("/tasks/{tid}/card")
+def save_task_card(tid: str, req: TaskCardReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    snap=_quest_snapshot(tid, uid)
+    if not snap: raise HTTPException(404)
+    desc=req.description.strip()
+    if req.improve:
+        desc=_generate_quest_description(snap, uid, desc)
+    elif not desc:
+        desc=_quest_description_fallback(snap)
+    _conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.quest_description=$d,t.description_updated_ts=$ts",
+        {"id":tid,"uid":uid,"d":desc,"ts":_now_s()})
+    snap["task"]["quest_description"]=desc
+    return {"ok":True,"description":desc}
+
+@app.post("/tasks/{tid}/current")
+def set_task_current(tid: str, req: TaskCurrentReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id",
+        {"id":tid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.is_current=$cur",
+                  {"id":tid,"uid":uid,"cur":"true" if req.is_current else "false"})
+    return {"ok":True,"is_current":req.is_current}
 
 @app.post("/tasks/{tid}/move")
 def move_task(tid: str, req: TaskMoveReq, u: dict = Depends(current_user)):
@@ -1438,6 +1686,7 @@ def tick_task(tid: str, u: dict = Depends(current_user)):
     _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.current_iters=$c,t.progress_value=$p,t.last_reset_ts=$lr,t.completed_ts=$cts",
                   {"id":tid,"uid":uid,"c":new_cur,"p":new_progress,"lr":lr,"cts":cts})
     _record_quest_event(tid, mid, uid, "tick", 1)
+    _write_quest_journal_event(tid, uid, "tick", 1)
     return {"current":new_cur,"required":req,"completed":new_cur>=req}
 
 @app.post("/tasks/{tid}/progress")
@@ -1445,10 +1694,10 @@ def update_task_progress(tid: str, req: TaskProgressReq, u: dict = Depends(curre
     uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
-        "RETURN t.mission_id,t.progress_value,t.target_value,t.required_iters,t.progress_mode",
+        "RETURN t.mission_id,t.progress_value,t.target_value,t.required_iters,t.progress_mode,t.record_enabled,t.record_value",
         {"id":tid,"uid":uid}))
     if not rows: raise HTTPException(404)
-    mid,current,target,required,mode=rows[0]
+    mid,current,target,required,mode,record_enabled,record_value=rows[0]
     new_value=float(req.value if req.value is not None else (current or 0) + req.delta)
     target=float(target or required or 1)
     completed = bool(target and new_value >= target and mode != "timer")
@@ -1456,10 +1705,14 @@ def update_task_progress(tid: str, req: TaskProgressReq, u: dict = Depends(curre
     _conn.execute(
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.progress_value=$v,t.completed_ts=$cts",
         {"id":tid,"uid":uid,"v":new_value,"cts":now_s})
+    if (record_enabled or "false")=="true" and new_value > float(record_value or 0):
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.record_value=$v",
+                      {"id":tid,"uid":uid,"v":new_value})
     if completed:
-        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done'",
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done',t.is_current='false'",
                       {"id":tid,"uid":uid})
     _record_quest_event(tid, mid or "", uid, "progress", float(req.delta or 0), req.note)
+    _write_quest_journal_event(tid, uid, "progress", new_value)
     return {"ok":True,"progress_value":new_value,"completed":completed}
 
 @app.post("/tasks/{tid}/timer/start")
@@ -1480,15 +1733,20 @@ def start_task_timer(tid: str, u: dict = Depends(current_user)):
 def stop_task_timer(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.timer_total_seconds,t.timer_started_ts",
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.timer_total_seconds,t.timer_started_ts,t.record_enabled,t.record_value",
         {"id":tid,"uid":uid}))
     if not rows: raise HTTPException(404)
-    mid,total,started=rows[0]
+    mid,total,started,record_enabled,record_value=rows[0]
     new_total=_timer_effective_seconds(int(total or 0), started or "")
+    session_delta=max(0, new_total - int(total or 0))
     _conn.execute(
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_total_seconds=$total,t.timer_started_ts='',t.progress_value=$hours",
         {"id":tid,"uid":uid,"total":new_total,"hours":round(new_total/3600, 3)})
-    _record_quest_event(tid, mid or "", uid, "timer_stopped", float(new_total - int(total or 0)))
+    if (record_enabled or "false")=="true" and session_delta > float(record_value or 0):
+        _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.record_value=$v",
+                      {"id":tid,"uid":uid,"v":float(session_delta)})
+    _record_quest_event(tid, mid or "", uid, "timer_stopped", float(session_delta))
+    _write_quest_journal_event(tid, uid, "timer_stopped", float(session_delta))
     return {"ok":True,"timer_total_seconds":new_total}
 
 @app.post("/tasks/{tid}/note")
@@ -1513,9 +1771,10 @@ def complete_task(tid: str, u: dict = Depends(current_user)):
     now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
     rows=kuzu_rows(_conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id",
                                  {"id":tid,"uid":uid}))
-    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done',t.completed_ts=$ts",
+    _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done',t.completed_ts=$ts,t.is_current='false'",
                   {"id":tid,"uid":uid,"ts":now_s})
     _record_quest_event(tid, rows[0][0] if rows else "", uid, "completed", 1)
+    _write_quest_journal_event(tid, uid, "completed", 1)
     return {"ok":True}
 
 @app.post("/tasks/{tid}/delete")
@@ -2272,6 +2531,8 @@ section.active{display:block}
 .entry-archivist{font-size:11px;color:var(--gold);font-family:sans-serif;font-style:italic;
   margin-top:10px;padding:6px 10px;border-left:2px solid rgba(139,105,20,.4);
   background:rgba(139,105,20,.04);line-height:1.6}
+.entry-stamp{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-bottom:7px;
+  letter-spacing:1px}
 .entry-time{font-size:10px;color:var(--ink3);font-family:sans-serif;
   margin-top:6px;text-align:right;opacity:.65}
 .ent-link{cursor:pointer;border-bottom:1px dotted currentColor;transition:opacity .1s}
@@ -2289,6 +2550,11 @@ section.active{display:block}
   margin-bottom:5px;cursor:pointer;background:var(--paper);transition:border-color .12s}
 .aside-mission:hover{border-color:var(--gold)}
 .aside-mission-t{font-size:13px;color:var(--ink)}
+.aside-quest{padding:7px 10px 7px 12px;border-left:2px solid var(--gold);
+  margin:5px 0;background:rgba(139,105,20,.06);cursor:pointer;border-radius:0 3px 3px 0}
+.aside-quest:hover{background:rgba(139,105,20,.12)}
+.aside-quest-title{font-size:12px;color:var(--ink);font-family:sans-serif;line-height:1.35}
+.aside-quest-meta{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-top:3px;line-height:1.35}
 .aside-entity{display:flex;align-items:center;gap:8px;padding:6px 0;cursor:pointer;
   border-bottom:.5px solid var(--border2)}
 .aside-entity:last-child{border-bottom:none}
@@ -2356,6 +2622,7 @@ section.active{display:block}
 .quest-node{position:relative}
 .quest-node[draggable="true"]{cursor:grab}
 .quest-node.dragging{opacity:.45}
+.quest-node.current>.quest-item{background:rgba(139,105,20,.07)}
 .quest-children{margin-left:22px;padding-left:12px;border-left:1px solid rgba(200,184,154,.6)}
 .quest-item{display:flex;align-items:flex-start;gap:10px;padding:9px 0;
   border-bottom:.5px solid rgba(200,164,122,.25);transition:background .12s,box-shadow .12s}
@@ -2384,6 +2651,7 @@ section.active{display:block}
 .quest-tool.primary{background:var(--gold);border-color:var(--gold);color:#fff}
 .quest-tool.primary:hover{background:#a07820;color:#fff}
 .quest-tool.running{background:var(--red);border-color:var(--red);color:#fff}
+.quest-tool.current{border-color:var(--gold);background:rgba(139,105,20,.12);color:var(--gold)}
 .quest-progress-line{display:flex;align-items:center;gap:8px;margin-top:5px;
   font-size:12px;font-family:sans-serif;color:var(--ink2);flex-wrap:wrap}
 .quest-progress-count{font-weight:700;color:var(--ink)}
@@ -2499,6 +2767,13 @@ section.active{display:block}
 .pathctx-ai{font-size:12px;color:var(--ink2);line-height:1.65;background:rgba(139,105,20,.06);
   border-left:2px solid rgba(139,105,20,.35);padding:10px 12px;margin-top:8px;
   white-space:pre-wrap}
+.quest-card-textarea{width:100%;box-sizing:border-box;background:var(--paper2);
+  border:1px solid var(--border);color:var(--ink);font-family:'Georgia',serif;
+  font-size:13px;padding:10px 12px;border-radius:3px;outline:none;resize:vertical;
+  min-height:130px;margin:8px 0 10px;line-height:1.55}
+.quest-card-textarea:focus{border-color:var(--gold)}
+.quest-card-meta{font-size:11px;color:var(--ink3);font-family:sans-serif;line-height:1.6;margin-bottom:10px}
+.quest-record{font-size:10px;color:var(--gold);font-family:sans-serif;margin-left:2px}
 
 /* ── REPEAT TASKS ── */
 .quest-item.repeat-task{background:rgba(139,105,20,.04);border-left:2px solid rgba(139,105,20,.28);padding-left:10px}
@@ -3347,6 +3622,12 @@ section.active{display:block}
     <div id="t-timer-opts" class="dlg-hint" style="display:none;margin-bottom:10px">
       Таймер будет копить общее время. Его можно запускать и останавливать прямо в ветви.
     </div>
+    <label style="display:flex;align-items:center;gap:7px;margin:6px 0 8px;font-family:sans-serif;font-size:12px;color:var(--ink2);cursor:pointer">
+      <input type="checkbox" id="t-current"> актуально сейчас
+    </label>
+    <label id="t-record-row" style="display:none;align-items:center;gap:7px;margin:0 0 12px;font-family:sans-serif;font-size:12px;color:var(--ink2);cursor:pointer">
+      <input type="checkbox" id="t-record"> вести рекорд
+    </label>
     <input type="hidden" id="t-mid">
     <input type="hidden" id="t-branch">
     <input type="hidden" id="t-parent">
@@ -3441,7 +3722,7 @@ let allEntities = [];
 let _openMissions = new Set();   // expanded mission blocks
 let _closedMissions = new Set(); // manually collapsed by user
 
-const ICONS = {person:'👤',place:'📍',project:'📁',concept:'💡',event:'📅'};
+const ICONS = {person:'👤',place:'📍',project:'📁',concept:'💡',event:'📅',quest:'⚔'};
 const TYPE_COLORS = {
   person:'var(--blue)', place:'#6b4a22', project:'var(--green)',
   concept:'#7b4fa0', event:'var(--gold)', quest:'var(--red)'
@@ -3949,7 +4230,10 @@ async function loadJournal(){
   </div>`:'';
   el.innerHTML=pastMoonHtml+Object.entries(byDate).map(([date,entries])=>{
     const cal=WoW.convert(date);
-    const items=entries.map(e=>{
+    const items=entries
+      .slice()
+      .sort((a,b)=>String(a.ts||'').localeCompare(String(b.ts||'')))
+      .map(e=>{
       const timeStr=e.ts.includes(' ')?e.ts.split(' ')[1]:'';
       const isPending = pendingIds.has(e.id);
       const ageStyle=entryAgeStyle(e.ts);
@@ -3960,11 +4244,11 @@ async function loadJournal(){
           ⏳ Архивариус обрабатывает запись...
         </div>`:'';
       return `<div class="entry" style="${ageStyle}">
+        ${timeStr?`<div class="entry-stamp">${timeStr} · ${cal.phaseEmoji} ${cal.phase}</div>`:''}
         <div class="entry-text">${linkify(e.narrative)}</div>
         ${!isPending&&e.raw&&e.raw!==e.narrative?`<div class="entry-raw">«${e.raw}»</div>`:''}
         ${archivistHtml}
         ${pendingHtml}
-        ${timeStr?`<div class="entry-time">${timeStr} · ${cal.phaseEmoji} ${cal.phase}</div>`:''}
       </div>`;
     }).join('');
     const isToday=date===new Date().toISOString().slice(0,10);
@@ -4001,27 +4285,114 @@ function _taskUrgency(t){
 async function loadAsides(){
   const mr=await fetch('/missions');
   const missions=await mr.json();
-  const active=missions.filter(m=>m.status==='active');
+  const active=missions
+    .filter(m=>m.status==='active')
+    .map(m=>({
+      ...m,
+      currentTasks:(m.tasks||[]).filter(t=>t.status!=='done'&&t.is_current)
+        .sort((a,b)=>_taskUrgency(a)-_taskUrgency(b))
+    }))
+    .filter(m=>m.currentTasks.length);
+  const questMeta=t=>{
+    const kind=t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
+    if(kind==='ritual'){
+      const timeLeft=t.last_reset_ts?fmtCountdown(t.last_reset_ts,t.reset_hours):'';
+      return `${t.current_iters||0}/${t.required_iters||1}${timeLeft?' · '+timeLeft:''}`;
+    }
+    if(kind==='timer'){
+      const rec=t.record_enabled&&t.record_value?` · рекорд ${fmtDuration(t.record_value)}`:'';
+      return `таймер · всего ${fmtDuration(t.timer_total_seconds||0)}${rec}`;
+    }
+    if(kind==='counter'){
+      const cur=Number(t.progress_value||0);
+      const target=Number(t.target_value||1);
+      const shown=Number.isInteger(cur)?String(cur):cur.toFixed(1);
+      const shownTarget=Number.isInteger(target)?String(target):target.toFixed(1);
+      const rec=t.record_enabled?` · рекорд ${Number(t.record_value||0).toLocaleString('ru-RU')}`:'';
+      return `счётчик · ${shown}/${shownTarget}${rec}`;
+    }
+    return t.parent_id?'шаг квеста':'квест';
+  };
   document.getElementById('aside-missions').innerHTML=active.length
     ?active.map(m=>{
-      const incompleteTasks=m.tasks.filter(t=>t.status!=='done')
-        .sort((a,b)=>_taskUrgency(a)-_taskUrgency(b));
-      const tasksHtml=incompleteTasks.map(t=>{
-        const isRepeat=t.task_type==='repeat';
-        const prog=isRepeat?`${t.current_iters}/${t.required_iters}`:'';
-        const timeLeft=isRepeat&&t.last_reset_ts?fmtCountdown(t.last_reset_ts,t.reset_hours):'';
-        return `<div style="padding:4px 8px 4px 14px;font-size:12px;font-family:sans-serif;color:var(--ink2);border-left:2px solid var(--border2);margin:3px 0">
-          <span>${t.title}</span>
-          ${prog?`<span style="color:var(--gold);margin-left:6px">${prog}</span>`:''}
-          ${timeLeft?`<span style="color:var(--ink3);font-size:10px;margin-left:4px">${timeLeft}</span>`:''}
+      const tasksHtml=m.currentTasks.map(t=>{
+        return `<div class="aside-quest" onclick="openTaskCard('${_jsEsc(t.id)}')">
+          <div class="aside-quest-title">${_entEsc(t.title)}</div>
+          <div class="aside-quest-meta">${_entEsc(questMeta(t))}</div>
         </div>`;
       }).join('');
       return `<div class="aside-mission" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
-        <div class="aside-mission-t">⚔️ ${m.title}</div>
+        <div class="aside-mission-t">⚔ ${_entEsc(m.title)}</div>
       </div>
-      <div style="display:none">${tasksHtml||'<div style="padding:4px 14px;font-size:11px;color:var(--ink3);font-family:sans-serif">нет заданий</div>'}</div>`;
+      <div>${tasksHtml}</div>`;
     }).join('')
-    :'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif">нет</div>';
+    :'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif;line-height:1.5">нет актуальных квестов</div>';
+}
+
+function questKindName(kind, taskType=''){
+  const k=kind||((taskType||'')==='repeat'?'ritual':'task');
+  return {task:'квест',ritual:'ритуал',timer:'таймер',counter:'счётчик'}[k]||'квест';
+}
+function questRecordText(task){
+  if(!task?.record_enabled) return '';
+  const kind=task.quest_kind||'task';
+  if(kind==='timer') return `Рекорд: ${fmtDuration(task.record_value||0)}`;
+  return `Рекорд: ${Number(task.record_value||0).toLocaleString('ru-RU')}`;
+}
+async function toggleTaskCurrent(tid,mid='',isCurrent=true){
+  const r=await fetch(`/tasks/${tid}/current`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({is_current:!!isCurrent})});
+  if(!r.ok) return;
+  if(mid) _openMissions.add(mid);
+  const active=document.querySelector('section.active');
+  if(active?.id==='s-missions') loadMissions();
+  loadAsides();
+  if(document.getElementById('ent-modal').classList.contains('open')&&document.getElementById('quest-card-desc')){
+    openTaskCard(tid);
+  }
+}
+async function openTaskCard(tid){
+  const r=await fetch(`/tasks/${tid}/card`);
+  if(!r.ok) return;
+  const d=await r.json();
+  const task=d.task||{}, mission=d.mission||{}, branch=d.branch||{};
+  const mid=task.mission_id||'';
+  const kind=questKindName(task.quest_kind,task.task_type);
+  const rec=questRecordText(task);
+  const entities=(d.entities||[]).map(e=>
+    `<span class="mission-ent-tag" onclick="openPathEntity('${_jsEsc(mid)}','${_jsEsc(e.name||'')}')">${_entEsc(e.name||'')}</span>`
+  ).join('');
+  const aiBtn=d.ai_available
+    ?`<button class="ent-merge-btn" onclick="saveTaskCard('${_jsEsc(tid)}',true)">ИИ улучшить</button>`
+    :`<button class="ent-merge-btn" disabled title="Подключи ключ ИИ в настройках">ИИ недоступен</button>`;
+  document.getElementById('ent-content').innerHTML=`
+    <div class="ent-name" style="color:var(--red)">${ICONS.quest||'◆'} ${_entEsc(task.title||'Квест')}</div>
+    <div class="ent-type" style="color:var(--red)">${_entEsc(kind)} · ${_entEsc(mission.title||'Путь')} · ${_entEsc(branch.title||'Основная')}</div>
+    <div class="quest-card-meta">${task.is_current?'актуально сейчас':'не в активных'}${rec?' · '+_entEsc(rec):''}</div>
+    ${entities?`<div class="mission-entities" style="margin:4px 0 12px">${entities}</div>`:''}
+    ${task.notes?`<div class="ent-sec">Заметки игрока</div><div class="ent-summary">${_entEsc(task.notes)}</div>`:''}
+    <div class="ent-sec">Карточка задания</div>
+    <textarea class="quest-card-textarea" id="quest-card-desc" placeholder="Что происходит в этом квесте, зачем он нужен, что важно помнить...">${_entEsc(d.description||'')}</textarea>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="ent-merge-btn" onclick="saveTaskCard('${_jsEsc(tid)}',false)">Сохранить</button>
+      ${aiBtn}
+      <button class="ent-merge-btn" onclick="toggleTaskCurrent('${_jsEsc(tid)}','${_jsEsc(mid)}',${task.is_current?'false':'true'})">${task.is_current?'Убрать из актуальных':'В актуальные'}</button>
+    </div>`;
+  document.getElementById('ent-modal').classList.add('open');
+}
+async function saveTaskCard(tid,improve=false){
+  const ta=document.getElementById('quest-card-desc');
+  if(!ta) return;
+  const old=ta.value;
+  if(improve) ta.value='Архивариус переписывает карточку...';
+  const r=await fetch(`/tasks/${tid}/card`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({description:old,improve})});
+  if(!r.ok){ta.value=old;return;}
+  const d=await r.json();
+  ta.value=d.description||old;
+  const active=document.querySelector('section.active');
+  if(active?.id==='s-missions') loadMissions();
+  loadAsides();
 }
 
 // ── Ingest ───────────────────────────────────────────────────────────────────
@@ -4183,14 +4554,18 @@ async function loadMissions(){
     const branchId=t.branch_id||defaultBranchId(m);
     const childHtml=(tree[t.id]||[]).map(ch=>renderTask(ch,m,tree)).join('');
     const badge=`<span class="quest-kind ${kindClass(kind)}">${kindTitle(kind)}</span>`;
+    const currentBadge=t.is_current?`<span class="quest-kind">актуально</span>`:'';
     const title=`<div class="quest-title ${isDone?'done':''}" id="qtitle-${t.id}">${htmlEsc(t.title)}</div>`;
     const noteHtml=notes?`<div class="quest-note-preview">${htmlEsc(notes.split('\n').slice(-1)[0])}</div>`:'';
     const addChild=`<button class="quest-tool" onclick="openTaskDlg('${jsArg(m.id)}','${jsArg(branchId)}','${jsArg(t.id)}');event.stopPropagation()">+ шаг</button>`;
     const noteBtn=`<button class="quest-tool" onclick="addTaskNote('${jsArg(t.id)}','${jsArg(m.id)}');event.stopPropagation()">заметка</button>`;
+    const cardBtn=`<button class="quest-tool" onclick="openTaskCard('${jsArg(t.id)}');event.stopPropagation()">карточка</button>`;
+    const currentBtn=`<button class="quest-tool ${t.is_current?'current':''}" onclick="toggleTaskCurrent('${jsArg(t.id)}','${jsArg(m.id)}',${t.is_current?'false':'true'});event.stopPropagation()">${t.is_current?'★ актуально':'☆ в актуальные'}</button>`;
     const editBtn=`<button class="btn-edit-inline" onclick="editTask('${jsArg(t.id)}');event.stopPropagation()" title="Переименовать">✎</button>`;
     const delBtn=`<button class="quest-del" onclick="deleteTask('${jsArg(t.id)}','${jsArg(m.id)}')" title="Удалить">×</button>`;
+    const recordHtml=t.record_enabled?`<span class="quest-record">рекорд: ${kind==='timer'?fmtDuration(t.record_value||0):Number(t.record_value||0).toLocaleString('ru-RU')}</span>`:'';
     let lead='';
-    let controls=`<div class="quest-tools">${addChild}${noteBtn}</div>`;
+    let controls=`<div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
 
     if(kind==='ritual'){
       const cycled=t.current_iters>=t.required_iters;
@@ -4200,24 +4575,24 @@ async function loadMissions(){
         <span class="streak-display">${streakMythName(t.streak)}</span>
         <span class="streak-best">рекорд: ${t.best_streak||0}</span>
         <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
-      </div><div class="quest-tools">${addChild}${noteBtn}</div>`;
+      </div><div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
     } else if(kind==='timer'){
       const running=!!t.timer_started_ts;
       controls=`<div class="quest-progress-line">
         <button class="quest-tool ${running?'running':'primary'}" onclick="${running?`stopTimer('${jsArg(t.id)}','${jsArg(m.id)}')`:`startTimer('${jsArg(t.id)}','${jsArg(m.id)}')`};event.stopPropagation()">${running?'стоп':'старт'}</button>
-        <span>всего ${fmtDuration(t.timer_total_seconds||0)}</span>
-      </div><div class="quest-tools">${addChild}${noteBtn}</div>`;
+        <span>всего ${fmtDuration(t.timer_total_seconds||0)}</span>${recordHtml}
+      </div><div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
     } else if(kind==='counter'){
       const p=taskProgress(t);
       controls=`<div class="quest-progress-line">
         <button class="quest-tool primary" onclick="progressTask('${jsArg(t.id)}','${jsArg(m.id)}',1);event.stopPropagation()">+1</button>
-        <span class="quest-progress-count ${p.done?'done':''}">${p.shown}/${p.shownTarget}</span>
-      </div><div class="quest-tools">${addChild}${noteBtn}</div>`;
+        <span class="quest-progress-count ${p.done?'done':''}">${p.shown}/${p.shownTarget}</span>${recordHtml}
+      </div><div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
     } else {
       lead=`<div class="quest-cb ${isDone?'done':''}" onclick="doneTask('${jsArg(t.id)}','${jsArg(m.id)}')">${isDone?'✓':''}</div>`;
     }
 
-    return `<div class="quest-node" draggable="true"
+    return `<div class="quest-node ${t.is_current?'current':''}" draggable="true"
       ondragstart="dragTaskStart(event,'${jsArg(t.id)}','${jsArg(m.id)}')"
       ondragend="dragTaskEnd(event)"
       ondragover="dragTaskOverTask(event,'${jsArg(t.id)}')"
@@ -4226,7 +4601,7 @@ async function loadMissions(){
       <div class="quest-item ${kind==='ritual'?'repeat-task':''}">
         ${lead}
         <div class="quest-info">
-          <div class="quest-meta">${badge}${t.locked?'<span class="quest-kind">закрыто</span>':''}</div>
+          <div class="quest-meta">${badge}${currentBadge}${t.locked?'<span class="quest-kind">закрыто</span>':''}</div>
           ${title}
           ${noteHtml}
           ${controls}
@@ -4366,6 +4741,11 @@ function openTaskDlg(mid,branchId='',parentId=''){
   document.getElementById('t-parent').value=parentId||'';
   document.getElementById('task-dlg-title').textContent=parentId?'Добавить шаг':'Добавить квест';
   document.getElementById('t-title').value='';
+  document.getElementById('t-iters').value='1';
+  document.getElementById('t-hours').value='24';
+  document.getElementById('t-target').value='1';
+  document.getElementById('t-current').checked=false;
+  document.getElementById('t-record').checked=false;
   const taskRadio=document.querySelector('input[name="t-kind"][value="task"]');
   if(taskRadio) taskRadio.checked=true;
   toggleTaskKindOpts();
@@ -4386,11 +4766,13 @@ async function saveTask(){
   const taskType=kind==='ritual'?'repeat':'once';
   const progressMode=kind==='ritual'?'count':kind==='timer'?'timer':kind==='counter'?'number':'check';
   const targetValue=kind==='ritual'?iters:(kind==='counter'?target:1);
+  const current=document.getElementById('t-current')?.checked||false;
+  const record=!!document.getElementById('t-record')?.checked&&(kind==='timer'||kind==='counter');
   await fetch('/tasks',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({
       mission_id:mid,title:t,task_type:taskType,required_iters:iters,reset_hours:hours,
       quest_kind:kind,progress_mode:progressMode,branch_id:branchId,parent_id:parentId,
-      target_value:targetValue
+      target_value:targetValue,is_current:current,record_enabled:record
     })});
   closeDlg('task-dlg');
   document.getElementById('t-title').value='';
@@ -4398,11 +4780,11 @@ async function saveTask(){
   if(taskRadio) taskRadio.checked=true;
   toggleTaskKindOpts();
   _openMissions.add(mid);
-  loadMissions();
+  loadMissions(); loadAsides();
 }
 async function tickTask(tid,mid){
   await fetch(`/tasks/${tid}/tick`,{method:'POST'});
-  _openMissions.add(mid); loadMissions();
+  _openMissions.add(mid); loadMissions(); loadAsides();
 }
 function toggleTaskKindOpts(){
   const kind=document.querySelector('input[name="t-kind"]:checked')?.value||'task';
@@ -4412,6 +4794,8 @@ function toggleTaskKindOpts(){
   if(counter) counter.style.display=kind==='counter'?'block':'none';
   const timer=document.getElementById('t-timer-opts');
   if(timer) timer.style.display=kind==='timer'?'block':'none';
+  const record=document.getElementById('t-record-row');
+  if(record) record.style.display=(kind==='timer'||kind==='counter')?'flex':'none';
 }
 function toggleRepeatOpts(){
   toggleTaskKindOpts();
@@ -4443,22 +4827,22 @@ async function deleteBranch(bid,mid){
 async function progressTask(tid,mid,delta){
   await fetch(`/tasks/${tid}/progress`,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({delta})});
-  _openMissions.add(mid); loadMissions();
+  _openMissions.add(mid); loadMissions(); loadAsides();
 }
 async function startTimer(tid,mid){
   await fetch(`/tasks/${tid}/timer/start`,{method:'POST'});
-  _openMissions.add(mid); loadMissions();
+  _openMissions.add(mid); loadMissions(); loadAsides();
 }
 async function stopTimer(tid,mid){
   await fetch(`/tasks/${tid}/timer/stop`,{method:'POST'});
-  _openMissions.add(mid); loadMissions();
+  _openMissions.add(mid); loadMissions(); loadAsides();
 }
 async function addTaskNote(tid,mid){
   const note=prompt('Заметка к квесту');
   if(!note||!note.trim()) return;
   await fetch(`/tasks/${tid}/note`,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({note:note.trim()})});
-  _openMissions.add(mid); loadMissions();
+  _openMissions.add(mid); loadMissions(); loadAsides();
 }
 function fmtDuration(seconds){
   seconds=Math.max(0,parseInt(seconds||0));
@@ -4469,19 +4853,19 @@ function fmtDuration(seconds){
   return '0м';
 }
 async function doneMission(id){
-  await fetch(`/missions/${id}/complete`,{method:'POST'}); loadMissions();
+  await fetch(`/missions/${id}/complete`,{method:'POST'}); loadMissions(); loadAsides();
 }
 async function deleteMission(id){
   if(!confirm('Удалить этот путь и все его задания?')) return;
-  await fetch(`/missions/${id}/delete`,{method:'POST'}); loadMissions();
+  await fetch(`/missions/${id}/delete`,{method:'POST'}); loadMissions(); loadAsides();
 }
 async function doneTask(tid,mid){
   await fetch(`/tasks/${tid}/complete`,{method:'POST'});
-  _openMissions.add(mid); loadMissions();
+  _openMissions.add(mid); loadMissions(); loadAsides();
 }
 async function deleteTask(tid,mid){
   await fetch(`/tasks/${tid}/delete`,{method:'POST'});
-  _openMissions.add(mid); loadMissions();
+  _openMissions.add(mid); loadMissions(); loadAsides();
 }
 
 // ── Inline edit ───────────────────────────────────────────────────────────────
@@ -4529,7 +4913,7 @@ async function saveTaskEdit(tid){
   await fetch(`/tasks/${tid}/update`,{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({title:val})});
-  loadMissions();
+  loadMissions(); loadAsides();
 }
 
 // ── Base of Knowledge ─────────────────────────────────────────────────────────
