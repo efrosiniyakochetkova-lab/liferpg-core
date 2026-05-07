@@ -11,9 +11,11 @@ import kuzu
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).parent
+_STATIC_DIR = Path(__file__).parent / "static"
 APP_CFG_FILE = _DATA_DIR / "app_config.json"
 
 def _app_cfg():
@@ -816,6 +818,7 @@ def write_entry(raw, data, user_id: str = "admin"):
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI()
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 # ── Auth endpoints ───────────────────────────────────────────────────────────
 class AuthReq(BaseModel): login: str; password: str
@@ -2758,6 +2761,63 @@ main{grid-column:2;grid-row:2;overflow:hidden;position:relative;min-width:0;min-
 section{display:none;height:100%;overflow-y:auto;min-width:0}
 section.active{display:block}
 
+/* ── LOGIN GATE ── */
+#login-screen{display:none;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;
+  overflow:hidden;background:#030303;color:#e9d2a2;font-family:'Georgia',serif}
+#login-screen::before{content:"";position:absolute;inset:-12%;
+  background:
+    radial-gradient(circle at 50% 42%,rgba(194,141,54,.18),transparent 28%),
+    radial-gradient(circle at 50% 52%,rgba(255,220,140,.075),transparent 18%),
+    radial-gradient(circle at 20% 20%,rgba(115,75,28,.10),transparent 30%),
+    radial-gradient(circle at 78% 74%,rgba(120,70,24,.10),transparent 34%),
+    linear-gradient(180deg,#020202,#090604 46%,#010101);
+  filter:saturate(1.05);pointer-events:none}
+#login-screen::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(ellipse at center,transparent 0%,rgba(0,0,0,.18) 44%,rgba(0,0,0,.82) 100%);
+  mix-blend-mode:multiply}
+#ls-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.login-shell{position:relative;z-index:2;width:min(92vw,860px);display:grid;grid-template-columns:minmax(0,1fr) 320px;
+  gap:48px;align-items:center;padding:38px}
+.login-sigil{justify-self:center;text-align:center;min-width:0}
+.login-mark{font-size:clamp(36px,5vw,76px);line-height:.96;letter-spacing:7px;color:#f0d8a6;
+  text-shadow:0 0 18px rgba(202,148,58,.42),0 0 70px rgba(202,148,58,.22)}
+.login-sub{margin-top:16px;font-family:sans-serif;font-size:10px;letter-spacing:7px;text-transform:uppercase;
+  color:rgba(220,174,94,.64)}
+.login-oath{margin:34px auto 0;max-width:440px;color:rgba(241,219,178,.78);font-size:17px;line-height:1.8;
+  text-shadow:0 0 28px rgba(0,0,0,.9)}
+.login-oath span{color:#f1d9a3}
+.login-panel{position:relative;background:linear-gradient(180deg,rgba(17,12,7,.72),rgba(8,6,4,.70));
+  border:1px solid rgba(214,164,81,.28);box-shadow:0 18px 60px rgba(0,0,0,.55),inset 0 0 42px rgba(205,142,50,.055);
+  backdrop-filter:blur(12px);padding:26px 28px 28px;border-radius:4px}
+.login-panel::before{content:"";position:absolute;left:18px;right:18px;top:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(255,220,145,.58),transparent)}
+.login-tabs{display:flex;margin-bottom:22px;border-bottom:1px solid rgba(214,164,81,.22)}
+.login-tab{flex:1;padding:0 0 11px;border:none;background:transparent;color:rgba(222,184,115,.58);
+  font-family:'Georgia',serif;font-size:13px;cursor:pointer;letter-spacing:.7px}
+.login-tab.active{color:#f2d59a;text-shadow:0 0 18px rgba(207,151,61,.36)}
+.login-input{width:100%;background:rgba(255,255,255,.045);border:1px solid rgba(214,164,81,.22);
+  color:#f2dfbb;font-family:'Georgia',serif;font-size:15px;padding:12px 13px;border-radius:3px;outline:none;margin-bottom:11px;
+  transition:border-color .18s,box-shadow .18s,background .18s}
+.login-input:focus{border-color:rgba(244,198,105,.58);box-shadow:0 0 0 2px rgba(204,148,58,.13),0 0 28px rgba(204,148,58,.10);
+  background:rgba(255,255,255,.065)}
+.login-input::placeholder{color:rgba(213,176,111,.42)}
+#ls-err{font-size:12px;color:#d87b62;font-family:sans-serif;min-height:18px;margin-bottom:9px}
+#ls-btn{width:100%;border:1px solid rgba(245,198,110,.45);background:linear-gradient(180deg,rgba(196,139,48,.92),rgba(119,74,22,.95));
+  color:#f7e7bf;padding:12px;font-family:'Georgia',serif;font-size:14px;letter-spacing:2.6px;border-radius:3px;cursor:pointer;
+  box-shadow:0 0 34px rgba(191,127,38,.18);transition:transform .18s,box-shadow .18s,filter .18s}
+#ls-btn:hover{transform:translateY(-1px);box-shadow:0 0 46px rgba(214,151,54,.27);filter:brightness(1.08)}
+.login-audio{position:absolute;right:22px;bottom:20px;z-index:3;border:1px solid rgba(214,164,81,.24);
+  background:rgba(6,5,4,.42);color:rgba(242,213,154,.72);font-family:sans-serif;font-size:12px;
+  padding:8px 11px;border-radius:999px;cursor:pointer;backdrop-filter:blur(8px)}
+.login-audio.on{color:#f6daa1;border-color:rgba(246,205,126,.48);box-shadow:0 0 28px rgba(202,145,49,.18)}
+.login-hint{margin-top:16px;text-align:center;font-family:sans-serif;font-size:10px;letter-spacing:2px;text-transform:uppercase;
+  color:rgba(222,184,115,.42)}
+@media(max-width:820px){
+  .login-shell{grid-template-columns:1fr;gap:28px;padding:28px 18px}
+  .login-oath{display:none}
+  .login-panel{width:min(100%,340px);justify-self:center}
+}
+
 /* ── INPUT BAR ── */
 #input-bar{grid-column:2;grid-row:3;background:var(--paper2);border-top:2px solid var(--border);
   padding:12px 24px;display:flex;gap:12px;align-items:flex-end;
@@ -3965,10 +4025,8 @@ function lsTab(mode){
   const isReg=mode==='reg';
   document.getElementById('ls-pw2').style.display=isReg?'block':'none';
   document.getElementById('ls-btn').textContent=isReg?'Создать аккаунт':'Войти';
-  document.getElementById('ls-tab-login').style.background=isReg?'transparent':'rgba(180,130,60,.8)';
-  document.getElementById('ls-tab-login').style.color=isReg?'#7a6040':'#e8d5b0';
-  document.getElementById('ls-tab-reg').style.background=isReg?'rgba(180,130,60,.8)':'transparent';
-  document.getElementById('ls-tab-reg').style.color=isReg?'#e8d5b0':'#7a6040';
+  document.getElementById('ls-tab-login').classList.toggle('active',!isReg);
+  document.getElementById('ls-tab-reg').classList.toggle('active',isReg);
   document.getElementById('ls-err').textContent='';
 }
 function showLogin(){document.getElementById('login-screen').style.display='flex';lsTab('login');LoginAtmo.start();}
@@ -5741,8 +5799,8 @@ async function processPendingInbox(){
   }catch(e){}
 }
 
-// ── Login screen: Canvas + Hang Drum ─────────────────────────────────────────
-const LoginAtmo = {
+// ── Legacy login ambience kept inert for old sessions ────────────────────────
+const LegacyLoginAtmo = {
   _raf: null, _actx: null, _running: false,
   _particles: [], _drops: [],
 
@@ -5925,6 +5983,232 @@ const LoginAtmo = {
   }
 };
 
+// ── Login screen: golden void gate ───────────────────────────────────────────
+const LOGIN_THEME_SRC = '/static/audio/liferpg-login-theme.m4a';
+const LoginAtmo = {
+  _raf: null, _running: false, _audio: null, _fade: null, _gesture: null, _keyGesture: null, _resize: null,
+  _particles: [], _w: 0, _h: 0, _dpr: 1,
+
+  _audioEl() {
+    if(!this._audio){
+      this._audio = new Audio(LOGIN_THEME_SRC);
+      this._audio.loop = true;
+      this._audio.preload = 'metadata';
+      this._audio.volume = 0;
+    }
+    return this._audio;
+  },
+
+  _setAudioUi(on, busy=false) {
+    const b=document.getElementById('ls-audio-btn');
+    if(!b) return;
+    b.classList.toggle('on', !!on);
+    b.textContent = busy ? 'звук входит' : (on ? 'звук включен' : 'включить звук');
+  },
+
+  _fadeAudio(target, done) {
+    const audio=this._audioEl();
+    if(this._fade) cancelAnimationFrame(this._fade);
+    const start=audio.volume || 0;
+    const t0=performance.now();
+    const dur=target>start ? 1800 : 700;
+    const step=(now)=>{
+      const k=Math.min(1,(now-t0)/dur);
+      const ease=1-Math.pow(1-k,3);
+      audio.volume=Math.max(0,Math.min(0.46,start+(target-start)*ease));
+      if(k<1) this._fade=requestAnimationFrame(step);
+      else { this._fade=null; if(done) done(); }
+    };
+    this._fade=requestAnimationFrame(step);
+  },
+
+  playAudio() {
+    const audio=this._audioEl();
+    this._unarmAudioGesture();
+    this._setAudioUi(false,true);
+    audio.play().then(()=>{
+      this._fadeAudio(0.42,()=>this._setAudioUi(true));
+    }).catch(()=>{
+      this._setAudioUi(false);
+    });
+  },
+
+  pauseAudio() {
+    if(!this._audio) return;
+    this._fadeAudio(0,()=>{
+      if(this._audio) this._audio.pause();
+      this._setAudioUi(false);
+    });
+  },
+
+  toggleAudio(ev) {
+    if(ev) ev.stopPropagation();
+    const audio=this._audioEl();
+    if(audio.paused) this.playAudio();
+    else this.pauseAudio();
+  },
+
+  _armAudioGesture() {
+    this._unarmAudioGesture();
+    this._gesture=(ev)=>{
+      if(ev.target?.closest?.('.login-audio')) return;
+      this.playAudio();
+    };
+    this._keyGesture=()=>this.playAudio();
+    const screen=document.getElementById('login-screen');
+    if(screen) screen.addEventListener('pointerdown',this._gesture);
+    document.addEventListener('keydown',this._keyGesture);
+  },
+
+  _unarmAudioGesture() {
+    const screen=document.getElementById('login-screen');
+    if(screen && this._gesture) screen.removeEventListener('pointerdown',this._gesture);
+    if(this._keyGesture) document.removeEventListener('keydown',this._keyGesture);
+    this._gesture=null; this._keyGesture=null;
+  },
+
+  _initParticles(W, H) {
+    this._particles = [];
+    const count=Math.min(120,Math.max(42,Math.floor(W*H/17000)));
+    for(let i=0;i<count;i++) this._particles.push({
+      x: Math.random()*W, y: Math.random()*H,
+      r: Math.random()*1.45+0.25,
+      vx: (Math.random()-.5)*0.055,
+      vy: (Math.random()-.5)*0.045,
+      a: Math.random()*0.23+0.035,
+      phase: Math.random()*Math.PI*2
+    });
+  },
+
+  _drawFrame(canvas, ctx2d, t) {
+    const W=this._w, H=this._h, min=Math.min(W,H), cx=W*0.5, cy=H*0.48;
+    const s=t*0.001;
+    ctx2d.setTransform(this._dpr,0,0,this._dpr,0,0);
+    ctx2d.clearRect(0,0,W,H);
+    let bg=ctx2d.createRadialGradient(cx,cy,0,cx,cy,min*.82);
+    bg.addColorStop(0,'rgba(31,21,9,.58)');
+    bg.addColorStop(.34,'rgba(7,5,3,.84)');
+    bg.addColorStop(1,'rgba(0,0,0,1)');
+    ctx2d.fillStyle=bg; ctx2d.fillRect(0,0,W,H);
+
+    ctx2d.save();
+    ctx2d.globalCompositeOperation='lighter';
+    for(let h=0;h<3;h++){
+      const hx=cx+Math.cos(s*.08+h*2.1)*min*.18;
+      const hy=cy+Math.sin(s*.07+h*1.7)*min*.12;
+      const g=ctx2d.createRadialGradient(hx,hy,0,hx,hy,min*(.24+h*.11));
+      g.addColorStop(0,`rgba(210,151,57,${.055-h*.012})`);
+      g.addColorStop(1,'rgba(210,151,57,0)');
+      ctx2d.fillStyle=g; ctx2d.fillRect(0,0,W,H);
+    }
+
+    this._particles.forEach(p=>{
+      p.x+=p.vx+Math.cos(s*.18+p.phase)*.01;
+      p.y+=p.vy+Math.sin(s*.16+p.phase)*.01;
+      if(p.y<-8)p.y=H+8; if(p.y>H+8)p.y=-8;
+      if(p.x<-8)p.x=W+8; if(p.x>W+8)p.x=-8;
+      const flicker=.58+.42*Math.sin(s*.9+p.phase);
+      ctx2d.beginPath();
+      ctx2d.arc(p.x,p.y,p.r,0,Math.PI*2);
+      ctx2d.fillStyle=`rgba(229,183,91,${p.a*flicker})`;
+      ctx2d.fill();
+    });
+
+    ctx2d.translate(cx,cy);
+    ctx2d.lineCap='round';
+    ctx2d.lineJoin='round';
+    ctx2d.shadowColor='rgba(235,177,72,.42)';
+    ctx2d.shadowBlur=14;
+    const segments=12;
+    const angle=Math.PI*2/segments;
+    for(let layer=0;layer<7;layer++){
+      const base=min*(.075+layer*.045);
+      const len=min*(.17+layer*.036);
+      const drift=s*(layer%2?-0.034:0.026)*(1+layer*.12);
+      const alpha=.095-layer*.009;
+      ctx2d.strokeStyle=`rgba(241,192,102,${alpha})`;
+      ctx2d.fillStyle=`rgba(203,139,45,${alpha*.12})`;
+      ctx2d.lineWidth=Math.max(.55,1.12-layer*.055);
+      for(let i=0;i<segments;i++){
+        ctx2d.save();
+        ctx2d.rotate(i*angle+drift);
+        if(i%2) ctx2d.scale(1,-1);
+        const wob=Math.sin(s*.32+layer+i*.37)*min*.006;
+        const spread=min*(.02+layer*.005);
+        ctx2d.beginPath();
+        ctx2d.moveTo(base+wob,0);
+        ctx2d.lineTo(base+len*.58,spread);
+        ctx2d.lineTo(base+len*.92,0);
+        ctx2d.lineTo(base+len*.58,-spread);
+        ctx2d.closePath();
+        ctx2d.stroke();
+        if(layer%2===0) ctx2d.fill();
+        ctx2d.beginPath();
+        ctx2d.moveTo(base*.62,0);
+        ctx2d.lineTo(base+len*.78,0);
+        ctx2d.stroke();
+        ctx2d.restore();
+      }
+    }
+    ctx2d.shadowBlur=22;
+    for(let r=0;r<5;r++){
+      const rad=min*(.105+r*.088)+Math.sin(s*.28+r)*min*.007;
+      ctx2d.beginPath();
+      ctx2d.arc(0,0,rad,0,Math.PI*2);
+      ctx2d.strokeStyle=`rgba(246,207,128,${.12-r*.017})`;
+      ctx2d.lineWidth=.75;
+      ctx2d.stroke();
+    }
+    ctx2d.shadowBlur=30;
+    ctx2d.beginPath();
+    ctx2d.arc(0,0,min*.036+Math.sin(s*.7)*min*.003,0,Math.PI*2);
+    ctx2d.fillStyle='rgba(255,222,142,.22)';
+    ctx2d.fill();
+    ctx2d.restore();
+
+    const vign=ctx2d.createRadialGradient(cx,cy,min*.18,cx,cy,min*.82);
+    vign.addColorStop(0,'rgba(0,0,0,0)');
+    vign.addColorStop(.68,'rgba(0,0,0,.24)');
+    vign.addColorStop(1,'rgba(0,0,0,.88)');
+    ctx2d.fillStyle=vign; ctx2d.fillRect(0,0,W,H);
+  },
+
+  start() {
+    if(this._running) return;
+    this._running = true;
+    const canvas = document.getElementById('ls-canvas');
+    if(!canvas) return;
+    const reduce=window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
+    this._resize=()=>{
+      this._w=window.innerWidth; this._h=window.innerHeight;
+      this._dpr=Math.min(2,window.devicePixelRatio||1);
+      canvas.width=Math.floor(this._w*this._dpr);
+      canvas.height=Math.floor(this._h*this._dpr);
+      canvas.style.width=this._w+'px'; canvas.style.height=this._h+'px';
+      this._initParticles(this._w,this._h);
+    };
+    this._resize(); window.addEventListener('resize',this._resize);
+    const ctx2d = canvas.getContext('2d');
+    const loop=()=>{
+      if(!this._running){ctx2d.clearRect(0,0,canvas.width,canvas.height);return;}
+      this._drawFrame(canvas,ctx2d,performance.now());
+      if(!reduce) this._raf=requestAnimationFrame(loop);
+    };
+    this._raf=requestAnimationFrame(loop);
+    this._audioEl();
+    this._setAudioUi(false);
+    this._armAudioGesture();
+  },
+
+  stop() {
+    this._running=false;
+    if(this._raf) cancelAnimationFrame(this._raf);
+    if(this._resize) window.removeEventListener('resize',this._resize);
+    this._unarmAudioGesture();
+    this.pauseAudio();
+  }
+};
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 function bootLifeRpg(){
   checkApiStatus();
@@ -5948,37 +6232,30 @@ if(document.readyState==='loading'){
   bootLifeRpg();
 }
 </script>
-<div id="login-screen" style="display:none;position:fixed;inset:0;z-index:9999;
-  background:#0e0a06;align-items:center;justify-content:center;flex-direction:column">
-  <canvas id="ls-canvas" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none"></canvas>
-  <div style="text-align:center;margin-bottom:28px;position:relative;z-index:1">
-    <div style="font-size:32px;font-family:'Georgia',serif;color:#e8d5b0;letter-spacing:4px;text-shadow:0 0 40px rgba(180,130,60,.5)">Life RPG</div>
-    <div style="font-size:10px;color:#7a6040;letter-spacing:6px;text-transform:uppercase;margin-top:6px">живая летопись</div>
-  </div>
-  <div style="background:rgba(20,14,6,.85);border:1px solid rgba(180,140,70,.25);border-radius:6px;
-    padding:32px 40px;width:300px;box-shadow:0 8px 40px rgba(0,0,0,.6);position:relative;z-index:1;backdrop-filter:blur(8px)">
-    <div style="display:flex;gap:0;margin-bottom:20px;border:1px solid rgba(180,140,70,.2);border-radius:3px;overflow:hidden">
-      <button id="ls-tab-login" onclick="lsTab('login')" style="flex:1;padding:7px;border:none;
-        background:rgba(180,130,60,.8);color:#e8d5b0;font-family:'Georgia',serif;font-size:12px;cursor:pointer">Войти</button>
-      <button id="ls-tab-reg" onclick="lsTab('reg')" style="flex:1;padding:7px;border:none;
-        background:transparent;color:#7a6040;font-family:'Georgia',serif;font-size:12px;cursor:pointer">Создать аккаунт</button>
+<div id="login-screen">
+  <canvas id="ls-canvas"></canvas>
+  <button id="ls-audio-btn" class="login-audio" onclick="LoginAtmo.toggleAudio(event)">включить звук</button>
+  <div class="login-shell">
+    <div class="login-sigil">
+      <div class="login-mark">Life RPG</div>
+      <div class="login-sub">порог пути</div>
+      <div class="login-oath">Стоит войти один раз, и мир начнет помнить <span>твои шаги</span>.</div>
     </div>
-    <input id="ls-login" placeholder="Логин" style="width:100%;box-sizing:border-box;background:rgba(255,255,255,.05);
-      border:1px solid rgba(180,140,70,.2);color:#e8d5b0;font-family:'Georgia',serif;font-size:14px;
-      padding:9px 12px;border-radius:3px;outline:none;margin-bottom:10px"
-      onkeydown="if(event.key==='Enter')document.getElementById('ls-pw').focus()">
-    <input id="ls-pw" type="password" placeholder="Пароль" style="width:100%;box-sizing:border-box;background:rgba(255,255,255,.05);
-      border:1px solid rgba(180,140,70,.2);color:#e8d5b0;font-family:'Georgia',serif;font-size:14px;
-      padding:9px 12px;border-radius:3px;outline:none;margin-bottom:10px"
-      onkeydown="if(event.key==='Enter')lsSubmit()">
-    <input id="ls-pw2" type="password" placeholder="Повтори пароль" style="display:none;width:100%;box-sizing:border-box;
-      background:rgba(255,255,255,.05);border:1px solid rgba(180,140,70,.2);color:#e8d5b0;
-      font-family:'Georgia',serif;font-size:14px;padding:9px 12px;border-radius:3px;outline:none;margin-bottom:10px"
-      onkeydown="if(event.key==='Enter')lsSubmit()">
-    <div id="ls-err" style="font-size:12px;color:#c0614a;font-family:sans-serif;min-height:18px;margin-bottom:8px"></div>
-    <button id="ls-btn" onclick="lsSubmit()" style="width:100%;background:rgba(180,130,60,.85);color:#e8d5b0;
-      border:none;padding:11px;font-family:'Georgia',serif;font-size:14px;letter-spacing:2px;
-      border-radius:3px;cursor:pointer;transition:background .2s">Войти</button>
+    <div class="login-panel">
+      <div class="login-tabs">
+        <button id="ls-tab-login" class="login-tab active" onclick="lsTab('login')">Войти</button>
+        <button id="ls-tab-reg" class="login-tab" onclick="lsTab('reg')">Создать героя</button>
+      </div>
+      <input id="ls-login" class="login-input" placeholder="Логин"
+        onkeydown="if(event.key==='Enter')document.getElementById('ls-pw').focus()">
+      <input id="ls-pw" class="login-input" type="password" placeholder="Пароль"
+        onkeydown="if(event.key==='Enter')lsSubmit()">
+      <input id="ls-pw2" class="login-input" type="password" placeholder="Повтори пароль" style="display:none"
+        onkeydown="if(event.key==='Enter')lsSubmit()">
+      <div id="ls-err"></div>
+      <button id="ls-btn" onclick="lsSubmit()">Войти</button>
+      <div class="login-hint">войти в путь</div>
+    </div>
   </div>
 </div>
 </body>
