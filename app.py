@@ -2,7 +2,7 @@
 Life RPG — Living Narrative OS v4
 Parchment · Knowledge Graph · Колесо Миров · AI Архивариус
 """
-import json, uuid, re, subprocess, time, threading, os, hashlib, hmac, secrets
+import json, uuid, re, subprocess, time, threading, os, hashlib, hmac, secrets, math
 import urllib.request as _ur
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -376,6 +376,203 @@ def _record_quest_event(task_id: str, mission_id: str, user_id: str, event_type:
              "ts": _now_s(), "uid": user_id})
     except Exception as e:
         print(f"[quest_event] {e}")
+
+_FORCE_LEX = {
+    "receiving": {
+        "хочу": 1.0, "получ": 1.1, "взять": .95, "деньг": 1.25, "заработ": 1.25,
+        "рост": .9, "прокач": .95, "навык": .85, "опыт": .85, "сил": .8,
+        "вниман": 1.05, "охват": 1.05, "просмотр": 1.0, "подпис": 1.0, "аудитор": .55,
+        "игра": .75, "майн": .8, "minecraft": .8, "стрим": .8, "трансляц": .8,
+        "отдых": .85, "кайф": .85, "удоволь": .85, "куп": .75, "статус": .85,
+        "контент": .65, "продукт": .6, "исслед": .65, "понял": .5
+    },
+    "giving": {
+        "отда": 1.2, "помог": 1.25, "польз": 1.2, "дели": .95, "подел": .95,
+        "науч": 1.05, "обуч": 1.05, "поддерж": 1.05, "забот": 1.0, "служ": 1.05,
+        "созд": .82, "улучш": .82, "вдохнов": 1.0, "переда": 1.0, "смысл": .75,
+        "чест": .85, "команд": .8, "семь": .8, "клиент": .85, "люд": .95,
+        "аудитор": .8, "ответ": .8, "дело": .75, "благо": 1.1, "текст": .55
+    },
+    "concrete": {
+        "сдел": .9, "напис": .9, "созд": .9, "пров": .8, "помог": .9,
+        "игра": .65, "работ": .8, "уч": .65, "сня": .8, "вылож": .9,
+        "разработ": .9, "собра": .8, "проч": .65, "запуст": .8, "законч": .9,
+        "обнов": .8, "исправ": .85, "добав": .75, "поговор": .75
+    },
+    "mist": {
+        "долж": .8, "надо": .55, "обязан": .8, "застав": .85, "срыв": .8,
+        "убега": .8, "прокраст": .9, "пуст": .65, "бессмыс": .75, "винов": .75,
+        "стыд": .75, "обман": .9, "наеб": .9, "ненавиж": .8
+    }
+}
+
+def _force_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-zа-яё0-9]{3,}", (text or "").lower())
+
+def _force_hits(tokens: list[str], lex: dict) -> float:
+    score = 0.0
+    for tok in set(tokens):
+        for stem, weight in lex.items():
+            if tok.startswith(stem):
+                score += weight
+                break
+    return score
+
+def _parse_ts(ts: str):
+    try: return datetime.strptime((ts or "")[:16], "%Y-%m-%d %H:%M")
+    except: return datetime.now()
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+def _entity_force_profile(name: str, summary: str = "", tags: str = "") -> dict:
+    text = " ".join([name or "", summary or "", tags or ""])
+    toks = _force_tokens(text)
+    r = _force_hits(toks, _FORCE_LEX["receiving"])
+    g = _force_hits(toks, _FORCE_LEX["giving"])
+    return {
+        "receiving": _clamp(.35 + r * .08, .15, .95),
+        "giving": _clamp(.35 + g * .08, .15, .95)
+    }
+
+def _text_force_profile(text: str, source: str = "entry") -> dict:
+    toks = _force_tokens(text)
+    if not toks:
+        return {"receiving": .15, "giving": .15, "trust": .35}
+    unique = len(set(toks))
+    r = _force_hits(toks, _FORCE_LEX["receiving"])
+    g = _force_hits(toks, _FORCE_LEX["giving"])
+    concrete = _force_hits(toks, _FORCE_LEX["concrete"])
+    mist = _force_hits(toks, _FORCE_LEX["mist"])
+    length_factor = _clamp(math.log1p(unique) / math.log(34), .24, 1.0)
+    concrete_factor = _clamp(.42 + concrete * .13, .36, 1.0)
+    fog_penalty = _clamp(1.0 - max(0, mist - concrete * .55) * .045, .68, 1.0)
+    base = .22 if source == "entry" else .18
+    receive = _clamp(base + min(.56, r * .055) + min(.18, concrete * .025), .08, .96)
+    give = _clamp(base + min(.58, g * .06) + min(.15, concrete * .02), .08, .96)
+    trust = _clamp(length_factor * concrete_factor * fog_penalty, .18, 1.0)
+    return {"receiving": receive, "giving": give, "trust": trust}
+
+def _force_score_to_pct(v: float) -> int:
+    return int(round(_clamp(100 * (1 - math.exp(-v / 4.2)), 0, 100)))
+
+def _force_snapshot(user_id: str = "admin") -> dict:
+    now = datetime.now()
+    signals = []
+    entity_rows = kuzu_rows(_conn.execute(
+        "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.name,e.summary,e.tags LIMIT 220",
+        {"uid": user_id}))
+    entity_profiles = []
+    for name, summary, tags in entity_rows:
+        entity_profiles.append({"name": name or "", "profile": _entity_force_profile(name or "", summary or "", tags or "")})
+
+    entries = kuzu_rows(_conn.execute(
+        "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.raw_text,e.narrative,e.archivist_note,e.ts "
+        "ORDER BY e.ts DESC LIMIT 140", {"uid": user_id}))
+    seen = {}
+    for raw, narrative, note, ts in entries:
+        text = _clean_journal_text(" ".join([raw or "", narrative or "", note or ""]))
+        if not text: continue
+        toks = _force_tokens(text)
+        key = " ".join(toks[:28])
+        seen[key] = seen.get(key, 0) + 1
+        prof = _text_force_profile(text, "entry")
+        ent_boost_r = ent_boost_g = 0.0
+        nodes = []
+        low = text.lower()
+        for ep in entity_profiles:
+            n = ep["name"]
+            if len(n) >= 3 and n.lower() in low:
+                ent_boost_r += ep["profile"]["receiving"] * .045
+                ent_boost_g += ep["profile"]["giving"] * .045
+                nodes.append(n)
+        dup_penalty = 1 / math.sqrt(seen[key])
+        signals.append({
+            "kind": "entry", "ts": ts, "day": (ts or "")[:10], "source": "дневник",
+            "receiving": _clamp(prof["receiving"] + ent_boost_r, .05, 1.0),
+            "giving": _clamp(prof["giving"] + ent_boost_g, .05, 1.0),
+            "weight": 1.05 * dup_penalty, "trust": prof["trust"],
+            "text": text[:180], "nodes": nodes[:4]
+        })
+
+    tasks = {r[0]: {"title": r[1] or "", "kind": r[2] or "task"} for r in kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.id,t.title,t.quest_kind LIMIT 500", {"uid": user_id}))}
+    missions = {r[0]: r[1] or "" for r in kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.user_id=$uid RETURN m.id,m.title LIMIT 200", {"uid": user_id}))}
+    qrows = kuzu_rows(_conn.execute(
+        "MATCH (q:QuestEvent) WHERE q.user_id=$uid RETURN q.task_id,q.mission_id,q.event_type,q.value,q.note,q.ts "
+        "ORDER BY q.ts DESC LIMIT 220", {"uid": user_id}))
+    event_weight = {
+        "completed": 1.55, "timer_stopped": 1.25, "tick": .58, "progress": .82,
+        "note": .62, "created": .22, "moved": .18, "timer_started": .10
+    }
+    for tid, mid, etype, value, note, ts in qrows:
+        task = tasks.get(tid or "", {})
+        title = task.get("title", "")
+        mission = missions.get(mid or "", "")
+        text = " ".join([title, mission, note or "", etype or ""])
+        prof = _text_force_profile(text, "quest")
+        val = float(value or 0)
+        kind = task.get("kind", "task")
+        w = event_weight.get(etype or "", .45)
+        if etype == "timer_stopped":
+            minutes = max(1, val / 60.0)
+            w *= _clamp(math.log1p(minutes) / math.log(91), .38, 1.65)
+            prof["receiving"] = _clamp(prof["receiving"] + .16, .05, 1.0)
+        if etype in ("completed", "progress", "tick"):
+            prof["giving"] = _clamp(prof["giving"] + (0.08 if kind in ("task","ritual") else 0.04), .05, 1.0)
+        if kind == "counter":
+            prof["receiving"] = _clamp(prof["receiving"] + .06, .05, 1.0)
+        signals.append({
+            "kind": "quest", "ts": ts, "day": (ts or "")[:10], "source": "квест",
+            "receiving": prof["receiving"], "giving": prof["giving"],
+            "weight": w, "trust": _clamp(.62 + prof["trust"] * .38, .25, 1.0),
+            "text": (title or etype or "квест")[:180], "nodes": [mission] if mission else []
+        })
+
+    day_totals = {}
+    for s in signals:
+        day_totals[s["day"]] = day_totals.get(s["day"], 0) + s["weight"]
+    total_r = total_g = total_w = suspicion = 0.0
+    node_power = {}
+    day_set, quest_texts = set(), set()
+    for s in signals:
+        dt = _parse_ts(s["ts"])
+        age = max(0, (now - dt).days)
+        decay = math.exp(-age / 46)
+        cap = min(1.0, 14.0 / max(1.0, day_totals.get(s["day"], 1)))
+        trust = s["trust"]
+        w = s["weight"] * decay * cap * (.48 + .52 * trust)
+        total_r += s["receiving"] * w
+        total_g += s["giving"] * w
+        total_w += w
+        suspicion += (1 - trust) * w
+        if s["day"]: day_set.add(s["day"])
+        if s["kind"] == "quest": quest_texts.add(s["text"])
+        for n in s.get("nodes", []):
+            if n:
+                np = node_power.setdefault(n, {"receiving": 0.0, "giving": 0.0})
+                np["receiving"] += s["receiving"] * w
+                np["giving"] += s["giving"] * w
+    diversity = _clamp((len(day_set) ** .45 + len(quest_texts) ** .32) / 4.2, .55, 1.08)
+    integrity = _clamp(1 - (suspicion / max(total_w, .001)) * .75, .35, 1.0)
+    total_r *= diversity * (.64 + .36 * integrity)
+    total_g *= diversity * (.64 + .36 * integrity)
+    receiving = _force_score_to_pct(total_r)
+    giving = _force_score_to_pct(total_g)
+    top_nodes = sorted(
+        [{"name": k, "receiving": round(v["receiving"], 2), "giving": round(v["giving"], 2)}
+         for k, v in node_power.items()],
+        key=lambda x: x["receiving"] + x["giving"], reverse=True)[:5]
+    balance = "равновесие"
+    if receiving - giving >= 14: balance = "сильное получение"
+    elif giving - receiving >= 14: balance = "сильная отдача"
+    return {
+        "receiving": receiving, "giving": giving, "balance": balance,
+        "integrity": int(round(integrity * 100)), "signals": len(signals),
+        "days": len(day_set), "top_nodes": top_nodes,
+        "updated_ts": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
 
 def _timer_effective_seconds(total: int, started_ts: str) -> int:
     total = int(total or 0)
@@ -1377,8 +1574,11 @@ def entity_card(name: str, u: dict = Depends(current_user)):
         "MATCH (en:Entry)-[:MENTIONS]->(et:Entity) WHERE et.id=$id"
         " AND en.user_id=$uid AND et.user_id=$uid RETURN en.ts,en.narrative,en.archivist_note ORDER BY en.ts DESC LIMIT 5",
         {"id":eid,"uid":uid}))
+    try: tags=json.loads(base[0][3]) if base[0][3] else []
+    except: tags=base[0][3].split(',') if base[0][3] else []
     return {"name":base[0][0],"type":base[0][1],"summary":base[0][2],
-            "tags":json.loads(base[0][3]) if base[0][3] else [],
+            "tags":tags,
+            "force_profile":_entity_force_profile(base[0][0] or "", base[0][2] or "", json.dumps(tags,ensure_ascii=False)),
             "links_out":[{"from":r[0],"label":r[1],"to":r[2]} for r in out],
             "links_in": [{"from":r[0],"label":r[1],"to":r[2]} for r in inp],
             "mentions":  [{"ts":r[0],"narrative":r[1],"archivist_note":r[2]} for r in ment]}
@@ -2410,11 +2610,33 @@ def oracle(req: OracleReq, u: dict = Depends(current_user)):
     mission_lines="\n".join(f"- {r[0]}: {r[1] or ''}" for r in missions) or "нет активных путей"
 
     type_labels={"moon":"Фаза луны","season":"Сезон","patron":"Покровитель",
-                 "epoch":"Эпоха","moon_name":"Луна сезона","stat":"Стат Героя"}
+                 "epoch":"Эпоха","moon_name":"Луна сезона","stat":"Стат Героя",
+                 "force":"Сила Героя"}
     label=type_labels.get(req.mechanic_type, req.mechanic_type)
     effect_line=f"\nЛорное значение: {req.mechanic_effect}" if req.mechanic_effect else ""
 
-    if req.mechanic_type=="stat":
+    if req.mechanic_type=="force":
+        forces=_force_snapshot(uid)
+        force_name="Получение" if req.mechanic_value=="receiving" else "Отдача"
+        other_name="Отдача" if req.mechanic_value=="receiving" else "Получение"
+        current=forces.get(req.mechanic_value,0)
+        other=forces.get("giving" if req.mechanic_value=="receiving" else "receiving",0)
+        nodes=", ".join(n["name"] for n in forces.get("top_nodes",[])[:4]) or "нет явных узлов"
+        p=f"""Ты — наставник Life RPG. Это не мораль и не запрет. Говори как мастер, который показывает Герою силу выбранного пути.
+
+Выбранная сила: {force_name} ({current}/100)
+Другая сила: {other_name} ({other}/100)
+Равновесие: {forces.get('balance')}
+Узлы, через которые идут силы: {nodes}
+
+Последние записи Героя:
+{entry_lines}
+
+Пути:
+{mission_lines}
+
+Дай наставление Пути {force_name}: 3-5 предложений, без списков, без "надо", без религиозных слов. Не запрещай противоположную силу. Покажи, как этой силой можно играть глубже и сильнее, чтобы Герой сам захотел сделать следующий ход."""
+    elif req.mechanic_type=="stat":
         stat_meta=next((s for s in HERO_STATS if s["id"]==req.mechanic_value),None)
         stat_name=stat_meta["name"] if stat_meta else req.mechanic_value
         stat_ai=stat_meta["ai"] if stat_meta else ""
@@ -2446,6 +2668,10 @@ def oracle(req: OracleReq, u: dict = Depends(current_user)):
 Дай откровение (3-4 предложения): что означает {req.mechanic_value} для этого конкретного Героя прямо сейчас. Связь с его реальными делами и путями обязательна."""
     text=_call_any_ai(p)
     return {"text":text.strip()}
+
+@app.get("/forces")
+def forces(u: dict = Depends(current_user)):
+    return _force_snapshot(_uid(u))
 
 @app.get("/config/status")
 def config_status():
@@ -3242,21 +3468,23 @@ section.active{display:block}
   cursor:pointer;transition:all .15s;white-space:nowrap}
 .sound-btn:hover{border-color:var(--gold);color:var(--gold)}
 .sound-btn.on{border-color:var(--gold);color:var(--gold);background:rgba(138,92,42,.07)}
-/* ── CHARACTER STATS SIDEBAR ── */
+/* ── TWO FORCES SIDEBAR ── */
 .char-section{margin-top:4px;padding-top:14px;border-top:1px solid var(--border2)}
-.stat-row{display:flex;align-items:center;gap:8px;padding:7px 0;
-  cursor:pointer;border-bottom:.5px solid var(--border2);transition:opacity .12s}
-.stat-row:last-of-type{border-bottom:none}
-.stat-row:hover{opacity:.75}
-.stat-name{font-size:12px;color:var(--ink);font-family:sans-serif;
-  width:82px;flex-shrink:0;font-weight:600}
-.stat-bar-wrap{flex:1;height:3px;background:var(--border2);border-radius:2px;overflow:hidden}
-.stat-bar{height:3px;border-radius:2px;transition:width .8s ease;width:0%}
-.stat-val{font-size:10px;font-family:sans-serif;color:var(--ink3);
-  width:24px;text-align:right;flex-shrink:0}
-.char-analyze-btn{font-size:10px;font-family:sans-serif;color:var(--ink3);
-  cursor:pointer;padding:6px 0 2px;transition:color .12s;display:block}
-.char-analyze-btn:hover{color:var(--gold)}
+.force-card{position:relative;padding:10px 0 2px}
+.force-row{cursor:pointer;margin-bottom:13px}
+.force-top{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:6px}
+.force-name{font-size:12px;color:var(--ink);font-family:sans-serif;font-weight:700;letter-spacing:.4px}
+.force-val{font-size:11px;font-family:sans-serif;color:var(--ink3);font-weight:700}
+.force-bar-wrap{height:9px;background:rgba(44,35,24,.09);border:1px solid var(--border2);
+  border-radius:2px;overflow:hidden;box-shadow:inset 0 1px 2px rgba(44,35,24,.12)}
+.force-bar{height:100%;width:0%;transition:width .7s ease}
+.force-bar.receiving{background:linear-gradient(90deg,#59140f,#a92f22,#d78348)}
+.force-bar.giving{background:linear-gradient(90deg,#102b4a,#1f628f,#d5a64a)}
+.force-row:hover .force-bar-wrap{border-color:var(--gold)}
+.force-balance{display:flex;justify-content:space-between;gap:8px;margin-top:2px;
+  color:var(--ink3);font-family:sans-serif;font-size:10px;line-height:1.35}
+.force-node{margin-top:7px;color:var(--ink3);font-family:sans-serif;font-size:10px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* ── PAST MOON MEMORY ── */
 .past-moon-block{margin:0 0 28px;padding:12px 16px;background:var(--paper2);
   border-left:2px solid var(--border2);font-family:'Georgia',serif}
@@ -3385,7 +3613,7 @@ section.active{display:block}
     border-radius:4px;padding:10px;
   }
   .aside-bottom{flex:0 0 150px;display:flex;align-items:center}
-  .stat-name{width:74px}
+  .force-card{padding-top:4px}
   main{grid-column:1;grid-row:3}
   #input-bar{
     grid-column:1;grid-row:4;padding:10px 12px calc(10px + env(safe-area-inset-bottom));
@@ -4428,52 +4656,38 @@ function entryAgeStyle(tsStr){
   return 'opacity:.70;filter:sepia(62%)';
 }
 
-// ── Character Stats ───────────────────────────────────────────────────────────
-const STATS_META=[
-  {id:'will',    name:'Воля',       sub:'Ты движешь судьбу — или она тебя?'},
-  {id:'temper',  name:'Закалка',    sub:'Металл, из которого куют легенды'},
-  {id:'flame',   name:'Пламя',      sub:'Зачем ты идёшь — ты знаешь?'},
-  {id:'mastery', name:'Мастерство', sub:'Острота, что точится через действие'},
-  {id:'threads', name:'Нити',       sub:'Связи, которые держат мир'},
-  {id:'shadow',  name:'Тень',       sub:'То, что идёт рядом и просит имени'},
-];
-function _statColor(v){
-  if(v>=80) return 'var(--green)';
-  if(v>=55) return 'var(--gold)';
-  if(v>=30) return 'var(--ink3)';
-  return 'var(--red)';
+// ── Two Forces ────────────────────────────────────────────────────────────────
+function htmlesc(s){
+  return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 async function loadCharacter(){
-  const d=await(await fetch('/character/data')).json();
+  const d=await(await fetch('/forces')).json();
   const el=document.getElementById('char-sidebar');
   if(!el) return;
-  const stats=d.stats||{};
-  const hasStats=STATS_META.some(s=>stats[s.id]!=null);
-  el.innerHTML=`<div class="aside-label" style="margin-bottom:8px">Статы Героя</div>`+
-    STATS_META.map(s=>{
-      const v=stats[s.id];
-      const pct=v!=null?Math.min(v,100):null;
-      const color=pct!=null?_statColor(pct):'var(--border2)';
-      return `<div class="stat-row" onclick="openOracle('stat','${s.id}','${s.sub.replace(/'/g,"\\'")}','${s.name}')" title="${s.sub}">
-        <div class="stat-name">${s.name}</div>
-        <div class="stat-bar-wrap"><div class="stat-bar" style="width:${pct??0}%;background:${color}" data-target="${pct??0}"></div></div>
-        <div class="stat-val" style="color:${color}">${pct!=null?pct:'—'}</div>
-      </div>`;
-    }).join('')+
-    `<span class="char-analyze-btn" onclick="triggerAnalyze()">⟳ ${d.last_analyzed?'обновить · '+d.last_analyzed:'Архивариус изучает характер...'}</span>`;
-  // Animate bars after render
+  const receiving=Math.max(0,Math.min(100,parseInt(d.receiving||0)));
+  const giving=Math.max(0,Math.min(100,parseInt(d.giving||0)));
+  const nodes=(d.top_nodes||[]).map(n=>n.name).filter(Boolean).slice(0,3).join(' · ');
+  el.innerHTML=`<div class="aside-label" style="margin-bottom:8px">Силы Героя</div>
+    <div class="force-card">
+      <div class="force-row" onclick="openOracle('force','receiving','${htmlesc(d.balance||'')}','Получение')">
+        <div class="force-top"><div class="force-name">Получение</div><div class="force-val">${receiving}</div></div>
+        <div class="force-bar-wrap"><div class="force-bar receiving" data-target="${receiving}"></div></div>
+      </div>
+      <div class="force-row" onclick="openOracle('force','giving','${htmlesc(d.balance||'')}','Отдача')">
+        <div class="force-top"><div class="force-name">Отдача</div><div class="force-val">${giving}</div></div>
+        <div class="force-bar-wrap"><div class="force-bar giving" data-target="${giving}"></div></div>
+      </div>
+      <div class="force-balance"><span>${htmlesc(d.balance||'равновесие')}</span><span>${d.signals||0} следов</span></div>
+      ${nodes?`<div class="force-node">${htmlesc(nodes)}</div>`:''}
+    </div>`;
   requestAnimationFrame(()=>requestAnimationFrame(()=>{
-    el.querySelectorAll('.stat-bar').forEach(b=>{
+    el.querySelectorAll('.force-bar').forEach(b=>{
       b.style.width=b.dataset.target+'%';
     });
   }));
 }
 async function triggerAnalyze(){
-  const el=document.getElementById('char-sidebar');
-  const btn=el?.querySelector('.char-analyze-btn');
-  if(btn) btn.textContent='⟳ Архивариус анализирует...';
-  await fetch('/character/analyze',{method:'POST'});
-  setTimeout(()=>loadCharacter(),14000);
+  await loadCharacter();
 }
 
 // ── Nav ──────────────────────────────────────────────────────────────────────
@@ -4841,6 +5055,7 @@ async function sendEntry(){
     const active=document.querySelector('section.active');
     if(active?.id==='s-journal'){loadJournal();loadAsides();}
     if(active?.id==='s-missions') loadMissions();
+    loadCharacter();
   } catch(e){ console.error('ingest error',e); }
   finally{ btn.disabled=false; btn.textContent='Записать →'; }
 }
@@ -5220,11 +5435,11 @@ async function saveTask(){
   if(taskRadio) taskRadio.checked=true;
   toggleTaskKindOpts();
   _openMissions.add(mid);
-  loadMissions(); loadAsides();
+  loadMissions(); loadAsides(); loadCharacter();
 }
 async function tickTask(tid,mid){
   await fetch(`/tasks/${tid}/tick`,{method:'POST'});
-  _openMissions.add(mid); loadMissions(); loadAsides();
+  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
 }
 function toggleTaskKindOpts(){
   const kind=document.querySelector('input[name="t-kind"]:checked')?.value||'task';
@@ -5272,22 +5487,22 @@ async function deleteBranch(bid,mid){
 async function progressTask(tid,mid,delta){
   await fetch(`/tasks/${tid}/progress`,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({delta})});
-  _openMissions.add(mid); loadMissions(); loadAsides();
+  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
 }
 async function startTimer(tid,mid){
   await fetch(`/tasks/${tid}/timer/start`,{method:'POST'});
-  _openMissions.add(mid); loadMissions(); loadAsides();
+  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
 }
 async function stopTimer(tid,mid){
   await fetch(`/tasks/${tid}/timer/stop`,{method:'POST'});
-  _openMissions.add(mid); loadMissions(); loadAsides();
+  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
 }
 async function addTaskNote(tid,mid){
   const note=prompt('Заметка к квесту');
   if(!note||!note.trim()) return;
   await fetch(`/tasks/${tid}/note`,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({note:note.trim()})});
-  _openMissions.add(mid); loadMissions(); loadAsides();
+  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
 }
 function fmtDuration(seconds){
   seconds=Math.max(0,parseInt(seconds||0));
@@ -5298,7 +5513,7 @@ function fmtDuration(seconds){
   return '0м';
 }
 async function doneMission(id){
-  await fetch(`/missions/${id}/complete`,{method:'POST'}); loadMissions(); loadAsides();
+  await fetch(`/missions/${id}/complete`,{method:'POST'}); loadMissions(); loadAsides(); loadCharacter();
 }
 async function deleteMission(id){
   if(!confirm('Удалить этот путь и все его задания?')) return;
@@ -5306,7 +5521,7 @@ async function deleteMission(id){
 }
 async function doneTask(tid,mid){
   await fetch(`/tasks/${tid}/complete`,{method:'POST'});
-  _openMissions.add(mid); loadMissions(); loadAsides();
+  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
 }
 async function deleteTask(tid,mid){
   await fetch(`/tasks/${tid}/delete`,{method:'POST'});
@@ -5539,12 +5754,24 @@ async function openEnt(name){
   const entTagsArr=Array.isArray(e.tags)?e.tags:typeof e.tags==='string'&&e.tags?e.tags.split(',').filter(Boolean):[];
   const tagsHtml=entTagsArr.length
     ?`<div class="ent-tags">${entTagsArr.map(t=>`<span class="ent-tag">${t}</span>`).join('')}</div>`:'';
+  const fp=e.force_profile||{};
+  const er=Math.round((fp.receiving||0)*100), eg=Math.round((fp.giving||0)*100);
+  const forceHtml=`<div class="ent-sec">Силы узла</div>
+    <div class="force-row" style="cursor:default;margin-bottom:8px">
+      <div class="force-top"><div class="force-name">Получение</div><div class="force-val">${er}</div></div>
+      <div class="force-bar-wrap"><div class="force-bar receiving" style="width:${er}%"></div></div>
+    </div>
+    <div class="force-row" style="cursor:default;margin-bottom:8px">
+      <div class="force-top"><div class="force-name">Отдача</div><div class="force-val">${eg}</div></div>
+      <div class="force-bar-wrap"><div class="force-bar giving" style="width:${eg}%"></div></div>
+    </div>`;
 
   document.getElementById('ent-content').innerHTML=`
     <div class="ent-name" style="color:${clr}">${ICONS[e.type]||'◆'} ${e.name}</div>
     <div class="ent-type" style="color:${clr}">${e.type}</div>
     ${tagsHtml}
     <div class="ent-summary">${e.summary}</div>
+    ${forceHtml}
     <div class="ent-sec">Связи →</div>${out}
     <div class="ent-sec">← Упоминается</div>${inp}
     <div class="ent-sec">Из дневника</div>
@@ -5621,6 +5848,7 @@ setInterval(async ()=>{
       _prevInboxCount=count;
       if(document.querySelector('#s-journal.active')){loadJournal();loadAsides();}
       if(document.querySelector('#s-missions.active')) loadMissions();
+      loadCharacter();
     }
   }catch(e){}
 }, 5000);
@@ -5798,11 +6026,6 @@ function bootLifeRpg(){
   authInit().then(()=>{
     if(localStorage.getItem('lrpg_token')){
       loadJournal(); loadAsides(); loadCharacter();
-      fetch('/character/data').then(r=>r.json()).then(d=>{
-        const last=d.last_analyzed;
-        const stale=!last||(Date.now()-new Date(last).getTime())/86400000>7;
-        if(stale) fetch('/character/analyze',{method:'POST'}).then(()=>setTimeout(loadCharacter,15000));
-      });
     }
   });
   if(window.innerWidth<=768){
