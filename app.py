@@ -11,11 +11,9 @@ import kuzu
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).parent
-_STATIC_DIR = Path(__file__).parent / "static"
 APP_CFG_FILE = _DATA_DIR / "app_config.json"
 
 def _app_cfg():
@@ -818,7 +816,6 @@ def write_entry(raw, data, user_id: str = "admin"):
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI()
-app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 # ── Auth endpoints ───────────────────────────────────────────────────────────
 class AuthReq(BaseModel): login: str; password: str
@@ -2763,55 +2760,44 @@ section.active{display:block}
 
 /* ── LOGIN GATE ── */
 #login-screen{display:none;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;
-  overflow:hidden;background:#030303;color:#e9d2a2;font-family:'Georgia',serif}
-#login-screen::before{content:"";position:absolute;inset:-12%;
+  overflow:hidden;background:#080704;color:#e4c37a;font-family:'Georgia',serif}
+#login-screen::before{content:"";position:absolute;inset:0;pointer-events:none;
   background:
-    radial-gradient(circle at 50% 42%,rgba(194,141,54,.18),transparent 28%),
-    radial-gradient(circle at 50% 52%,rgba(255,220,140,.075),transparent 18%),
-    radial-gradient(circle at 20% 20%,rgba(115,75,28,.10),transparent 30%),
-    radial-gradient(circle at 78% 74%,rgba(120,70,24,.10),transparent 34%),
-    linear-gradient(180deg,#020202,#090604 46%,#010101);
-  filter:saturate(1.05);pointer-events:none}
-#login-screen::after{content:"";position:absolute;inset:0;pointer-events:none;
-  background:radial-gradient(ellipse at center,transparent 0%,rgba(0,0,0,.18) 44%,rgba(0,0,0,.82) 100%);
-  mix-blend-mode:multiply}
-#ls-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
-.login-shell{position:relative;z-index:2;width:min(92vw,860px);display:grid;grid-template-columns:minmax(0,1fr) 320px;
-  gap:48px;align-items:center;padding:38px}
+    linear-gradient(rgba(173,124,38,.06) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(173,124,38,.06) 1px,transparent 1px),
+    radial-gradient(circle at 50% 42%,rgba(155,105,28,.18),transparent 34%),
+    #080704;
+  background-size:24px 24px,24px 24px,100% 100%,100% 100%}
+.login-pixels{position:absolute;inset:0;pointer-events:none;opacity:.9;
+  background:
+    linear-gradient(45deg,transparent 47%,rgba(204,151,55,.26) 48%,rgba(204,151,55,.26) 52%,transparent 53%) center/128px 128px no-repeat,
+    linear-gradient(-45deg,transparent 47%,rgba(235,184,83,.18) 48%,rgba(235,184,83,.18) 52%,transparent 53%) center/128px 128px no-repeat,
+    radial-gradient(circle at center,rgba(224,166,64,.16),transparent 34%)}
+.login-shell{position:relative;z-index:2;width:min(92vw,760px);display:grid;grid-template-columns:minmax(0,1fr) 312px;
+  gap:42px;align-items:center;padding:32px}
 .login-sigil{justify-self:center;text-align:center;min-width:0}
-.login-mark{font-size:clamp(36px,5vw,76px);line-height:.96;letter-spacing:7px;color:#f0d8a6;
-  text-shadow:0 0 18px rgba(202,148,58,.42),0 0 70px rgba(202,148,58,.22)}
+.login-mark{font-size:clamp(34px,5vw,68px);line-height:.96;letter-spacing:6px;color:#efcf8a;
+  text-shadow:3px 3px 0 #2c1d08}
 .login-sub{margin-top:16px;font-family:sans-serif;font-size:10px;letter-spacing:7px;text-transform:uppercase;
-  color:rgba(220,174,94,.64)}
-.login-oath{margin:34px auto 0;max-width:440px;color:rgba(241,219,178,.78);font-size:17px;line-height:1.8;
-  text-shadow:0 0 28px rgba(0,0,0,.9)}
+  color:#9d7836}
+.login-oath{margin:30px auto 0;max-width:410px;color:#caa35c;font-size:16px;line-height:1.75}
 .login-oath span{color:#f1d9a3}
-.login-panel{position:relative;background:linear-gradient(180deg,rgba(17,12,7,.72),rgba(8,6,4,.70));
-  border:1px solid rgba(214,164,81,.28);box-shadow:0 18px 60px rgba(0,0,0,.55),inset 0 0 42px rgba(205,142,50,.055);
-  backdrop-filter:blur(12px);padding:26px 28px 28px;border-radius:4px}
-.login-panel::before{content:"";position:absolute;left:18px;right:18px;top:0;height:1px;
-  background:linear-gradient(90deg,transparent,rgba(255,220,145,.58),transparent)}
-.login-tabs{display:flex;margin-bottom:22px;border-bottom:1px solid rgba(214,164,81,.22)}
-.login-tab{flex:1;padding:0 0 11px;border:none;background:transparent;color:rgba(222,184,115,.58);
+.login-panel{position:relative;background:#120d07;border:2px solid #70501e;box-shadow:6px 6px 0 #050403;
+  padding:24px 26px 26px;border-radius:0}
+.login-tabs{display:flex;margin-bottom:20px;border-bottom:1px solid #5a421b}
+.login-tab{flex:1;padding:0 0 10px;border:none;background:transparent;color:#8e713a;
   font-family:'Georgia',serif;font-size:13px;cursor:pointer;letter-spacing:.7px}
-.login-tab.active{color:#f2d59a;text-shadow:0 0 18px rgba(207,151,61,.36)}
-.login-input{width:100%;background:rgba(255,255,255,.045);border:1px solid rgba(214,164,81,.22);
-  color:#f2dfbb;font-family:'Georgia',serif;font-size:15px;padding:12px 13px;border-radius:3px;outline:none;margin-bottom:11px;
-  transition:border-color .18s,box-shadow .18s,background .18s}
-.login-input:focus{border-color:rgba(244,198,105,.58);box-shadow:0 0 0 2px rgba(204,148,58,.13),0 0 28px rgba(204,148,58,.10);
-  background:rgba(255,255,255,.065)}
-.login-input::placeholder{color:rgba(213,176,111,.42)}
+.login-tab.active{color:#f2d59a}
+.login-input{width:100%;background:#090704;border:1px solid #594019;color:#f2dfbb;
+  font-family:'Georgia',serif;font-size:15px;padding:12px 13px;border-radius:0;outline:none;margin-bottom:11px}
+.login-input:focus{border-color:#b48736}
+.login-input::placeholder{color:#806537}
 #ls-err{font-size:12px;color:#d87b62;font-family:sans-serif;min-height:18px;margin-bottom:9px}
-#ls-btn{width:100%;border:1px solid rgba(245,198,110,.45);background:linear-gradient(180deg,rgba(196,139,48,.92),rgba(119,74,22,.95));
-  color:#f7e7bf;padding:12px;font-family:'Georgia',serif;font-size:14px;letter-spacing:2.6px;border-radius:3px;cursor:pointer;
-  box-shadow:0 0 34px rgba(191,127,38,.18);transition:transform .18s,box-shadow .18s,filter .18s}
-#ls-btn:hover{transform:translateY(-1px);box-shadow:0 0 46px rgba(214,151,54,.27);filter:brightness(1.08)}
-.login-audio{position:absolute;right:22px;bottom:20px;z-index:3;border:1px solid rgba(214,164,81,.24);
-  background:rgba(6,5,4,.42);color:rgba(242,213,154,.72);font-family:sans-serif;font-size:12px;
-  padding:8px 11px;border-radius:999px;cursor:pointer;backdrop-filter:blur(8px)}
-.login-audio.on{color:#f6daa1;border-color:rgba(246,205,126,.48);box-shadow:0 0 28px rgba(202,145,49,.18)}
+#ls-btn{width:100%;border:1px solid #d3a14c;background:#8f651f;color:#f7e7bf;padding:12px;
+  font-family:'Georgia',serif;font-size:14px;letter-spacing:2.6px;border-radius:0;cursor:pointer}
+#ls-btn:hover{background:#a57427}
 .login-hint{margin-top:16px;text-align:center;font-family:sans-serif;font-size:10px;letter-spacing:2px;text-transform:uppercase;
-  color:rgba(222,184,115,.42)}
+  color:#806537}
 @media(max-width:820px){
   .login-shell{grid-template-columns:1fr;gap:28px;padding:28px 18px}
   .login-oath{display:none}
@@ -5799,414 +5785,11 @@ async function processPendingInbox(){
   }catch(e){}
 }
 
-// ── Legacy login ambience kept inert for old sessions ────────────────────────
-const LegacyLoginAtmo = {
-  _raf: null, _actx: null, _running: false,
-  _particles: [], _drops: [],
-
-  // Hang drum pentatonic (D minor: D3 F3 G3 A3 C4 D4 F4 A4)
-  _notes: [146.83, 174.61, 196.00, 220.00, 261.63, 293.66, 349.23, 440.00],
-
-  _ctx() {
-    if (!this._actx) this._actx = new (window.AudioContext || window.webkitAudioContext)();
-    return this._actx;
-  },
-
-  _reverb(ctx) {
-    const conv = ctx.createConvolver();
-    const len = ctx.sampleRate * 3;
-    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
-    for (let c = 0; c < 2; c++) {
-      const d = buf.getChannelData(c);
-      for (let i = 0; i < len; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 2.5);
-    }
-    conv.buffer = buf; return conv;
-  },
-
-  _hangNote(freq, vol=0.18) {
-    const ctx = this._ctx(); const now = ctx.currentTime;
-    const rev = this._reverb(ctx);
-    const gain = ctx.createGain(); gain.connect(rev); rev.connect(ctx.destination);
-    // Primary tone
-    const o1 = ctx.createOscillator(); o1.type = 'sine'; o1.frequency.value = freq;
-    const g1 = ctx.createGain(); o1.connect(g1); g1.connect(gain);
-    g1.gain.setValueAtTime(0, now); g1.gain.linearRampToValueAtTime(vol, now+0.008);
-    g1.gain.exponentialRampToValueAtTime(0.001, now+4.5);
-    // Octave harmonic (quieter)
-    const o2 = ctx.createOscillator(); o2.type = 'sine'; o2.frequency.value = freq*2;
-    const g2 = ctx.createGain(); o2.connect(g2); g2.connect(gain);
-    g2.gain.setValueAtTime(0, now); g2.gain.linearRampToValueAtTime(vol*0.28, now+0.006);
-    g2.gain.exponentialRampToValueAtTime(0.001, now+3.2);
-    // Minor 3rd partial (metallic shimmer)
-    const o3 = ctx.createOscillator(); o3.type = 'sine'; o3.frequency.value = freq*2.76;
-    const g3 = ctx.createGain(); o3.connect(g3); g3.connect(gain);
-    g3.gain.setValueAtTime(0, now); g3.gain.linearRampToValueAtTime(vol*0.10, now+0.004);
-    g3.gain.exponentialRampToValueAtTime(0.001, now+1.8);
-    [o1,o2,o3].forEach(o=>{o.start(now);o.stop(now+5);});
-    gain.gain.setValueAtTime(1, now);
-  },
-
-  _drop() {
-    const ctx = this._ctx(); const now = ctx.currentTime;
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.setValueAtTime(1200, now);
-    osc.frequency.exponentialRampToValueAtTime(180, now+0.08);
-    const g = ctx.createGain(); g.gain.setValueAtTime(0.12, now);
-    g.gain.exponentialRampToValueAtTime(0.001, now+0.18);
-    osc.connect(g); g.connect(ctx.destination);
-    osc.start(now); osc.stop(now+0.2);
-  },
-
-  _metalHit() {
-    const ctx = this._ctx(); const now = ctx.currentTime;
-    const buf = ctx.createBuffer(1, ctx.sampleRate*0.4, ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,1.4);
-    const src = ctx.createBufferSource(); src.buffer = buf;
-    const bp = ctx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=320; bp.Q.value=8;
-    const g = ctx.createGain(); g.gain.setValueAtTime(0.08,now); g.gain.exponentialRampToValueAtTime(0.001,now+0.5);
-    src.connect(bp); bp.connect(g); g.connect(ctx.destination);
-    src.start(now);
-  },
-
-  _initParticles(W, H) {
-    this._particles = [];
-    for (let i=0;i<60;i++) this._particles.push({
-      x: Math.random()*W, y: Math.random()*H,
-      r: Math.random()*1.8+0.3,
-      vx: (Math.random()-.5)*0.12,
-      vy: -Math.random()*0.18-0.04,
-      a: Math.random()*0.35+0.05
-    });
-  },
-
-  _drawFrame(canvas, ctx2d, t) {
-    const W=canvas.width, H=canvas.height;
-    ctx2d.clearRect(0,0,W,H);
-
-    // Fog layers
-    for (let l=0;l<3;l++) {
-      const spd=[0.00004,0.00007,0.00012][l];
-      const grd=ctx2d.createRadialGradient(
-        W*(0.3+0.4*Math.sin(t*spd+l*2)), H*(0.4+0.3*Math.cos(t*spd*0.7+l)), 0,
-        W*(0.3+0.4*Math.sin(t*spd+l*2)), H*(0.4+0.3*Math.cos(t*spd*0.7+l)), W*0.55);
-      const a=[0.055,0.04,0.03][l];
-      grd.addColorStop(0,`rgba(140,90,30,${a})`);
-      grd.addColorStop(1,'rgba(0,0,0,0)');
-      ctx2d.fillStyle=grd; ctx2d.fillRect(0,0,W,H);
-    }
-
-    // Particles
-    this._particles.forEach(p=>{
-      p.x+=p.vx; p.y+=p.vy;
-      if(p.y<-4){p.y=H+4; p.x=Math.random()*W;}
-      if(p.x<-4)p.x=W+4; if(p.x>W+4)p.x=-4;
-      const flicker=0.6+0.4*Math.sin(t*0.001*Math.random()+p.x);
-      ctx2d.beginPath();
-      ctx2d.arc(p.x,p.y,p.r,0,Math.PI*2);
-      ctx2d.fillStyle=`rgba(200,160,80,${p.a*flicker})`;
-      ctx2d.fill();
-    });
-
-    // Rain drops
-    this._drops = this._drops.filter(dr=>{
-      dr.y += dr.vy; dr.a -= 0.018;
-      if(dr.a<=0) return false;
-      ctx2d.beginPath(); ctx2d.arc(dr.x,dr.y,dr.r,0,Math.PI*2);
-      ctx2d.fillStyle=`rgba(120,160,200,${dr.a})`; ctx2d.fill();
-      // ripple
-      if(dr.vy<0.5){
-        ctx2d.beginPath(); ctx2d.arc(dr.x,dr.y,dr.r*3*(1-dr.a),0,Math.PI*2);
-        ctx2d.strokeStyle=`rgba(120,160,200,${dr.a*0.4})`; ctx2d.lineWidth=0.5; ctx2d.stroke();
-      }
-      return true;
-    });
-  },
-
-  _schedule() {
-    if (!this._running) return;
-    // Hang drum note every 3-9s
-    const hangDelay = (3000 + Math.random()*6000);
-    setTimeout(()=>{
-      if(!this._running) return;
-      const freq = this._notes[Math.floor(Math.random()*this._notes.length)];
-      // Sometimes play 2 notes close together
-      this._hangNote(freq);
-      if(Math.random()<0.3) setTimeout(()=>this._hangNote(this._notes[Math.floor(Math.random()*this._notes.length)],0.12), 400+Math.random()*600);
-      this._schedule();
-    }, hangDelay);
-    // Water drop every 4-12s
-    setTimeout(()=>{
-      if(!this._running) return;
-      this._drop();
-      const canvas=document.getElementById('ls-canvas');
-      if(canvas) this._drops.push({x:Math.random()*canvas.width,y:Math.random()*canvas.height*0.7,r:2.5,vy:0.1,a:0.7});
-    }, 2000+Math.random()*10000);
-    // Metal hit every 8-20s
-    setTimeout(()=>{
-      if(!this._running) return;
-      this._metalHit();
-    }, 5000+Math.random()*15000);
-  },
-
-  start() {
-    if(this._running) return;
-    this._running = true;
-    const canvas = document.getElementById('ls-canvas');
-    if(!canvas) return;
-    const resize=()=>{canvas.width=window.innerWidth;canvas.height=window.innerHeight;
-      this._initParticles(canvas.width,canvas.height);};
-    resize(); window.addEventListener('resize',resize);
-    const ctx2d = canvas.getContext('2d');
-    let t=0;
-    const loop=()=>{
-      if(!this._running){ctx2d.clearRect(0,0,canvas.width,canvas.height);return;}
-      t+=16; this._drawFrame(canvas,ctx2d,t); this._raf=requestAnimationFrame(loop);
-    };
-    this._raf=requestAnimationFrame(loop);
-    // Start audio on first user gesture (autoplay policy)
-    const startAudio=()=>{
-      this._ctx(); // resume context
-      if(this._actx.state==='suspended') this._actx.resume();
-      this._schedule();
-      document.removeEventListener('click',startAudio);
-      document.removeEventListener('keydown',startAudio);
-    };
-    document.addEventListener('click',startAudio);
-    document.addEventListener('keydown',startAudio);
-  },
-
-  stop() {
-    this._running=false;
-    if(this._raf) cancelAnimationFrame(this._raf);
-    if(this._actx) { this._actx.suspend(); }
-  }
-};
-
-// ── Login screen: golden void gate ───────────────────────────────────────────
-const LOGIN_THEME_SRC = '/static/audio/liferpg-login-theme.m4a';
+// ── Login screen: ultra-light pixel gate ─────────────────────────────────────
 const LoginAtmo = {
-  _raf: null, _running: false, _audio: null, _fade: null, _gesture: null, _keyGesture: null, _resize: null,
-  _particles: [], _w: 0, _h: 0, _dpr: 1,
-
-  _audioEl() {
-    if(!this._audio){
-      this._audio = new Audio(LOGIN_THEME_SRC);
-      this._audio.loop = true;
-      this._audio.preload = 'metadata';
-      this._audio.volume = 0;
-    }
-    return this._audio;
-  },
-
-  _setAudioUi(on, busy=false) {
-    const b=document.getElementById('ls-audio-btn');
-    if(!b) return;
-    b.classList.toggle('on', !!on);
-    b.textContent = busy ? 'звук входит' : (on ? 'звук включен' : 'включить звук');
-  },
-
-  _fadeAudio(target, done) {
-    const audio=this._audioEl();
-    if(this._fade) cancelAnimationFrame(this._fade);
-    const start=audio.volume || 0;
-    const t0=performance.now();
-    const dur=target>start ? 1800 : 700;
-    const step=(now)=>{
-      const k=Math.min(1,(now-t0)/dur);
-      const ease=1-Math.pow(1-k,3);
-      audio.volume=Math.max(0,Math.min(0.46,start+(target-start)*ease));
-      if(k<1) this._fade=requestAnimationFrame(step);
-      else { this._fade=null; if(done) done(); }
-    };
-    this._fade=requestAnimationFrame(step);
-  },
-
-  playAudio() {
-    const audio=this._audioEl();
-    this._unarmAudioGesture();
-    this._setAudioUi(false,true);
-    audio.play().then(()=>{
-      this._fadeAudio(0.42,()=>this._setAudioUi(true));
-    }).catch(()=>{
-      this._setAudioUi(false);
-    });
-  },
-
-  pauseAudio() {
-    if(!this._audio) return;
-    this._fadeAudio(0,()=>{
-      if(this._audio) this._audio.pause();
-      this._setAudioUi(false);
-    });
-  },
-
-  toggleAudio(ev) {
-    if(ev) ev.stopPropagation();
-    const audio=this._audioEl();
-    if(audio.paused) this.playAudio();
-    else this.pauseAudio();
-  },
-
-  _armAudioGesture() {
-    this._unarmAudioGesture();
-    this._gesture=(ev)=>{
-      if(ev.target?.closest?.('.login-audio')) return;
-      this.playAudio();
-    };
-    this._keyGesture=()=>this.playAudio();
-    const screen=document.getElementById('login-screen');
-    if(screen) screen.addEventListener('pointerdown',this._gesture);
-    document.addEventListener('keydown',this._keyGesture);
-  },
-
-  _unarmAudioGesture() {
-    const screen=document.getElementById('login-screen');
-    if(screen && this._gesture) screen.removeEventListener('pointerdown',this._gesture);
-    if(this._keyGesture) document.removeEventListener('keydown',this._keyGesture);
-    this._gesture=null; this._keyGesture=null;
-  },
-
-  _initParticles(W, H) {
-    this._particles = [];
-    const count=Math.min(120,Math.max(42,Math.floor(W*H/17000)));
-    for(let i=0;i<count;i++) this._particles.push({
-      x: Math.random()*W, y: Math.random()*H,
-      r: Math.random()*1.45+0.25,
-      vx: (Math.random()-.5)*0.055,
-      vy: (Math.random()-.5)*0.045,
-      a: Math.random()*0.23+0.035,
-      phase: Math.random()*Math.PI*2
-    });
-  },
-
-  _drawFrame(canvas, ctx2d, t) {
-    const W=this._w, H=this._h, min=Math.min(W,H), cx=W*0.5, cy=H*0.48;
-    const s=t*0.001;
-    ctx2d.setTransform(this._dpr,0,0,this._dpr,0,0);
-    ctx2d.clearRect(0,0,W,H);
-    let bg=ctx2d.createRadialGradient(cx,cy,0,cx,cy,min*.82);
-    bg.addColorStop(0,'rgba(31,21,9,.58)');
-    bg.addColorStop(.34,'rgba(7,5,3,.84)');
-    bg.addColorStop(1,'rgba(0,0,0,1)');
-    ctx2d.fillStyle=bg; ctx2d.fillRect(0,0,W,H);
-
-    ctx2d.save();
-    ctx2d.globalCompositeOperation='lighter';
-    for(let h=0;h<3;h++){
-      const hx=cx+Math.cos(s*.08+h*2.1)*min*.18;
-      const hy=cy+Math.sin(s*.07+h*1.7)*min*.12;
-      const g=ctx2d.createRadialGradient(hx,hy,0,hx,hy,min*(.24+h*.11));
-      g.addColorStop(0,`rgba(210,151,57,${.055-h*.012})`);
-      g.addColorStop(1,'rgba(210,151,57,0)');
-      ctx2d.fillStyle=g; ctx2d.fillRect(0,0,W,H);
-    }
-
-    this._particles.forEach(p=>{
-      p.x+=p.vx+Math.cos(s*.18+p.phase)*.01;
-      p.y+=p.vy+Math.sin(s*.16+p.phase)*.01;
-      if(p.y<-8)p.y=H+8; if(p.y>H+8)p.y=-8;
-      if(p.x<-8)p.x=W+8; if(p.x>W+8)p.x=-8;
-      const flicker=.58+.42*Math.sin(s*.9+p.phase);
-      ctx2d.beginPath();
-      ctx2d.arc(p.x,p.y,p.r,0,Math.PI*2);
-      ctx2d.fillStyle=`rgba(229,183,91,${p.a*flicker})`;
-      ctx2d.fill();
-    });
-
-    ctx2d.translate(cx,cy);
-    ctx2d.lineCap='round';
-    ctx2d.lineJoin='round';
-    ctx2d.shadowColor='rgba(235,177,72,.42)';
-    ctx2d.shadowBlur=14;
-    const segments=12;
-    const angle=Math.PI*2/segments;
-    for(let layer=0;layer<7;layer++){
-      const base=min*(.075+layer*.045);
-      const len=min*(.17+layer*.036);
-      const drift=s*(layer%2?-0.034:0.026)*(1+layer*.12);
-      const alpha=.095-layer*.009;
-      ctx2d.strokeStyle=`rgba(241,192,102,${alpha})`;
-      ctx2d.fillStyle=`rgba(203,139,45,${alpha*.12})`;
-      ctx2d.lineWidth=Math.max(.55,1.12-layer*.055);
-      for(let i=0;i<segments;i++){
-        ctx2d.save();
-        ctx2d.rotate(i*angle+drift);
-        if(i%2) ctx2d.scale(1,-1);
-        const wob=Math.sin(s*.32+layer+i*.37)*min*.006;
-        const spread=min*(.02+layer*.005);
-        ctx2d.beginPath();
-        ctx2d.moveTo(base+wob,0);
-        ctx2d.lineTo(base+len*.58,spread);
-        ctx2d.lineTo(base+len*.92,0);
-        ctx2d.lineTo(base+len*.58,-spread);
-        ctx2d.closePath();
-        ctx2d.stroke();
-        if(layer%2===0) ctx2d.fill();
-        ctx2d.beginPath();
-        ctx2d.moveTo(base*.62,0);
-        ctx2d.lineTo(base+len*.78,0);
-        ctx2d.stroke();
-        ctx2d.restore();
-      }
-    }
-    ctx2d.shadowBlur=22;
-    for(let r=0;r<5;r++){
-      const rad=min*(.105+r*.088)+Math.sin(s*.28+r)*min*.007;
-      ctx2d.beginPath();
-      ctx2d.arc(0,0,rad,0,Math.PI*2);
-      ctx2d.strokeStyle=`rgba(246,207,128,${.12-r*.017})`;
-      ctx2d.lineWidth=.75;
-      ctx2d.stroke();
-    }
-    ctx2d.shadowBlur=30;
-    ctx2d.beginPath();
-    ctx2d.arc(0,0,min*.036+Math.sin(s*.7)*min*.003,0,Math.PI*2);
-    ctx2d.fillStyle='rgba(255,222,142,.22)';
-    ctx2d.fill();
-    ctx2d.restore();
-
-    const vign=ctx2d.createRadialGradient(cx,cy,min*.18,cx,cy,min*.82);
-    vign.addColorStop(0,'rgba(0,0,0,0)');
-    vign.addColorStop(.68,'rgba(0,0,0,.24)');
-    vign.addColorStop(1,'rgba(0,0,0,.88)');
-    ctx2d.fillStyle=vign; ctx2d.fillRect(0,0,W,H);
-  },
-
-  start() {
-    if(this._running) return;
-    this._running = true;
-    const canvas = document.getElementById('ls-canvas');
-    if(!canvas) return;
-    const reduce=window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
-    this._resize=()=>{
-      this._w=window.innerWidth; this._h=window.innerHeight;
-      this._dpr=Math.min(2,window.devicePixelRatio||1);
-      canvas.width=Math.floor(this._w*this._dpr);
-      canvas.height=Math.floor(this._h*this._dpr);
-      canvas.style.width=this._w+'px'; canvas.style.height=this._h+'px';
-      this._initParticles(this._w,this._h);
-    };
-    this._resize(); window.addEventListener('resize',this._resize);
-    const ctx2d = canvas.getContext('2d');
-    const loop=()=>{
-      if(!this._running){ctx2d.clearRect(0,0,canvas.width,canvas.height);return;}
-      this._drawFrame(canvas,ctx2d,performance.now());
-      if(!reduce) this._raf=requestAnimationFrame(loop);
-    };
-    this._raf=requestAnimationFrame(loop);
-    this._audioEl();
-    this._setAudioUi(false);
-    this._armAudioGesture();
-  },
-
-  stop() {
-    this._running=false;
-    if(this._raf) cancelAnimationFrame(this._raf);
-    if(this._resize) window.removeEventListener('resize',this._resize);
-    this._unarmAudioGesture();
-    this.pauseAudio();
-  }
+  start() {},
+  stop() {},
+  toggleAudio() {}
 };
 
 // ── Init ─────────────────────────────────────────────────────────────────────
@@ -6233,8 +5816,7 @@ if(document.readyState==='loading'){
 }
 </script>
 <div id="login-screen">
-  <canvas id="ls-canvas"></canvas>
-  <button id="ls-audio-btn" class="login-audio" onclick="LoginAtmo.toggleAudio(event)">включить звук</button>
+  <div class="login-pixels"></div>
   <div class="login-shell">
     <div class="login-sigil">
       <div class="login-mark">Life RPG</div>
