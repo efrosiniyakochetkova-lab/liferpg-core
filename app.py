@@ -9,7 +9,7 @@ from pathlib import Path
 
 import kuzu
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
@@ -5953,5 +5953,23 @@ if(document.readyState==='loading'){
 </body>
 </html>"""
 
+@app.get("/health")
+def health():
+    try:
+        kuzu_rows(_conn.execute("MATCH (u:User) RETURN count(u)"))
+        db = "ok"
+    except Exception as e:
+        db = str(e)
+    return {"ok": db == "ok", "db": db}
+
+@app.head("/health")
+def health_head():
+    return Response(status_code=200)
+
+@app.head("/")
+def root_head():
+    return Response(status_code=200, headers={"Cache-Control":"no-store"})
+
 @app.get("/", response_class=HTMLResponse)
-def root(): return HTML
+def root():
+    return HTMLResponse(HTML, headers={"Cache-Control":"no-store"})
