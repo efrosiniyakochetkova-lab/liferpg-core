@@ -74,6 +74,20 @@ def _call_gigachat(prompt_text: str) -> str:
     except Exception as e:
         print(f"[gigachat] {e}"); return ""
 
+def _clean_journal_text(text: str) -> str:
+    """Keep old saved AI output readable without exposing prompt/meta artifacts."""
+    if not text: return ""
+    text = str(text).strip()
+    text = re.sub(r'^\s*[«"]?quest:[^»"\n]+[»"]?\s*$', "", text, flags=re.I)
+    text = re.sub(r'\s*◆\s*Запись создана по действию квеста\.?', "", text, flags=re.I)
+    text = re.sub(r'(?:\*\*)?\s*Значение:\s*(?:\*\*)?\s*[-+]?\d+(?:[.,]\d+)?\s*', " ", text, flags=re.I)
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    text = re.sub(r'[ \t]+', " ", text)
+    text = re.sub(r'\n{3,}', "\n\n", text)
+    return text.strip(" \n\t\"«»")
+
 def call_ai_extract(raw: str, user_id: str = "admin") -> dict:
     """Call AI (Anthropic or GigaChat). Returns parsed dict or None."""
     ent_ctx, miss_ctx = build_context(user_id)
@@ -657,9 +671,9 @@ def _improve_quest_journal_entry(entry_id: str, snap: dict, event_type: str, val
 Стиль: ясный дневник Героя, не поэма, не религиозная проповедь, без слов "каббала", "Творец", "божественный", "святость".
 Скрытый смысл: действие должно мягко приближать Героя к намерению отдавать, приносить пользу, очищать мотив от "получить ради себя" к "сделать ради смысла и пользы".
 1-2 предложения. Конкретно: что сделано, зачем это важно, короткая рефлексия-наставление себе.
+Не используй markdown. Не пиши технические поля вроде "Значение", сырые числа таймера или названия event_type.
 
 Действие: {_quest_event_meaning(event_type,value)}
-Значение: {value}
 Задание: {snap['task']['title']}
 Описание задания: {snap['task'].get('quest_description') or _quest_description_fallback(snap)}
 Путь: {snap['mission']['title']}
@@ -673,7 +687,7 @@ def _improve_quest_journal_entry(entry_id: str, snap: dict, event_type: str, val
 {_paths_context(user_id)}
 
 Верни только текст записи."""
-    text=_call_any_ai(prompt).strip()
+    text=_clean_journal_text(_call_any_ai(prompt).strip())
     if text:
         try:
             _conn.execute("MATCH (e:Entry) WHERE e.id=$id AND e.user_id=$uid SET e.narrative=$n,e.archivist_note=''",
@@ -711,7 +725,7 @@ PROMPT = """Ты — Архивариус, хранитель Живой Лет�
 
 Верни JSON строго в таком формате:
 {{
-  "narrative": "2-4 предложения от третьего лица — стиль Morrowind, хроника, величие, конкретные детали",
+  "narrative": "1-3 предложения ОТ ПЕРВОГО ЛИЦА: что я сделал, зачем это важно, какую точную мысль беру себе дальше",
   "entities": [
     {{"name":"Имя","type":"person|place|concept|project|event|object","summary":"одно ёмкое предложение","tags":[]}}
   ],
@@ -721,13 +735,17 @@ PROMPT = """Ты — Архивариус, хранитель Живой Лет�
   "quests": [
     {{"title":"конкретный шаг или задача","mission_id":"id пути если явно связано или пустая строка","description":"контекст","task_type":"once или repeat","reset_hours":24,"required_iters":1}}
   ],
-  "archivist_note": "1-2 предложения — мудрость Архивариуса о значении этой записи для судьбы Героя. Нарративно, эпически.",
+  "archivist_note": "короткая мысль-наставление от первого лица или пустая строка, без пафоса",
   "mission_analysis": [
-    {{"mission_id":"id","insight":"что эта запись даёт или блокирует","lore":"1-2 предложения в стиле летописи Морровинда — что этот Путь значит для Героя, конкретно и нарративно"}}
+    {{"mission_id":"id","insight":"что эта запись даёт или блокирует","lore":"1-2 предложения: что этот Путь помогает мне отдать миру через дело, конкретно и без религиозных терминов"}}
   ]
 }}
 
 ПРАВИЛА:
+- narrative всегда от первого лица: "я сделал", "я понял", "мне стало ясно"; не "Герой сделал"
+- скрытый смысл: я учусь менять намерение с личной выгоды на пользу, точность, отдачу, служение делу; без слов "каббала", "Творец", "религия", "святость"
+- стиль живой и честный: меньше эпической пыли, больше конкретики действия и спокойной внутренней мысли
+- не используй markdown, жирный шрифт, списки и технические поля вроде "Значение"
 - entities: только реально упомянутые люди, места, идеи, проекты, предметы — не выдумывай; object — физические предметы и инструменты (самокат, камера, ноутбук)
 - relations: только если связь явно следует из текста
 - quests: только конкретные задачи/обязательства, явно упоминаемые
@@ -759,10 +777,11 @@ def extract(raw, user_id: str = "admin"):
 def write_entry(raw, data, user_id: str = "admin"):
     eid = str(uuid.uuid4())
     ts  = datetime.now().strftime("%Y-%m-%d %H:%M")
-    an  = data.get("archivist_note","")
+    an  = _clean_journal_text(data.get("archivist_note",""))
+    narrative = _clean_journal_text(data.get("narrative", raw))
     _conn.execute(
         "CREATE (:Entry {id:$id,ts:$ts,raw_text:$r,narrative:$n,archivist_note:$an,user_id:$uid})",
-        {"id":eid,"ts":ts,"r":raw,"n":data.get("narrative",raw),"an":an,"uid":user_id})
+        {"id":eid,"ts":ts,"r":raw,"n":narrative,"an":an,"uid":user_id})
     for ent in data.get("entities",[]):
         sid  = _entity_id(ent["name"], user_id)
         tags = json.dumps(ent.get("tags",[]), ensure_ascii=False)
@@ -1198,8 +1217,8 @@ def process_pending(u: dict = Depends(current_user)):
 
 def _apply_analysis(eid: str, data: dict, user_id: str = "admin"):
     """Apply AI analysis result to DB (shared by update_entry and auto-processing)."""
-    narrative = data.get("narrative","")
-    an = data.get("archivist_note","")
+    narrative = _clean_journal_text(data.get("narrative",""))
+    an = _clean_journal_text(data.get("archivist_note",""))
     if narrative:
         try:
             _conn.execute(
@@ -1311,7 +1330,8 @@ def diary(limit: int=60, u: dict = Depends(current_user)):
     rows=kuzu_rows(_conn.execute(
         "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.id,e.ts,e.narrative,e.raw_text,e.archivist_note"
         " ORDER BY e.ts DESC LIMIT $l",{"l":limit,"uid":uid}))
-    return [{"id":r[0],"ts":r[1],"narrative":r[2],"raw":r[3],"archivist_note":r[4]} for r in rows]
+    return [{"id":r[0],"ts":r[1],"narrative":_clean_journal_text(r[2] or r[3] or ""),
+             "raw":r[3],"archivist_note":_clean_journal_text(r[4] or "")} for r in rows]
 
 @app.post("/diary/{eid}/delete")
 def delete_entry(eid: str, u: dict = Depends(current_user)):
@@ -2355,15 +2375,17 @@ def today_narrative(u: dict = Depends(current_user)):
     all_tasks=rows+[[r[0],r[1],r[1]] for r in rows2]
     if not all_tasks: return {"narrative":""}
     task_lines="\n".join(f"- {r[0]} ({r[1]}/{r[2]})" for r in all_tasks)
-    p=f"""Ты — Архивариус. Одним абзацем (2-3 предложения) в стиле летописи Морровинда опиши достижения Героя за сегодня.
-Лаконично, эпично, от третьего лица. Без лишних слов.
+    p=f"""Ты — тихий редактор дневника Life RPG. Одним абзацем (1-2 предложения) подведи живой итог сегодняшних квестов ОТ ПЕРВОГО ЛИЦА.
+Стиль: ясный дневник Героя, не поэма и не религиозная проповедь.
+Скрытый смысл: я учусь превращать действие из личной выгоды в пользу, точность, заботу и отдачу через дело.
+Без слов "каббала", "Творец", "божественный", "святость". Без markdown и технических полей.
 
 Задания сегодня:
 {task_lines}
 
-Верни только текст летописи, без кавычек и заголовков."""
+Верни только текст записи, без кавычек и заголовков."""
     text=_call_any_ai(p) if _has_any_ai() else ""
-    return {"narrative":text.strip()}
+    return {"narrative":_clean_journal_text(text.strip())}
 
 class OracleReq(BaseModel):
     mechanic_type: str  # "moon"|"season"|"patron"|"epoch"|"moon_name"
@@ -4459,7 +4481,16 @@ function closeDrawer(){
 }
 
 // ── Linkify ──────────────────────────────────────────────────────────────────
+function cleanJournalText(text){
+  let out=String(text||'').trim();
+  out=out.replace(/^\s*[«"]?quest:[^»"\n]+[»"]?\s*$/i,'');
+  out=out.replace(/\s*◆\s*Запись создана по действию квеста\.?/gi,'');
+  out=out.replace(/(?:\*\*)?\s*Значение:\s*(?:\*\*)?\s*[-+]?\d+(?:[.,]\d+)?\s*/gi,' ');
+  out=out.replace(/\*\*(.*?)\*\*/g,'$1').replace(/__(.*?)__/g,'$1').replace(/`([^`]+)`/g,'$1');
+  return out.replace(/[ \t]+/g,' ').replace(/\n{3,}/g,'\n\n').replace(/^[\s"«»]+|[\s"«»]+$/g,'');
+}
 function linkify(text){
+  text=cleanJournalText(text);
   if(!allEntities.length) return text;
   const sorted=[...allEntities].sort((a,b)=>b.name.length-a.name.length);
   let out=text;
@@ -4479,7 +4510,7 @@ async function loadJournal(){
   const inboxRaw=await ir.json();
   const doneToday=(await doneR.json()).count||0;
   const missions=await mr.json();
-  const todayNarrative=(await narR.json()).narrative||'';
+  const todayNarrative=cleanJournalText((await narR.json()).narrative||'');
   const pastMoon=(await pmR.json()).entry||null;
   const today=new Date().toISOString().slice(0,10);
   const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>
@@ -4533,7 +4564,7 @@ async function loadJournal(){
     const doneBadge=isToday&&doneToday>0?`<span class="daily-done-badge">✓ ${doneToday} заданий сегодня</span>`:'';
     const progressBlock=isToday&&todayTasks.length?`<div style="margin:10px 0 16px;padding:14px 16px;background:var(--paper2);border:1px solid var(--border2);border-radius:3px">
       <div style="font-size:9px;letter-spacing:2px;color:var(--ink3);font-family:sans-serif;margin-bottom:10px">ХРОНИКИ ДНЯ</div>
-      ${todayNarrative?`<div style="font-size:13px;color:var(--ink);font-style:italic;margin-bottom:12px;line-height:1.6">${todayNarrative}</div>`:''}
+      ${todayNarrative?`<div style="font-size:13px;color:var(--ink);font-style:italic;margin-bottom:12px;line-height:1.6">${linkify(todayNarrative)}</div>`:''}
       ${todayTasks.map(t=>{
         const pct=Math.round(t.current_iters/Math.max(t.required_iters,1)*100);
         return `<div style="margin-bottom:6px">
