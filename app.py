@@ -2235,17 +2235,41 @@ def start_task_timer(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN "
-        "t.mission_id,t.timer_started_ts,t.quest_kind,t.progress_mode,t.current_iters,t.required_iters",
+        "t.mission_id,t.timer_started_ts,t.quest_kind,t.progress_mode,t.current_iters,t.required_iters,"
+        "t.target_value,t.progress_value,t.last_reset_ts",
         {"id":tid,"uid":uid}))
     if not rows: raise HTTPException(404)
-    mid,started,kind,mode,cur,req=rows[0]
-    if (mode or "") == "timed_sessions" and int(cur or 0) >= int(req or 1):
-        return {"ok":True,"already_complete":True}
+    mid,started,kind,mode,cur,req,target_value,progress_value,last_reset_ts=rows[0]
+    is_timed_ritual = (mode or "") == "timed_sessions"
+    cur_i=int(cur or 0)
+    req_i=max(1, int(req or 1))
+    if is_timed_ritual:
+        target_seconds=max(1, int(float(target_value or 5400)))
+        progress_seconds=max(0, int(float(progress_value or 0)))
+        if progress_seconds >= target_seconds and cur_i < req_i:
+            gained=min(max(0, req_i - cur_i), progress_seconds // target_seconds)
+            if gained > 0:
+                cur_i += int(gained)
+                progress_seconds -= int(gained) * target_seconds
+                completed_ts = _now_s() if cur_i >= req_i else ""
+                reset_ts = last_reset_ts or _now_s()
+                _conn.execute(
+                    "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+                    "t.current_iters=$iters,t.progress_value=$progress,t.last_reset_ts=$reset,t.completed_ts=$completed",
+                    {"id":tid,"uid":uid,"iters":cur_i,"progress":float(0 if cur_i >= req_i else progress_seconds),
+                     "reset":reset_ts,"completed":completed_ts})
+                progress_seconds = 0 if cur_i >= req_i else progress_seconds
+        if cur_i >= req_i:
+            _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_started_ts=''",
+                          {"id":tid,"uid":uid})
+            return {"ok":True,"already_complete":True}
     if not started:
-        if (kind or "") == "ritual" or (mode or "") == "timed_sessions":
+        if (kind or "") == "ritual" or is_timed_ritual:
             _conn.execute(
-                "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_started_ts=$ts,t.task_type='repeat',t.quest_kind='ritual'",
-                {"id":tid,"uid":uid,"ts":_timer_now_s()})
+                "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+                "t.timer_started_ts=$ts,t.task_type='repeat',t.quest_kind='ritual',t.progress_value=$progress",
+                {"id":tid,"uid":uid,"ts":_timer_now_s(),
+                 "progress":float(progress_seconds if is_timed_ritual else (progress_value or 0))})
         else:
             _conn.execute(
                 "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_started_ts=$ts,t.quest_kind='timer',t.progress_mode='timer'",
