@@ -5026,6 +5026,10 @@ async function loadAsides(){
       const timeLeft=t.last_reset_ts?fmtCountdown(t.last_reset_ts,t.reset_hours):'';
       return `${timedRitualMetaHtml(t)}${timeLeft?' · '+_entEsc(timeLeft):''}`;
     }
+    if(kind==='timer'){
+      const rec=timerRecordSummary(t,true);
+      return `таймер · ${liveTimerHtml(t,t.timer_total_seconds||0,'всего ')}${rec?' · '+_entEsc(rec):''}`;
+    }
     return _entEsc(questMeta(t));
   };
   const pct=(cur,target)=>Math.max(0,Math.min(100,(Number(cur||0)/Math.max(1,Number(target||1)))*100));
@@ -5056,7 +5060,7 @@ async function loadAsides(){
       const running=!!t.timer_started_ts;
       return `<div class="aside-quest-actions">
           <button class="aside-action ${running?'running':'primary'}" onclick="${running?`stopTimer('${tid}','${midArg}')`:`startTimer('${tid}','${midArg}')`};event.stopPropagation()">${running?'стоп':'старт'}</button>
-          <span class="aside-quest-meta">всего ${fmtDuration(t.timer_total_seconds||0)}</span>
+          <span class="aside-quest-meta">${liveTimerHtml(t,t.timer_total_seconds||0,'всего ')}</span>
         </div>`;
     }
     if(kind==='counter'){
@@ -5088,7 +5092,7 @@ async function loadAsides(){
     }).join('')
     :'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif;line-height:1.5">нет актуальных квестов</div>';
   ensureTimedRitualTicker();
-  tickTimedRitualClocks();
+  tickLiveClocks();
 }
 
 function questKindName(kind, taskType=''){
@@ -5155,10 +5159,32 @@ function tickTimedRitualClocks(){
     el.style.width=timedRitualStateFromEl(el).pct+'%';
   });
 }
-let _timedRitualTicker=null;
+function liveTimerAttrs(task,totalSeconds=0,prefix=''){
+  return `data-total="${Math.max(0,Number(totalSeconds||0))}" data-running="${task?.timer_started_ts?'true':'false'}" data-render-ms="${Date.now()}" data-prefix="${_entEsc(prefix)}"`;
+}
+function liveTimerHtml(task,totalSeconds=0,prefix=''){
+  return `<span class="live-timer-clock" ${liveTimerAttrs(task,totalSeconds,prefix)}>${_entEsc(prefix+fmtDuration(totalSeconds||0))}</span>`;
+}
+function liveTimerSecondsFromEl(el){
+  const base=Math.max(0,Number(el.dataset.total||0));
+  if(el.dataset.running!=='true') return base;
+  const renderMs=Number(el.dataset.renderMs||0);
+  if(!renderMs) return base;
+  return base+Math.max(0,Math.floor((Date.now()-renderMs)/1000));
+}
+function tickTimerClocks(){
+  document.querySelectorAll('.live-timer-clock').forEach(el=>{
+    el.textContent=(el.dataset.prefix||'')+fmtDuration(liveTimerSecondsFromEl(el));
+  });
+}
+function tickLiveClocks(){
+  tickTimedRitualClocks();
+  tickTimerClocks();
+}
+let _liveClockTicker=null;
 function ensureTimedRitualTicker(){
-  if(_timedRitualTicker) return;
-  _timedRitualTicker=setInterval(tickTimedRitualClocks,1000);
+  if(_liveClockTicker) return;
+  _liveClockTicker=setInterval(tickLiveClocks,1000);
 }
 function timerRecordMode(task){
   return task?.timer_record_mode || (task?.record_enabled?'session':'none');
@@ -5192,14 +5218,14 @@ function timerRecordPanel(task){
   const modeLabel={none:'без рекорда',session:'сессии',period:'периоды'}[mode]||'без рекорда';
   const cells=mode==='period'
     ?[
-      ['текущий период',fmtDuration(task.timer_current_period_seconds||task.timer_period_seconds||0)],
+      ['текущий период',liveTimerHtml(task,task.timer_current_period_seconds||task.timer_period_seconds||0)],
       ['прошлый период',fmtDuration(task.timer_last_period_seconds||0)],
       ['лучший период',fmtDuration(task.timer_best_period_seconds||0)]
     ]
     :[
       ['последняя сессия',fmtDuration(task.timer_last_session_seconds||0)],
       ['лучшая сессия',fmtDuration(task.timer_best_session_seconds||task.record_value||0)],
-      ['всего',fmtDuration(task.timer_total_seconds||0)]
+      ['всего',liveTimerHtml(task,task.timer_total_seconds||0)]
     ];
   return `<div class="timer-record-panel">
     <div class="quest-card-meta">Режим рекорда: ${modeLabel}${mode==='period'?` · период ${task.timer_period_hours||24}ч`:''}</div>
@@ -5555,7 +5581,7 @@ async function loadMissions(){
       const running=!!t.timer_started_ts;
       controls=`<div class="quest-progress-line">
         <button class="quest-tool ${running?'running':'primary'}" onclick="${running?`stopTimer('${jsArg(t.id)}','${jsArg(m.id)}')`:`startTimer('${jsArg(t.id)}','${jsArg(m.id)}')`};event.stopPropagation()">${running?'стоп':'старт'}</button>
-        <span>всего ${fmtDuration(t.timer_total_seconds||0)}</span>${recordHtml}
+        <span>${liveTimerHtml(t,t.timer_total_seconds||0,'всего ')}</span>${recordHtml}
       </div><div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
     } else if(kind==='counter'){
       const p=taskProgress(t);
@@ -5656,7 +5682,7 @@ async function loadMissions(){
     if(chev) chev.classList.add('open');
   });
   ensureTimedRitualTicker();
-  tickTimedRitualClocks();
+  tickLiveClocks();
 }
 
 function editMissionDesc(mid){
@@ -5829,7 +5855,7 @@ async function refreshQuestViews(mid){
   await loadAsides();
   await loadCharacter();
   ensureTimedRitualTicker();
-  tickTimedRitualClocks();
+  tickLiveClocks();
 }
 async function startTimer(tid,mid){
   await fetch(`/tasks/${tid}/timer/start`,{method:'POST'});
