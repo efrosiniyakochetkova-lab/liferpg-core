@@ -438,7 +438,7 @@ def _entity_force_profile(name: str, summary: str = "", tags: str = "") -> dict:
 def _text_force_profile(text: str, source: str = "entry") -> dict:
     toks = _force_tokens(text)
     if not toks:
-        return {"receiving": .15, "giving": .15, "trust": .35}
+        return {"receiving": .05, "giving": .05, "trust": .25}
     unique = len(set(toks))
     r = _force_hits(toks, _FORCE_LEX["receiving"])
     g = _force_hits(toks, _FORCE_LEX["giving"])
@@ -447,14 +447,18 @@ def _text_force_profile(text: str, source: str = "entry") -> dict:
     length_factor = _clamp(math.log1p(unique) / math.log(34), .24, 1.0)
     concrete_factor = _clamp(.42 + concrete * .13, .36, 1.0)
     fog_penalty = _clamp(1.0 - max(0, mist - concrete * .55) * .045, .68, 1.0)
-    base = .22 if source == "entry" else .18
-    receive = _clamp(base + min(.56, r * .055) + min(.18, concrete * .025), .08, .96)
-    give = _clamp(base + min(.58, g * .06) + min(.15, concrete * .02), .08, .96)
-    trust = _clamp(length_factor * concrete_factor * fog_penalty, .18, 1.0)
+    base = .10 if source == "entry" else .07
+    receive = _clamp(base + min(.62, r * .065) + min(.12, concrete * .015), .03, .94)
+    give = _clamp(base + min(.64, g * .07) + min(.10, concrete * .012), .03, .94)
+    trust = _clamp(length_factor * concrete_factor * fog_penalty, .14, 1.0)
     return {"receiving": receive, "giving": give, "trust": trust}
 
-def _force_score_to_pct(v: float) -> int:
-    return int(round(_clamp(100 * (1 - math.exp(-v / 4.2)), 0, 100)))
+def _force_score_to_pct(total: float, evidence: float) -> int:
+    if evidence <= 0:
+        return 0
+    avg = _clamp(total / evidence, 0, 1)
+    confidence = _clamp(1 - math.exp(-evidence / 18.0), .28, 1.0)
+    return int(round(_clamp((avg / .34) * 100 * (.62 + .38 * confidence), 0, 100)))
 
 def _force_snapshot(user_id: str = "admin") -> dict:
     now = datetime.now()
@@ -471,7 +475,9 @@ def _force_snapshot(user_id: str = "admin") -> dict:
         "ORDER BY e.ts DESC LIMIT 140", {"uid": user_id}))
     seen = {}
     for raw, narrative, note, ts in entries:
-        text = _clean_journal_text(" ".join([raw or "", narrative or "", note or ""]))
+        text = _clean_journal_text(raw or "")
+        if text.lower().startswith("quest:"):
+            continue
         if not text: continue
         toks = _force_tokens(text)
         key = " ".join(toks[:28])
@@ -556,10 +562,9 @@ def _force_snapshot(user_id: str = "admin") -> dict:
                 np["giving"] += s["giving"] * w
     diversity = _clamp((len(day_set) ** .45 + len(quest_texts) ** .32) / 4.2, .55, 1.08)
     integrity = _clamp(1 - (suspicion / max(total_w, .001)) * .75, .35, 1.0)
-    total_r *= diversity * (.64 + .36 * integrity)
-    total_g *= diversity * (.64 + .36 * integrity)
-    receiving = _force_score_to_pct(total_r)
-    giving = _force_score_to_pct(total_g)
+    force_scale = diversity * (.70 + .30 * integrity)
+    receiving = _force_score_to_pct(total_r * force_scale, total_w)
+    giving = _force_score_to_pct(total_g * force_scale, total_w)
     top_nodes = sorted(
         [{"name": k, "receiving": round(v["receiving"], 2), "giving": round(v["giving"], 2)}
          for k, v in node_power.items()],
@@ -570,6 +575,7 @@ def _force_snapshot(user_id: str = "admin") -> dict:
     return {
         "receiving": receiving, "giving": giving, "balance": balance,
         "integrity": int(round(integrity * 100)), "signals": len(signals),
+        "evidence": round(total_w, 2),
         "days": len(day_set), "top_nodes": top_nodes,
         "updated_ts": datetime.now().strftime("%Y-%m-%d %H:%M")
     }
