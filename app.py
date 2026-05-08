@@ -3202,6 +3202,20 @@ section.active{display:block}
 .aside-quest:hover{background:rgba(139,105,20,.12)}
 .aside-quest-title{font-size:12px;color:var(--ink);font-family:sans-serif;line-height:1.35}
 .aside-quest-meta{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-top:3px;line-height:1.35}
+.aside-quest-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px}
+.aside-action{border:1px solid var(--border2);background:var(--paper);color:var(--ink2);
+  font-family:sans-serif;font-size:10px;line-height:1;padding:4px 8px;border-radius:3px;
+  cursor:pointer;min-height:22px}
+.aside-action:hover{border-color:var(--gold);color:var(--gold)}
+.aside-action.primary{background:var(--gold);border-color:var(--gold);color:#fff}
+.aside-action.primary:hover{background:#a07820;color:#fff}
+.aside-action.running{background:var(--red);border-color:var(--red);color:#fff}
+.aside-action.done{background:var(--green);border-color:var(--green);color:#fff}
+.aside-action:disabled{opacity:.45;cursor:default}
+.aside-progress{height:4px;background:rgba(200,184,154,.42);border-radius:999px;
+  overflow:hidden;margin-top:6px}
+.aside-progress-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--gold));
+  border-radius:999px;transition:width .25s}
 .aside-entity{display:flex;align-items:center;gap:8px;padding:6px 0;cursor:pointer;
   border-bottom:.5px solid var(--border2)}
 .aside-entity:last-child{border-bottom:none}
@@ -4996,12 +5010,57 @@ async function loadAsides(){
     }
     return t.parent_id?'шаг квеста':'квест';
   };
+  const pct=(cur,target)=>Math.max(0,Math.min(100,(Number(cur||0)/Math.max(1,Number(target||1)))*100));
+  const asideControls=(t,mid)=>{
+    const kind=t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
+    const tid=_jsEsc(t.id), midArg=_jsEsc(mid);
+    if(kind==='ritual'&&(t.progress_mode||'')==='timed_sessions'){
+      const s=timedRitualState(t);
+      const cycled=s.done>=s.required;
+      const label=cycled?'готово':(s.running?'стоп':'старт');
+      const btnClass=cycled?'done':(s.running?'running':'primary');
+      return `<div class="aside-quest-actions">
+          <button class="aside-action ${btnClass}" onclick="${s.running?`stopTimer('${tid}','${midArg}')`:`startTimer('${tid}','${midArg}')`};event.stopPropagation()" ${cycled?'disabled':''}>${label}</button>
+          <span class="aside-quest-meta">${s.done}/${s.required}</span>
+          <span class="aside-quest-meta">подход ${s.next}/${s.required}: ${fmtDuration(s.current)}/${fmtDuration(s.target)}</span>
+        </div>
+        <div class="aside-progress"><div class="aside-progress-fill" style="width:${s.pct}%"></div></div>`;
+    }
+    if(kind==='ritual'){
+      const cycled=(t.current_iters||0)>=(t.required_iters||1);
+      return `<div class="aside-quest-actions">
+          <button class="aside-action ${cycled?'done':'primary'}" onclick="tickTask('${tid}','${midArg}');event.stopPropagation()" ${cycled?'disabled':''}>${cycled?'готово':'+1'}</button>
+          <span class="aside-quest-meta">${t.current_iters||0}/${t.required_iters||1}</span>
+        </div>
+        <div class="aside-progress"><div class="aside-progress-fill" style="width:${pct(t.current_iters,t.required_iters)}%"></div></div>`;
+    }
+    if(kind==='timer'){
+      const running=!!t.timer_started_ts;
+      return `<div class="aside-quest-actions">
+          <button class="aside-action ${running?'running':'primary'}" onclick="${running?`stopTimer('${tid}','${midArg}')`:`startTimer('${tid}','${midArg}')`};event.stopPropagation()">${running?'стоп':'старт'}</button>
+          <span class="aside-quest-meta">всего ${fmtDuration(t.timer_total_seconds||0)}</span>
+        </div>`;
+    }
+    if(kind==='counter'){
+      const cur=Number(t.progress_value||0), target=Number(t.target_value||1);
+      const done=target>0&&cur>=target;
+      return `<div class="aside-quest-actions">
+          <button class="aside-action ${done?'done':'primary'}" onclick="progressTask('${tid}','${midArg}',1);event.stopPropagation()" ${done?'disabled':''}>${done?'готово':'+1'}</button>
+          <span class="aside-quest-meta">${Number.isInteger(cur)?cur:cur.toFixed(1)}/${Number.isInteger(target)?target:target.toFixed(1)}</span>
+        </div>
+        <div class="aside-progress"><div class="aside-progress-fill" style="width:${pct(cur,target)}%"></div></div>`;
+    }
+    return `<div class="aside-quest-actions">
+      <button class="aside-action done" onclick="doneTask('${tid}','${midArg}');event.stopPropagation()">✓ выполнить</button>
+    </div>`;
+  };
   document.getElementById('aside-missions').innerHTML=active.length
     ?active.map(m=>{
       const tasksHtml=m.currentTasks.map(t=>{
         return `<div class="aside-quest" onclick="openTaskCard('${_jsEsc(t.id)}')">
           <div class="aside-quest-title">${_entEsc(t.title)}</div>
           <div class="aside-quest-meta">${_entEsc(questMeta(t))}</div>
+          ${asideControls(t,m.id)}
         </div>`;
       }).join('');
       return `<div class="aside-mission" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
