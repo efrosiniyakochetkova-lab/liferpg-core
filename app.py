@@ -311,10 +311,17 @@ def _maybe_reset_task(t: dict) -> dict:
         if cur >= req: stk += 1; best = max(best, stk)
         else:          stk = 0
         now_s = datetime.now().strftime("%Y-%m-%d %H:%M")
-        _conn.execute(
-            "MATCH (t:Task) WHERE t.id=$id "
-            "SET t.current_iters=0,t.last_reset_ts=$ts,t.streak=$s,t.best_streak=$b",
-            {"id": t["id"], "ts": now_s, "s": stk, "b": best})
+        if (t.get("progress_mode") or "") == "timed_sessions":
+            _conn.execute(
+                "MATCH (t:Task) WHERE t.id=$id "
+                "SET t.current_iters=0,t.progress_value=0,t.last_reset_ts=$ts,t.streak=$s,t.best_streak=$b",
+                {"id": t["id"], "ts": now_s, "s": stk, "b": best})
+            t["progress_value"] = 0
+        else:
+            _conn.execute(
+                "MATCH (t:Task) WHERE t.id=$id "
+                "SET t.current_iters=0,t.last_reset_ts=$ts,t.streak=$s,t.best_streak=$b",
+                {"id": t["id"], "ts": now_s, "s": stk, "b": best})
         t.update({"current_iters": 0, "last_reset_ts": now_s, "streak": stk, "best_streak": best})
     except: pass
     return t
@@ -352,9 +359,10 @@ def _ensure_mission_quest_engine(mission_id: str, user_id: str) -> str:
         progress = float(progress_value or current_iters or 0)
         if task_type == "repeat":
             kind = "ritual"
-            mode = "count"
-            target = float(required_iters or target or 1)
-            progress = float(current_iters or progress or 0)
+            if mode not in ("count", "timed_sessions"):
+                mode = "count"
+            target = float(target_value or (required_iters if mode == "count" else 5400) or 1)
+            progress = float(progress_value or 0) if mode == "timed_sessions" else float(current_iters or progress or 0)
         if not branch_id:
             branch_id = bid
         try:
@@ -851,6 +859,10 @@ def _quest_journal_fallback(snap: dict, event_type: str, value: float = 0.0) -> 
     path=f" на Пути «{mission['title']}»"
     context=f" Это связано с {linked}." if linked else ""
     if event_type=="timer_stopped":
+        if task.get("progress_mode") == "timed_sessions":
+            target=_duration_ru(float(task.get("target_value") or 5400))
+            partial=_duration_ru(float(task.get("progress_value") or 0))
+            return f"Я держал ритуал «{task['title']}» {_duration_ru(value)}{path}. Сейчас отмечено {task['current_iters']}/{task['required_iters']} подходов по {target}; в следующем подходе уже собрано {partial}. Я учусь превращать время в форму действия, которая потом сможет стать пользой для других.{context}"
         return f"Я занимался «{task['title']}» {_duration_ru(value)}{path}. Важно помнить: время становится силой, когда я направляю его не только на свой результат, но и на пользу, которую смогу передать дальше.{context}"
     if event_type=="tick":
         return f"Я сделал шаг в ритуале «{task['title']}»: {task['current_iters']}/{task['required_iters']}{path}. Малое повторение собирает намерение: я учусь превращать привычку в действие ради большего, чем просто отметка.{context}"
@@ -1751,14 +1763,17 @@ def get_missions(u: dict = Depends(current_user)):
             {"mid":mid,"uid":uid}))
         task_list=[]
         for t in tasks:
+            pmode=t[16] or ("count" if (t[4] or "")=="repeat" else "check")
+            raw_progress=t[18]
+            progress_value=float(raw_progress if raw_progress is not None else (0 if pmode == "timed_sessions" else (t[7] or 0)))
             td={"id":t[0],"title":t[1],"status":t[2],"ts":t[3],
                 "task_type":t[4] or "once","reset_hours":int(t[5] or 24),
                 "required_iters":int(t[6] or 1),"current_iters":int(t[7] or 0),
                 "last_reset_ts":t[8] or "","streak":int(t[9] or 0),"best_streak":int(t[10] or 0),
                 "completed_ts":t[11] or "","quest_kind":t[12] or ("ritual" if (t[4] or "")=="repeat" else "task"),
                 "branch_id":t[13] or _default_branch_id(mid),"parent_id":t[14] or "",
-                "position":int(t[15] or 0),"progress_mode":t[16] or ("count" if (t[4] or "")=="repeat" else "check"),
-                "target_value":float(t[17] or t[6] or 1),"progress_value":float(t[18] or t[7] or 0),
+                "position":int(t[15] or 0),"progress_mode":pmode,
+                "target_value":float(t[17] or t[6] or 1),"progress_value":progress_value,
                 "timer_total_seconds":int(t[19] or 0),
                 "timer_started_ts":t[20] or "","unlock_rule":t[21] or "",
                 "unlock_payload":t[22] or "","locked":(t[23] or "false")=="true","notes":t[24] or "",
@@ -1913,7 +1928,10 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
     init_reset = ts if task_type == "repeat" else ""
     target_value = float(req.target_value or req.required_iters or 1)
     if task_type == "repeat":
-        target_value = float(req.required_iters or target_value or 1)
+        if progress_mode == "timed_sessions":
+            target_value = float(req.target_value or 5400)
+        else:
+            target_value = float(req.required_iters or target_value or 1)
     pos_rows=kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.mission_id=$mid AND t.branch_id=$bid AND t.user_id=$uid RETURN count(t)",
         {"mid":req.mission_id,"bid":branch_id,"uid":uid}))
@@ -1961,6 +1979,11 @@ class TaskCurrentReq(BaseModel):
 class TaskTimerRecordReq(BaseModel):
     mode: str = "none"
     period_hours: int = 24
+class TaskRitualSettingsReq(BaseModel):
+    progress_mode: str = "count"
+    required_iters: int = 1
+    reset_hours: int = 24
+    session_minutes: int = 90
 class TaskMoveReq(BaseModel):
     branch_id: str
     parent_id: str = ""
@@ -2072,6 +2095,39 @@ def set_timer_record(tid: str, req: TaskTimerRecordReq, u: dict = Depends(curren
     snap=_quest_snapshot(tid, uid)
     return {"ok":True,"task":snap["task"] if snap else {}}
 
+@app.post("/tasks/{tid}/ritual-settings")
+def set_ritual_settings(tid: str, req: TaskRitualSettingsReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    mode=(req.progress_mode or "count").strip().lower()
+    if mode not in ("count","timed_sessions"):
+        raise HTTPException(400, "Неверный режим ритуала")
+    required=max(1, int(req.required_iters or 1))
+    reset_hours=max(1, int(req.reset_hours or 24))
+    session_seconds=max(60, int(req.session_minutes or 90) * 60)
+    rows=kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.last_reset_ts,t.timer_started_ts,t.current_iters",
+        {"id":tid,"uid":uid}))
+    if not rows: raise HTTPException(404)
+    last_reset=rows[0][0] or _now_s()
+    timer_started=rows[0][1] or ""
+    current_iters=int(rows[0][2] or 0)
+    target=float(session_seconds if mode == "timed_sessions" else required)
+    progress_value=0.0 if mode == "timed_sessions" else float(current_iters)
+    updates = (
+        "t.task_type='repeat',t.quest_kind='ritual',t.progress_mode=$mode,"
+        "t.required_iters=$required,t.reset_hours=$reset,t.target_value=$target,"
+        "t.progress_value=$progress,t.last_reset_ts=$last_reset"
+    )
+    params={"id":tid,"uid":uid,"mode":mode,"required":required,"reset":reset_hours,
+            "target":target,"progress":progress_value,"last_reset":last_reset}
+    if mode == "count":
+        updates += ",t.timer_started_ts=''"
+    elif not timer_started:
+        updates += ",t.timer_started_ts=''"
+    _conn.execute(f"MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET {updates}", params)
+    snap=_quest_snapshot(tid, uid)
+    return {"ok":True,"task":snap["task"] if snap else {}}
+
 @app.post("/tasks/{tid}/move")
 def move_task(tid: str, req: TaskMoveReq, u: dict = Depends(current_user)):
     uid = _uid(u)
@@ -2171,14 +2227,23 @@ def update_task_progress(tid: str, req: TaskProgressReq, u: dict = Depends(curre
 def start_task_timer(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id,t.timer_started_ts",
+        "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN "
+        "t.mission_id,t.timer_started_ts,t.quest_kind,t.progress_mode,t.current_iters,t.required_iters",
         {"id":tid,"uid":uid}))
     if not rows: raise HTTPException(404)
-    if not rows[0][1]:
-        _conn.execute(
-            "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_started_ts=$ts,t.quest_kind='timer',t.progress_mode='timer'",
-            {"id":tid,"uid":uid,"ts":_now_s()})
-        _record_quest_event(tid, rows[0][0] or "", uid, "timer_started", 0)
+    mid,started,kind,mode,cur,req=rows[0]
+    if (mode or "") == "timed_sessions" and int(cur or 0) >= int(req or 1):
+        return {"ok":True,"already_complete":True}
+    if not started:
+        if (kind or "") == "ritual" or (mode or "") == "timed_sessions":
+            _conn.execute(
+                "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_started_ts=$ts,t.task_type='repeat',t.quest_kind='ritual'",
+                {"id":tid,"uid":uid,"ts":_now_s()})
+        else:
+            _conn.execute(
+                "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_started_ts=$ts,t.quest_kind='timer',t.progress_mode='timer'",
+                {"id":tid,"uid":uid,"ts":_now_s()})
+        _record_quest_event(tid, mid or "", uid, "timer_started", 0)
     return {"ok":True}
 
 @app.post("/tasks/{tid}/timer/stop")
@@ -2188,11 +2253,13 @@ def stop_task_timer(tid: str, u: dict = Depends(current_user)):
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN "
         "t.mission_id,t.timer_total_seconds,t.timer_started_ts,t.record_enabled,t.record_value,"
         "t.timer_record_mode,t.timer_period_hours,t.timer_period_started_ts,t.timer_period_seconds,"
-        "t.timer_last_period_seconds,t.timer_best_period_seconds,t.timer_last_session_seconds,t.timer_best_session_seconds",
+        "t.timer_last_period_seconds,t.timer_best_period_seconds,t.timer_last_session_seconds,t.timer_best_session_seconds,"
+        "t.quest_kind,t.progress_mode,t.current_iters,t.required_iters,t.target_value,t.progress_value,t.last_reset_ts",
         {"id":tid,"uid":uid}))
     if not rows: raise HTTPException(404)
     (mid,total,started,record_enabled,record_value,mode,period_hours,period_started,period_seconds,
-     last_period,best_period,last_session,best_session)=rows[0]
+     last_period,best_period,last_session,best_session,quest_kind,progress_mode,current_iters,required_iters,
+     target_value,progress_value,last_reset_ts)=rows[0]
     task={"id":tid,"timer_total_seconds":int(total or 0),"timer_started_ts":started or "",
           "record_enabled":(record_enabled or "false")=="true","record_value":float(record_value or 0),
           "timer_record_mode":mode or ("session" if (record_enabled or "false")=="true" else "none"),
@@ -2218,6 +2285,22 @@ def stop_task_timer(tid: str, u: dict = Depends(current_user)):
         record_value=float(best_period)
     elif mode == "session":
         record_value=float(best_session)
+    is_timed_ritual = (quest_kind or "") == "ritual" and (progress_mode or "") == "timed_sessions"
+    new_iters = int(current_iters or 0)
+    new_progress = float(progress_value or 0)
+    completed_ts = ""
+    if is_timed_ritual:
+        target_seconds = max(1, int(float(target_value or 5400)))
+        required = max(1, int(required_iters or 1))
+        available = max(0, int(new_progress) + int(session_delta))
+        gained = min(max(0, required - new_iters), available // target_seconds)
+        if gained > 0:
+            new_iters += int(gained)
+            available -= int(gained) * target_seconds
+        new_progress = float(0 if new_iters >= required else available)
+        completed_ts = _now_s() if new_iters >= required else ""
+        if not last_reset_ts:
+            last_reset_ts = _now_s()
     _conn.execute(
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
         "t.timer_total_seconds=$total,t.timer_started_ts='',t.progress_value=$hours,"
@@ -2226,11 +2309,18 @@ def stop_task_timer(tid: str, u: dict = Depends(current_user)):
         {"id":tid,"uid":uid,"total":new_total,"hours":round(new_total/3600, 3),
          "last_session":int(session_delta),"best_session":best_session,
          "period_seconds":period_seconds,"best_period":best_period,"record":record_value})
+    if is_timed_ritual:
+        _conn.execute(
+            "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+            "t.current_iters=$iters,t.progress_value=$progress,t.last_reset_ts=$reset,t.completed_ts=$completed",
+            {"id":tid,"uid":uid,"iters":new_iters,"progress":new_progress,
+             "reset":last_reset_ts or _now_s(),"completed":completed_ts})
     _record_quest_event(tid, mid or "", uid, "timer_stopped", float(session_delta))
     _write_quest_journal_event(tid, uid, "timer_stopped", float(session_delta))
     return {"ok":True,"timer_total_seconds":new_total,"last_session_seconds":int(session_delta),
             "best_session_seconds":best_session,"current_period_seconds":period_seconds,
-            "best_period_seconds":best_period}
+            "best_period_seconds":best_period,"current_iters":new_iters,
+            "progress_value":new_progress}
 
 @app.post("/tasks/{tid}/note")
 def save_task_note(tid: str, req: TaskNoteReq, u: dict = Depends(current_user)):
@@ -3211,6 +3301,11 @@ section.active{display:block}
 .quest-tool.current{border-color:var(--gold);background:rgba(139,105,20,.12);color:var(--gold)}
 .quest-progress-line{display:flex;align-items:center;gap:8px;margin-top:5px;
   font-size:12px;font-family:sans-serif;color:var(--ink2);flex-wrap:wrap}
+.focus-line{margin-bottom:5px}
+.focus-mini{height:5px;background:rgba(200,184,154,.38);border-radius:999px;
+  overflow:hidden;max-width:360px;margin:2px 0 7px}
+.focus-mini-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--gold));
+  border-radius:999px;transition:width .25s}
 .quest-progress-count{font-weight:700;color:var(--ink)}
 .quest-progress-count.done{color:var(--green)}
 .quest-del{background:none;border:none;color:var(--border2);cursor:pointer;
@@ -4180,6 +4275,18 @@ section.active{display:block}
           style="width:90px;margin-bottom:0" placeholder="Часов">
         <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">ч до сброса</span>
       </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-basis:100%">
+        <select class="dlg-input" id="t-ritual-mode" onchange="toggleTaskKindOpts()" style="max-width:220px;margin-bottom:0;font-family:'Georgia',serif">
+          <option value="count">Засчитывать кнопкой +1</option>
+          <option value="timed_sessions">Подходы по таймеру</option>
+        </select>
+        <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">как считать ритуал</span>
+      </div>
+      <div id="t-session-row" style="display:none;align-items:center;gap:6px;flex-basis:100%">
+        <input class="dlg-input" id="t-session-minutes" type="number" min="1" value="90"
+          style="width:90px;margin-bottom:0" placeholder="Минут">
+        <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">минут в подходе</span>
+      </div>
     </div>
     <div id="t-counter-opts" style="display:none;margin-bottom:10px">
       <input class="dlg-input" id="t-target" type="number" min="1" value="1" placeholder="Цель по счётчику">
@@ -4870,6 +4977,9 @@ async function loadAsides(){
     const kind=t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
     if(kind==='ritual'){
       const timeLeft=t.last_reset_ts?fmtCountdown(t.last_reset_ts,t.reset_hours):'';
+      if((t.progress_mode||'')==='timed_sessions'){
+        return `${timedRitualMeta(t)}${timeLeft?' · '+timeLeft:''}`;
+      }
       return `${t.current_iters||0}/${t.required_iters||1}${timeLeft?' · '+timeLeft:''}`;
     }
     if(kind==='timer'){
@@ -4905,6 +5015,27 @@ async function loadAsides(){
 function questKindName(kind, taskType=''){
   const k=kind||((taskType||'')==='repeat'?'ritual':'task');
   return {task:'квест',ritual:'ритуал',timer:'таймер',counter:'счётчик'}[k]||'квест';
+}
+function runningElapsedSeconds(ts){
+  if(!ts) return 0;
+  const started=new Date(String(ts).replace(' ','T')).getTime();
+  if(!started||Number.isNaN(started)) return 0;
+  return Math.max(0,Math.floor((Date.now()-started)/1000));
+}
+function timedRitualState(t){
+  const target=Math.max(1,Number(t.target_value||5400));
+  const running=!!t.timer_started_ts;
+  const partial=Number(t.progress_value||0)+runningElapsedSeconds(t.timer_started_ts);
+  const required=Math.max(1,Number(t.required_iters||1));
+  const done=Math.max(0,Number(t.current_iters||0));
+  const finished=done>=required;
+  const current=finished?target:Math.min(target,Math.max(0,partial));
+  const next=finished?required:Math.min(required,done+1);
+  return {target,current,required,done,next,running,pct:Math.max(0,Math.min(100,(current/target)*100))};
+}
+function timedRitualMeta(t){
+  const s=timedRitualState(t);
+  return `${s.done}/${s.required} · подход ${s.next}/${s.required}: ${fmtDuration(s.current)}/${fmtDuration(s.target)}`;
 }
 function timerRecordMode(task){
   return task?.timer_record_mode || (task?.record_enabled?'session':'none');
@@ -4973,16 +5104,65 @@ function timerRecordSettings(task){
       <button class="ent-merge-btn" onclick="saveTimerRecordSettings('${_jsEsc(task.id)}','${_jsEsc(task.mission_id||'')}')">Сохранить режим рекорда</button>
     </div>`;
 }
+function ritualSettings(task){
+  if((task?.quest_kind||'')!=='ritual') return '';
+  const mode=(task.progress_mode||'count')==='timed_sessions'?'timed_sessions':'count';
+  const minutes=Math.max(1,Math.round(Number(task.target_value||5400)/60));
+  const timed=mode==='timed_sessions';
+  const state=timed?timedRitualState(task):null;
+  return `<div class="ent-sec">Настройки ритуала</div>
+    <div class="timer-record-panel">
+      ${timed?`<div class="quest-card-meta">${timedRitualMeta(task)}</div>
+      <div class="focus-mini" style="max-width:none"><div class="focus-mini-fill" style="width:${state.pct}%"></div></div>`:''}
+      <select class="dlg-input" id="ritual-card-mode" onchange="toggleRitualCardSessionRow()" style="font-family:'Georgia',serif;margin-bottom:8px">
+        <option value="count" ${mode==='count'?'selected':''}>Ручной ритуал: кнопка +1</option>
+        <option value="timed_sessions" ${mode==='timed_sessions'?'selected':''}>Таймерные подходы</option>
+      </select>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+        <input class="dlg-input" id="ritual-card-iters" type="number" min="1" value="${task.required_iters||1}"
+          style="width:86px;margin-bottom:0">
+        <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">раз за цикл</span>
+        <input class="dlg-input" id="ritual-card-hours" type="number" min="1" value="${task.reset_hours||24}"
+          style="width:86px;margin-bottom:0">
+        <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">ч до сброса</span>
+      </div>
+      <div id="ritual-card-session-row" style="display:${timed?'flex':'none'};align-items:center;gap:6px;margin-bottom:10px">
+        <input class="dlg-input" id="ritual-card-session-minutes" type="number" min="1" value="${minutes}"
+          style="width:86px;margin-bottom:0">
+        <span style="font-size:12px;font-family:sans-serif;color:var(--ink3)">минут в подходе</span>
+      </div>
+      <button class="ent-merge-btn" onclick="saveRitualSettings('${_jsEsc(task.id)}','${_jsEsc(task.mission_id||'')}')">Сохранить ритуал</button>
+    </div>`;
+}
 function toggleTimerCardPeriodRow(){
   const mode=document.getElementById('timer-card-mode')?.value||'none';
   const row=document.getElementById('timer-card-period-row');
   if(row) row.style.display=mode==='period'?'flex':'none';
+}
+function toggleRitualCardSessionRow(){
+  const mode=document.getElementById('ritual-card-mode')?.value||'count';
+  const row=document.getElementById('ritual-card-session-row');
+  if(row) row.style.display=mode==='timed_sessions'?'flex':'none';
 }
 async function saveTimerRecordSettings(tid,mid=''){
   const mode=document.getElementById('timer-card-mode')?.value||'none';
   const period_hours=parseInt(document.getElementById('timer-card-period-hours')?.value)||24;
   const r=await fetch(`/tasks/${tid}/timer-record`,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({mode,period_hours})});
+  if(!r.ok) return;
+  if(mid) _openMissions.add(mid);
+  const active=document.querySelector('section.active');
+  if(active?.id==='s-missions') loadMissions();
+  loadAsides();
+  openTaskCard(tid);
+}
+async function saveRitualSettings(tid,mid=''){
+  const progress_mode=document.getElementById('ritual-card-mode')?.value||'count';
+  const required_iters=parseInt(document.getElementById('ritual-card-iters')?.value)||1;
+  const reset_hours=parseInt(document.getElementById('ritual-card-hours')?.value)||24;
+  const session_minutes=parseInt(document.getElementById('ritual-card-session-minutes')?.value)||90;
+  const r=await fetch(`/tasks/${tid}/ritual-settings`,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({progress_mode,required_iters,reset_hours,session_minutes})});
   if(!r.ok) return;
   if(mid) _openMissions.add(mid);
   const active=document.querySelector('section.active');
@@ -5022,6 +5202,7 @@ async function openTaskCard(tid){
     <div class="quest-card-meta">${task.is_current?'актуально сейчас':'не в активных'}${rec?' · '+_entEsc(rec):''}</div>
     ${entities?`<div class="mission-entities" style="margin:4px 0 12px">${entities}</div>`:''}
     ${task.notes?`<div class="ent-sec">Заметки игрока</div><div class="ent-summary">${_entEsc(task.notes)}</div>`:''}
+    ${ritualSettings(task)}
     ${timerRecordSettings(task)}
     <div class="ent-sec">Карточка задания</div>
     <textarea class="quest-card-textarea" id="quest-card-desc" placeholder="Что происходит в этом квесте, зачем он нужен, что важно помнить...">${_entEsc(d.description||'')}</textarea>
@@ -5207,6 +5388,7 @@ async function loadMissions(){
     const branchId=t.branch_id||defaultBranchId(m);
     const childHtml=(tree[t.id]||[]).map(ch=>renderTask(ch,m,tree)).join('');
     const badge=`<span class="quest-kind ${kindClass(kind)}">${kindTitle(kind)}</span>`;
+    const focusBadge=(kind==='ritual'&&(t.progress_mode||'')==='timed_sessions')?`<span class="quest-kind timer">подходы</span>`:'';
     const currentBadge=t.is_current?`<span class="quest-kind">актуально</span>`:'';
     const title=`<div class="quest-title ${isDone?'done':''}" id="qtitle-${t.id}">${htmlEsc(t.title)}</div>`;
     const noteHtml=notes?`<div class="quest-note-preview">${htmlEsc(notes.split('\n').slice(-1)[0])}</div>`:'';
@@ -5225,13 +5407,25 @@ async function loadMissions(){
 
     if(kind==='ritual'){
       const cycled=t.current_iters>=t.required_iters;
-      controls=`<div class="quest-progress-line">
-        <button class="iter-btn" onclick="tickTask('${jsArg(t.id)}','${jsArg(m.id)}')" ${cycled?'disabled':''}>+1</button>
-        <span class="quest-progress-count ${cycled?'done':''}">${t.current_iters||0}/${t.required_iters||1}</span>
-        <span class="streak-display">${streakMythName(t.streak)}</span>
-        <span class="streak-best">рекорд: ${t.best_streak||0}</span>
-        <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
-      </div><div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
+      if((t.progress_mode||'')==='timed_sessions'){
+        const s=timedRitualState(t);
+        controls=`<div class="quest-progress-line focus-line">
+          <button class="quest-tool ${s.running?'running':'primary'}" onclick="${s.running?`stopTimer('${jsArg(t.id)}','${jsArg(m.id)}')`:`startTimer('${jsArg(t.id)}','${jsArg(m.id)}')`};event.stopPropagation()" ${cycled?'disabled':''}>${s.running?'стоп':'старт'}</button>
+          <span class="quest-progress-count ${cycled?'done':''}">${s.done}/${s.required}</span>
+          <span class="quest-record">подход ${s.next}/${s.required}: ${fmtDuration(s.current)}/${fmtDuration(s.target)}</span>
+          <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
+        </div>
+        <div class="focus-mini"><div class="focus-mini-fill" style="width:${s.pct}%"></div></div>
+        <div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
+      } else {
+        controls=`<div class="quest-progress-line">
+          <button class="iter-btn" onclick="tickTask('${jsArg(t.id)}','${jsArg(m.id)}')" ${cycled?'disabled':''}>+1</button>
+          <span class="quest-progress-count ${cycled?'done':''}">${t.current_iters||0}/${t.required_iters||1}</span>
+          <span class="streak-display">${streakMythName(t.streak)}</span>
+          <span class="streak-best">рекорд: ${t.best_streak||0}</span>
+          <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
+        </div><div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
+      }
     } else if(kind==='timer'){
       const running=!!t.timer_started_ts;
       controls=`<div class="quest-progress-line">
@@ -5257,7 +5451,7 @@ async function loadMissions(){
       <div class="quest-item ${kind==='ritual'?'repeat-task':''}">
         ${lead}
         <div class="quest-info">
-          <div class="quest-meta">${badge}${currentBadge}${t.locked?'<span class="quest-kind">закрыто</span>':''}</div>
+          <div class="quest-meta">${badge}${focusBadge}${currentBadge}${t.locked?'<span class="quest-kind">закрыто</span>':''}</div>
           ${title}
           ${noteHtml}
           ${controls}
@@ -5400,6 +5594,8 @@ function openTaskDlg(mid,branchId='',parentId=''){
   document.getElementById('t-iters').value='1';
   document.getElementById('t-hours').value='24';
   document.getElementById('t-target').value='1';
+  document.getElementById('t-ritual-mode').value='count';
+  document.getElementById('t-session-minutes').value='90';
   document.getElementById('t-timer-record-mode').value='none';
   document.getElementById('t-period-hours').value='24';
   document.getElementById('t-current').checked=false;
@@ -5421,9 +5617,11 @@ async function saveTask(){
   const iters=parseInt(document.getElementById('t-iters')?.value)||1;
   const hours=parseInt(document.getElementById('t-hours')?.value)||24;
   const target=parseFloat(document.getElementById('t-target')?.value)||1;
+  const ritualMode=document.getElementById('t-ritual-mode')?.value||'count';
+  const sessionMinutes=parseInt(document.getElementById('t-session-minutes')?.value)||90;
   const taskType=kind==='ritual'?'repeat':'once';
-  const progressMode=kind==='ritual'?'count':kind==='timer'?'timer':kind==='counter'?'number':'check';
-  const targetValue=kind==='ritual'?iters:(kind==='counter'?target:1);
+  const progressMode=kind==='ritual'?ritualMode:kind==='timer'?'timer':kind==='counter'?'number':'check';
+  const targetValue=kind==='ritual'?(ritualMode==='timed_sessions'?sessionMinutes*60:iters):(kind==='counter'?target:1);
   const current=document.getElementById('t-current')?.checked||false;
   const timerRecordMode=kind==='timer'?(document.getElementById('t-timer-record-mode')?.value||'none'):'none';
   const periodHours=parseInt(document.getElementById('t-period-hours')?.value)||24;
@@ -5451,6 +5649,9 @@ function toggleTaskKindOpts(){
   const kind=document.querySelector('input[name="t-kind"]:checked')?.value||'task';
   const opts=document.getElementById('t-repeat-opts');
   if(opts) opts.style.display=kind==='ritual'?'flex':'none';
+  const ritualMode=document.getElementById('t-ritual-mode')?.value||'count';
+  const sessionRow=document.getElementById('t-session-row');
+  if(sessionRow) sessionRow.style.display=(kind==='ritual'&&ritualMode==='timed_sessions')?'flex':'none';
   const counter=document.getElementById('t-counter-opts');
   if(counter) counter.style.display=kind==='counter'?'block':'none';
   const timer=document.getElementById('t-timer-opts');
@@ -5844,6 +6045,12 @@ function tickCountdowns(){
   });
 }
 setInterval(tickCountdowns,30000);
+setInterval(()=>{
+  if(document.querySelector('#s-missions.active .quest-tool.running')){
+    loadMissions();
+    loadAsides();
+  }
+},30000);
 
 let _prevInboxCount = -1;
 setInterval(async ()=>{
