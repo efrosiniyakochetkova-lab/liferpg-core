@@ -600,6 +600,13 @@ def _timer_effective_seconds(total: int, started_ts: str) -> int:
     except:
         return total
 
+def _timed_ritual_elapsed_seconds(task: dict) -> int:
+    elapsed = max(0, int(float(task.get("progress_value") or 0)))
+    started = _dt_from_s(task.get("timer_started_ts") or "")
+    if started:
+        elapsed += max(0, int((datetime.now() - started).total_seconds()))
+    return elapsed
+
 def _dt_from_s(ts: str) -> datetime | None:
     if not ts: return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
@@ -815,6 +822,7 @@ def _quest_snapshot(tid: str, user_id: str) -> dict | None:
         task["timer_best_period_seconds"]=max(int(task.get("timer_best_period_seconds") or 0),
                                               int(task.get("timer_current_period_seconds") or 0))
     task["timer_total_seconds"]=_timer_effective_seconds(int(task.get("timer_total_seconds") or 0), task.get("timer_started_ts") or "")
+    task["timed_elapsed_seconds"]=_timed_ritual_elapsed_seconds(task) if task.get("progress_mode") == "timed_sessions" else int(float(task.get("progress_value") or 0))
     return {
         "task":task,
         "mission":{"title":mrows[0][0] if mrows else "Путь","description":mrows[0][1] if mrows else "",
@@ -1802,6 +1810,7 @@ def get_missions(u: dict = Depends(current_user)):
                                                     int(td.get("timer_current_period_seconds") or 0))
             td["timer_total_seconds"]=_timer_effective_seconds(int(td.get("timer_total_seconds") or 0), td.get("timer_started_ts") or "")
             td=_maybe_reset_task(td)
+            td["timed_elapsed_seconds"]=_timed_ritual_elapsed_seconds(td) if td.get("progress_mode") == "timed_sessions" else int(float(td.get("progress_value") or 0))
             task_list.append(td)
         # Linked entities
         eid=_mission_entity_id(mid, r[1], uid)
@@ -5131,8 +5140,11 @@ function runningElapsedSeconds(ts){
 }
 function timedRitualState(t){
   const target=Math.max(1,Number(t.target_value||5400));
-  const running=!!t.timer_started_ts;
-  const partial=Number(t.progress_value||0)+runningElapsedSeconds(t.timer_started_ts);
+  const running=!!t.timer_started_ts||t.timer_running===true||t.timer_running==='true';
+  const baseProgress=Number(t.timed_elapsed_seconds ?? t.progress_value ?? 0);
+  const renderMs=Number(t.client_render_ms||0);
+  const liveElapsed=(running&&renderMs)?Math.max(0,Math.floor((Date.now()-renderMs)/1000)):0;
+  const partial=baseProgress+liveElapsed;
   const required=Math.max(1,Number(t.required_iters||1));
   const done=Math.max(0,Number(t.current_iters||0));
   const finished=done>=required;
@@ -5164,11 +5176,14 @@ function timedRitualMetaHtml(t,mid=''){
   return `${s.done}/${s.required} · <span class="timed-ritual-clock" ${timedRitualAttrs(t,mid)}>${_entEsc(timedRitualLabel(s))}</span>`;
 }
 function timedRitualAttrs(t,mid=''){
-  return `data-task-id="${_entEsc(t.id||'')}" data-mission-id="${_entEsc(mid||t.mission_id||'')}" data-started-ts="${_entEsc(t.timer_started_ts||'')}" data-progress="${Number(t.progress_value||0)}" data-target="${Math.max(1,Number(t.target_value||5400))}" data-done="${Number(t.current_iters||0)}" data-required="${Math.max(1,Number(t.required_iters||1))}"`;
+  const progress=Number(t.timed_elapsed_seconds ?? t.progress_value ?? 0);
+  return `data-task-id="${_entEsc(t.id||'')}" data-mission-id="${_entEsc(mid||t.mission_id||'')}" data-started-ts="${_entEsc(t.timer_started_ts||'')}" data-running="${t.timer_started_ts?'true':'false'}" data-render-ms="${Date.now()}" data-progress="${progress}" data-target="${Math.max(1,Number(t.target_value||5400))}" data-done="${Number(t.current_iters||0)}" data-required="${Math.max(1,Number(t.required_iters||1))}"`;
 }
 function timedRitualStateFromEl(el){
   return timedRitualState({
     timer_started_ts:el.dataset.startedTs||'',
+    timer_running:el.dataset.running||'false',
+    client_render_ms:Number(el.dataset.renderMs||0),
     progress_value:Number(el.dataset.progress||0),
     target_value:Number(el.dataset.target||5400),
     current_iters:Number(el.dataset.done||0),
