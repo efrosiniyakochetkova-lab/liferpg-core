@@ -5020,11 +5020,11 @@ async function loadAsides(){
     }
     return t.parent_id?'шаг квеста':'квест';
   };
-  const questMetaHtml=t=>{
+  const questMetaHtml=(t,mid='')=>{
     const kind=t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
     if(kind==='ritual'&&(t.progress_mode||'')==='timed_sessions'){
       const timeLeft=t.last_reset_ts?fmtCountdown(t.last_reset_ts,t.reset_hours):'';
-      return `${timedRitualMetaHtml(t)}${timeLeft?' · '+_entEsc(timeLeft):''}`;
+      return `${timedRitualMetaHtml(t,mid)}${timeLeft?' · '+_entEsc(timeLeft):''}`;
     }
     if(kind==='timer'){
       const rec=timerRecordSummary(t,true);
@@ -5044,9 +5044,9 @@ async function loadAsides(){
       return `<div class="aside-quest-actions">
           <button class="aside-action ${btnClass}" onclick="${s.running?`stopTimer('${tid}','${midArg}')`:`startTimer('${tid}','${midArg}')`};event.stopPropagation()" ${cycled?'disabled':''}>${label}</button>
           <span class="aside-quest-meta">${s.done}/${s.required}</span>
-          <span class="aside-quest-meta timed-ritual-clock" ${timedRitualAttrs(t)}>${timedRitualLabel(s)}</span>
+          <span class="aside-quest-meta timed-ritual-clock" ${timedRitualAttrs(t,mid)}>${timedRitualLabel(s)}</span>
         </div>
-        <div class="aside-progress"><div class="aside-progress-fill timed-ritual-fill" ${timedRitualAttrs(t)} style="width:${s.pct}%"></div></div>`;
+        <div class="aside-progress"><div class="aside-progress-fill timed-ritual-fill" ${timedRitualAttrs(t,mid)} style="width:${s.pct}%"></div></div>`;
     }
     if(kind==='ritual'){
       const cycled=(t.current_iters||0)>=(t.required_iters||1);
@@ -5081,7 +5081,7 @@ async function loadAsides(){
       const tasksHtml=m.currentTasks.map(t=>{
         return `<div class="aside-quest" onclick="openTaskCard('${_jsEsc(t.id)}')">
           <div class="aside-quest-title">${_entEsc(t.title)}</div>
-          <div class="aside-quest-meta">${questMetaHtml(t)}</div>
+          <div class="aside-quest-meta">${questMetaHtml(t,m.id)}</div>
           ${asideControls(t,m.id)}
         </div>`;
       }).join('');
@@ -5135,12 +5135,12 @@ function timedRitualMeta(t){
   const s=timedRitualState(t);
   return `${s.done}/${s.required} · ${timedRitualLabel(s)}`;
 }
-function timedRitualMetaHtml(t){
+function timedRitualMetaHtml(t,mid=''){
   const s=timedRitualState(t);
-  return `${s.done}/${s.required} · <span class="timed-ritual-clock" ${timedRitualAttrs(t)}>${_entEsc(timedRitualLabel(s))}</span>`;
+  return `${s.done}/${s.required} · <span class="timed-ritual-clock" ${timedRitualAttrs(t,mid)}>${_entEsc(timedRitualLabel(s))}</span>`;
 }
-function timedRitualAttrs(t){
-  return `data-started-ts="${_entEsc(t.timer_started_ts||'')}" data-progress="${Number(t.progress_value||0)}" data-target="${Math.max(1,Number(t.target_value||5400))}" data-done="${Number(t.current_iters||0)}" data-required="${Math.max(1,Number(t.required_iters||1))}"`;
+function timedRitualAttrs(t,mid=''){
+  return `data-task-id="${_entEsc(t.id||'')}" data-mission-id="${_entEsc(mid||t.mission_id||'')}" data-started-ts="${_entEsc(t.timer_started_ts||'')}" data-progress="${Number(t.progress_value||0)}" data-target="${Math.max(1,Number(t.target_value||5400))}" data-done="${Number(t.current_iters||0)}" data-required="${Math.max(1,Number(t.required_iters||1))}"`;
 }
 function timedRitualStateFromEl(el){
   return timedRitualState({
@@ -5151,9 +5151,25 @@ function timedRitualStateFromEl(el){
     required_iters:Number(el.dataset.required||1)
   });
 }
+const _autoCompletingRituals=new Set();
+function autoCompleteTimedRitual(el,state,seen){
+  const tid=el.dataset.taskId||'';
+  if(!tid||!state.running||state.finished||state.remaining>0||seen.has(tid)||_autoCompletingRituals.has(tid)) return;
+  seen.add(tid);
+  _autoCompletingRituals.add(tid);
+  el.textContent=`подход ${state.next}/${state.required}: завершаю`;
+  stopTimer(tid,el.dataset.missionId||'')
+    .catch(()=>{})
+    .finally(()=>_autoCompletingRituals.delete(tid));
+}
 function tickTimedRitualClocks(){
+  const seenAutoComplete=new Set();
   document.querySelectorAll('.timed-ritual-clock').forEach(el=>{
-    el.textContent=timedRitualLabel(timedRitualStateFromEl(el));
+    const state=timedRitualStateFromEl(el);
+    el.textContent=(state.running&&!state.finished&&state.remaining<=0)
+      ?`подход ${state.next}/${state.required}: завершаю`
+      :timedRitualLabel(state);
+    autoCompleteTimedRitual(el,state,seenAutoComplete);
   });
   document.querySelectorAll('.timed-ritual-fill').forEach(el=>{
     el.style.width=timedRitualStateFromEl(el).pct+'%';
@@ -5261,8 +5277,8 @@ function ritualSettings(task){
   const state=timed?timedRitualState(task):null;
   return `<div class="ent-sec">Настройки ритуала</div>
     <div class="timer-record-panel">
-      ${timed?`<div class="quest-card-meta">${state.done}/${state.required} · <span class="timed-ritual-clock" ${timedRitualAttrs(task)}>${timedRitualLabel(state)}</span></div>
-      <div class="focus-mini" style="max-width:none"><div class="focus-mini-fill timed-ritual-fill" ${timedRitualAttrs(task)} style="width:${state.pct}%"></div></div>`:''}
+      ${timed?`<div class="quest-card-meta">${state.done}/${state.required} · <span class="timed-ritual-clock" ${timedRitualAttrs(task,task.mission_id||'')}>${timedRitualLabel(state)}</span></div>
+      <div class="focus-mini" style="max-width:none"><div class="focus-mini-fill timed-ritual-fill" ${timedRitualAttrs(task,task.mission_id||'')} style="width:${state.pct}%"></div></div>`:''}
       <select class="dlg-input" id="ritual-card-mode" onchange="toggleRitualCardSessionRow()" style="font-family:'Georgia',serif;margin-bottom:8px">
         <option value="count" ${mode==='count'?'selected':''}>Ручной ритуал: кнопка +1</option>
         <option value="timed_sessions" ${mode==='timed_sessions'?'selected':''}>Таймерные подходы</option>
@@ -5563,10 +5579,10 @@ async function loadMissions(){
         controls=`<div class="quest-progress-line focus-line">
           <button class="quest-tool ${btnClass}" onclick="${s.running?`stopTimer('${jsArg(t.id)}','${jsArg(m.id)}')`:`startTimer('${jsArg(t.id)}','${jsArg(m.id)}')`};event.stopPropagation()" ${cycled?'disabled':''}>${label}</button>
           <span class="quest-progress-count ${cycled?'done':''}">${s.done}/${s.required}</span>
-          <span class="quest-record timed-ritual-clock" ${timedRitualAttrs(t)}>${timedRitualLabel(s)}</span>
+          <span class="quest-record timed-ritual-clock" ${timedRitualAttrs(t,m.id)}>${timedRitualLabel(s)}</span>
           <span class="reset-hint" data-reset-ts="${t.last_reset_ts||''}" data-reset-hours="${t.reset_hours||24}">· ${fmtCountdown(t.last_reset_ts,t.reset_hours)}</span>
         </div>
-        <div class="focus-mini"><div class="focus-mini-fill timed-ritual-fill" ${timedRitualAttrs(t)} style="width:${s.pct}%"></div></div>
+        <div class="focus-mini"><div class="focus-mini-fill timed-ritual-fill" ${timedRitualAttrs(t,m.id)} style="width:${s.pct}%"></div></div>
         <div class="quest-tools">${addChild}${cardBtn}${currentBtn}${noteBtn}</div>`;
       } else {
         controls=`<div class="quest-progress-line">
