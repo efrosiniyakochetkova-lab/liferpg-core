@@ -5020,6 +5020,14 @@ async function loadAsides(){
     }
     return t.parent_id?'шаг квеста':'квест';
   };
+  const questMetaHtml=t=>{
+    const kind=t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
+    if(kind==='ritual'&&(t.progress_mode||'')==='timed_sessions'){
+      const timeLeft=t.last_reset_ts?fmtCountdown(t.last_reset_ts,t.reset_hours):'';
+      return `${timedRitualMetaHtml(t)}${timeLeft?' · '+_entEsc(timeLeft):''}`;
+    }
+    return _entEsc(questMeta(t));
+  };
   const pct=(cur,target)=>Math.max(0,Math.min(100,(Number(cur||0)/Math.max(1,Number(target||1)))*100));
   const asideControls=(t,mid)=>{
     const kind=t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
@@ -5069,7 +5077,7 @@ async function loadAsides(){
       const tasksHtml=m.currentTasks.map(t=>{
         return `<div class="aside-quest" onclick="openTaskCard('${_jsEsc(t.id)}')">
           <div class="aside-quest-title">${_entEsc(t.title)}</div>
-          <div class="aside-quest-meta">${_entEsc(questMeta(t))}</div>
+          <div class="aside-quest-meta">${questMetaHtml(t)}</div>
           ${asideControls(t,m.id)}
         </div>`;
       }).join('');
@@ -5079,6 +5087,8 @@ async function loadAsides(){
       <div>${tasksHtml}</div>`;
     }).join('')
     :'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif;line-height:1.5">нет актуальных квестов</div>';
+  ensureTimedRitualTicker();
+  tickTimedRitualClocks();
 }
 
 function questKindName(kind, taskType=''){
@@ -5121,6 +5131,10 @@ function timedRitualMeta(t){
   const s=timedRitualState(t);
   return `${s.done}/${s.required} · ${timedRitualLabel(s)}`;
 }
+function timedRitualMetaHtml(t){
+  const s=timedRitualState(t);
+  return `${s.done}/${s.required} · <span class="timed-ritual-clock" ${timedRitualAttrs(t)}>${_entEsc(timedRitualLabel(s))}</span>`;
+}
 function timedRitualAttrs(t){
   return `data-started-ts="${_entEsc(t.timer_started_ts||'')}" data-progress="${Number(t.progress_value||0)}" data-target="${Math.max(1,Number(t.target_value||5400))}" data-done="${Number(t.current_iters||0)}" data-required="${Math.max(1,Number(t.required_iters||1))}"`;
 }
@@ -5140,6 +5154,11 @@ function tickTimedRitualClocks(){
   document.querySelectorAll('.timed-ritual-fill').forEach(el=>{
     el.style.width=timedRitualStateFromEl(el).pct+'%';
   });
+}
+let _timedRitualTicker=null;
+function ensureTimedRitualTicker(){
+  if(_timedRitualTicker) return;
+  _timedRitualTicker=setInterval(tickTimedRitualClocks,1000);
 }
 function timerRecordMode(task){
   return task?.timer_record_mode || (task?.record_enabled?'session':'none');
@@ -5636,6 +5655,8 @@ async function loadMissions(){
     if(chain) chain.classList.add('open');
     if(chev) chev.classList.add('open');
   });
+  ensureTimedRitualTicker();
+  tickTimedRitualClocks();
 }
 
 function editMissionDesc(mid){
@@ -5802,13 +5823,21 @@ async function progressTask(tid,mid,delta){
     body:JSON.stringify({delta})});
   _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
 }
+async function refreshQuestViews(mid){
+  if(mid) _openMissions.add(mid);
+  await loadMissions();
+  await loadAsides();
+  await loadCharacter();
+  ensureTimedRitualTicker();
+  tickTimedRitualClocks();
+}
 async function startTimer(tid,mid){
   await fetch(`/tasks/${tid}/timer/start`,{method:'POST'});
-  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
+  await refreshQuestViews(mid);
 }
 async function stopTimer(tid,mid){
   await fetch(`/tasks/${tid}/timer/stop`,{method:'POST'});
-  _openMissions.add(mid); loadMissions(); loadAsides(); loadCharacter();
+  await refreshQuestViews(mid);
 }
 async function addTaskNote(tid,mid){
   const note=prompt('Заметка к квесту');
@@ -6151,7 +6180,7 @@ function tickCountdowns(){
   });
 }
 setInterval(tickCountdowns,30000);
-setInterval(tickTimedRitualClocks,1000);
+ensureTimedRitualTicker();
 setInterval(()=>{
   if(document.querySelector('#s-missions.active .quest-tool.running')){
     loadMissions();
