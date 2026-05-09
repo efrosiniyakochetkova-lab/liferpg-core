@@ -731,23 +731,30 @@ def _force_oracle_fallback(force_key: str, forces: dict, evidence: list[dict]) -
     score = forces.get(force_key, 0)
     other_key = "giving" if force_key == "receiving" else "receiving"
     other_score = forces.get(other_key, 0)
+    basis = []
+    for item in evidence[:2]:
+        terms = ", ".join((item.get("terms") or [])[:4])
+        text = (item.get("text") or "").strip()
+        if len(text) > 56:
+            text = text[:53].rstrip() + "..."
+        basis.append(f"{text}" + (f" ({terms})" if terms else ""))
+    basis_text = "; ".join(basis) if basis else "пока мало следов, нужны записи и действия"
     if force_key == "receiving":
-        meaning = "Получение здесь — желание взять форму: результат, опыт, деньги, внимание, отдых, удовольствие, силу и материал для следующего хода. Это не грязь и не запрет, а топливо персонажа."
-        instruction = "Играй этим как огнём: бери ресурс честно, называй конкретный результат и сразу смотри, во что он может быть превращён дальше. Если полученное остаётся только для насыщения себя, сила замыкается; если становится материалом для дела, людей и создания, она начинает переходить в отдачу."
+        meaning = "желание взять ресурс, опыт, внимание и силу как материал"
+        instruction = "бери честно и сразу ищи, во что это можно превратить для дела"
     else:
-        meaning = "Отдача здесь — не самоотмена и не обязанность, а свойство, где полученное разворачивается наружу: в пользу, помощь, обучение, создание, заботу, точность и дело."
-        instruction = "Играй этим как синим вектором: не гаси желание получать, а направляй его так, чтобы результат становился полезной формой. Сила растёт там, где Герой не просто делает отметку, а превращает своё время, опыт и внимание в вклад во внешний мир."
-    lines = []
-    for item in evidence[:4]:
-        label = item.get("event") or item.get("source") or "след"
-        nodes = ", ".join(item.get("nodes") or [])
-        terms = ", ".join(item.get("terms") or [])
-        tail = []
-        if nodes: tail.append(f"узлы: {nodes}")
-        if terms: tail.append(f"маркеры: {terms}")
-        lines.append(f"{item.get('ts','')[:16]} — {label}: {item.get('text','')}" + (f" ({'; '.join(tail)})" if tail else ""))
-    evidence_text = "\n".join(f"• {x}" for x in lines) if lines else "• Пока мало следов: сила считается, но ей не хватает дневниковых и квестовых фактов."
-    return f"{force_name}: {score}/100 против {other_score}/100. {meaning}\n\nИз чего это сложилось:\n{evidence_text}\n\nИгровая инструкция: {instruction}"
+        meaning = "способность превратить полученное в пользу, помощь, создание и вклад"
+        instruction = "не гаси получение, а направляй его в полезную форму"
+    return _one_screen_oracle_text(
+        f"{force_name} {score}/100 против {other_score}/100: это {meaning}. Сложилось из: {basis_text}. Ход: {instruction}."
+    )
+
+def _one_screen_oracle_text(text: str, max_chars: int = 360) -> str:
+    text = re.sub(r"\s+", " ", _clean_journal_text(text or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars].rsplit(" ", 1)[0].rstrip(" .,;:")
+    return cut + "..."
 
 def _timer_effective_seconds(total: int, started_ts: str) -> int:
     total = int(total or 0)
@@ -2977,7 +2984,7 @@ def oracle(req: OracleReq, u: dict = Depends(current_user)):
         current=forces.get(req.mechanic_value,0)
         other=forces.get("giving" if req.mechanic_value=="receiving" else "receiving",0)
         nodes=", ".join(n["name"] for n in forces.get("top_nodes",[])[:4]) or "нет явных узлов"
-        evidence = (forces.get("force_evidence") or {}).get(req.mechanic_value, [])[:6]
+        evidence = (forces.get("force_evidence") or {}).get(req.mechanic_value, [])[:4]
         evidence_lines = "\n".join(
             f"- [{x.get('ts','')}] {x.get('source','')}/{x.get('event') or 'след'}: {x.get('text','')} "
             f"| узлы: {', '.join(x.get('nodes') or []) or 'нет'} "
@@ -3012,11 +3019,10 @@ def oracle(req: OracleReq, u: dict = Depends(current_user)):
 Активные Пути:
 {mission_lines}
 
-Сделай 2 коротких абзаца.
-Абзац 1: "как сформировалось" — прямо ссылайся на действия/записи из следов.
-Абзац 2: "игровая инструкция" — как Герою играть этой силой дальше, не запрещая противоположную силу.
+Верни РОВНО ОДИН абзац до 42 слов и до 360 символов. Без заголовков, списков, переносов строк и markdown.
+Внутри абзаца обязательно: счёт силы, 1-2 причины из следов, короткая игровая инструкция.
 Пиши от лица мира игры, но трезво, конкретно, без случайного пафоса."""
-        text=_clean_journal_text(_call_any_ai(p).strip())
+        text=_one_screen_oracle_text(_call_any_ai(p).strip())
         if not text:
             text = _force_oracle_fallback(req.mechanic_value, forces, evidence)
         return {
@@ -3953,7 +3959,8 @@ section.active{display:block}
   font-style:italic;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border2)}
 .oracle-body{font-size:15px;color:var(--ink2);line-height:1.85;font-style:italic;
   min-height:80px;white-space:pre-line}
-.oracle-force-text{font-style:italic;white-space:pre-line;margin-bottom:18px}
+.oracle-force-text{font-style:italic;white-space:normal;margin-bottom:0;line-height:1.65}
+.oracle-force-compact{font-size:14px}
 .oracle-evidence{border-top:1px solid var(--border2);padding-top:14px;margin-top:14px;
   font-family:sans-serif;font-style:normal}
 .oracle-evidence-title{font-size:9px;letter-spacing:2.4px;text-transform:uppercase;
@@ -4905,26 +4912,7 @@ tickClock(); setInterval(tickClock,30000);
 
 // ── Oracle ───────────────────────────────────────────────────────────────────
 function renderForceOracle(d){
-  const ev=d.evidence||[];
-  const maxImpact=Math.max(.001,...ev.map(x=>Number(x.impact||0)));
-  const forceClass=d.force==='giving'?'giving':'receiving';
-  const evidenceHtml=ev.length?ev.slice(0,6).map(x=>{
-    const meta=[localTimeHM(x.ts),localDisplayDate(x.ts),x.source,x.event].filter(Boolean).join(' · ');
-    const nodes=(x.nodes||[]).filter(Boolean).join(' · ');
-    const terms=(x.terms||[]).filter(Boolean).join(' · ');
-    const pct=Math.max(4,Math.min(100,Number(x.impact||0)/maxImpact*100));
-    return `<div class="oracle-evidence-item">
-      <div class="oracle-evidence-meta">${htmlesc(meta)} · доверие ${parseInt(x.trust||0)}%</div>
-      <div class="oracle-evidence-text">${htmlesc(x.text||'')}</div>
-      ${(nodes||terms)?`<div class="oracle-evidence-tags">${nodes?`узлы: ${htmlesc(nodes)}`:''}${nodes&&terms?' · ':''}${terms?`маркеры: ${htmlesc(terms)}`:''}</div>`:''}
-      <div class="oracle-evidence-impact"><div class="oracle-evidence-fill ${forceClass}" style="width:${pct}%"></div></div>
-    </div>`;
-  }).join(''):'<div class="oracle-evidence-text">Пока мало следов. Сила есть, но ей нужно больше дневника и действий.</div>';
-  return `<div class="oracle-force-text">${htmlesc(d.text||'')}</div>
-    <div class="oracle-evidence">
-      <div class="oracle-evidence-title">Следы расчёта · ${htmlesc(d.balance||'')}</div>
-      ${evidenceHtml}
-    </div>`;
+  return `<div class="oracle-force-text oracle-force-compact">${htmlesc(d.text||'')}</div>`;
 }
 function openOracle(type,value,effect,label){
   const m=document.getElementById('oracle-modal');
