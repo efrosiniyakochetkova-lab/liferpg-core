@@ -7,9 +7,11 @@ server.log
 .DS_Store
 app_config.json
 pocket_config.json
+pocket_config.*.json
 inbox.json
 sessions.json
 character.json
+character.*.json
 .schema_v
 __pycache__/
 *.pyc

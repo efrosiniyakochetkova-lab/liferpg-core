@@ -1395,8 +1395,8 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     # Entries
     for e in d.get("entries",[]):
         try:
-            _conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":e["id"]})
-            rows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id RETURN x.id",{"id":e["id"]}))
+            rows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                         {"id":e["id"],"uid":uid}))
             if not rows:
                 _conn.execute("CREATE (:Entry {id:$id,ts:$ts,raw_text:$r,narrative:$n,archivist_note:$a,user_id:$uid})",
                     {"id":e["id"],"ts":e.get("ts",""),"r":e.get("raw_text",""),
@@ -1417,15 +1417,16 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     except: pass
     for m in d.get("missions",[]):
         try:
-            rows=kuzu_rows(_conn.execute("MATCH (x:Mission) WHERE x.id=$id RETURN x.id",{"id":m["id"]}))
+            rows=kuzu_rows(_conn.execute("MATCH (x:Mission) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                         {"id":m["id"],"uid":uid}))
             if not rows:
                 try:
-                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,lore:$l,user_id:$uid})",
-                        {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
+                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:$s,ts:$ts,lore:$l,user_id:$uid})",
+                        {"id":m["id"],"t":m["title"],"d":m.get("description",""),
                          "s":m.get("status","active"),"ts":m.get("ts",""),"l":m.get("lore",""),"uid":uid})
                 except:
-                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$desc,status:$s,ts:$ts,user_id:$uid})",
-                        {"id":m["id"],"t":m["title"],"desc":m.get("description",""),
+                    _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:$s,ts:$ts,user_id:$uid})",
+                        {"id":m["id"],"t":m["title"],"d":m.get("description",""),
                          "s":m.get("status","active"),"ts":m.get("ts",""),"uid":uid})
                 imported["missions"]+=1
         except: pass
@@ -1444,7 +1445,8 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     # Tasks
     for t in d.get("tasks",[]):
         try:
-            rows=kuzu_rows(_conn.execute("MATCH (x:Task) WHERE x.id=$id RETURN x.id",{"id":t["id"]}))
+            rows=kuzu_rows(_conn.execute("MATCH (x:Task) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                         {"id":t["id"],"uid":uid}))
             if not rows:
                 branch_id=t.get("branch_id","") or (_ensure_default_branch(t.get("mission_id",""), uid) if t.get("mission_id","") else "")
                 _conn.execute(
@@ -1493,7 +1495,8 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     # Finances
     for f in d.get("finances",[]):
         try:
-            rows=kuzu_rows(_conn.execute("MATCH (x:Finance) WHERE x.id=$id RETURN x.id",{"id":f["id"]}))
+            rows=kuzu_rows(_conn.execute("MATCH (x:Finance) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
+                                         {"id":f["id"],"uid":uid}))
             if not rows:
                 _conn.execute("CREATE (:Finance {id:$id,amount:$a,direction:$dir,category:$c,note:$n,ts:$ts,user_id:$uid})",
                     {"id":f["id"],"a":float(f.get("amount",0)),"dir":f.get("direction","out"),
@@ -1504,12 +1507,19 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     for lnk in d.get("links",[]):
         try:
             if entity_exists(lnk["from"], uid) and entity_exists(lnk["to"], uid):
-                _conn.execute(
-                    "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid "
-                    "MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid "
-                    "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
-                    {"f":lnk["from"],"t":lnk["to"],"uid":uid,"l":lnk.get("label",""),"e":lnk.get("entry_id","import")})
-                imported["links"]+=1
+                rel_rows=kuzu_rows(_conn.execute(
+                    "MATCH (a:Entity)-[r:LINKED]->(b:Entity) "
+                    "WHERE a.id=$f AND a.user_id=$uid AND b.id=$t AND b.user_id=$uid "
+                    "AND r.label=$l AND r.entry_id=$e RETURN r.entry_id",
+                    {"f":lnk["from"],"t":lnk["to"],"uid":uid,
+                     "l":lnk.get("label",""),"e":lnk.get("entry_id","import")}))
+                if not rel_rows:
+                    _conn.execute(
+                        "MATCH (a:Entity) WHERE a.id=$f AND a.user_id=$uid "
+                        "MATCH (b:Entity) WHERE b.id=$t AND b.user_id=$uid "
+                        "CREATE (a)-[:LINKED{label:$l,entry_id:$e}]->(b)",
+                        {"f":lnk["from"],"t":lnk["to"],"uid":uid,"l":lnk.get("label",""),"e":lnk.get("entry_id","import")})
+                    imported["links"]+=1
         except: pass
     # Mentions
     for mn in d.get("mentions",[]):
@@ -1517,10 +1527,15 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
             erows=kuzu_rows(_conn.execute("MATCH (x:Entry) WHERE x.id=$id AND x.user_id=$uid RETURN x.id",
                                           {"id":mn["entry_id"],"uid":uid}))
             if erows and entity_exists(mn["entity_id"], uid):
-                _conn.execute(
-                    "MATCH (e:Entry) WHERE e.id=$eid AND e.user_id=$uid "
-                    "MATCH (n:Entity) WHERE n.id=$nid AND n.user_id=$uid "
-                    "CREATE (e)-[:MENTIONS]->(n)",{"eid":mn["entry_id"],"nid":mn["entity_id"],"uid":uid})
+                rel_rows=kuzu_rows(_conn.execute(
+                    "MATCH (e:Entry)-[:MENTIONS]->(n:Entity) "
+                    "WHERE e.id=$eid AND e.user_id=$uid AND n.id=$nid AND n.user_id=$uid RETURN n.id",
+                    {"eid":mn["entry_id"],"nid":mn["entity_id"],"uid":uid}))
+                if not rel_rows:
+                    _conn.execute(
+                        "MATCH (e:Entry) WHERE e.id=$eid AND e.user_id=$uid "
+                        "MATCH (n:Entity) WHERE n.id=$nid AND n.user_id=$uid "
+                        "CREATE (e)-[:MENTIONS]->(n)",{"eid":mn["entry_id"],"nid":mn["entity_id"],"uid":uid})
         except: pass
     # Quest events
     for ev in d.get("events",[]):
