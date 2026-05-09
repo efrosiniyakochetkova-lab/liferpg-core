@@ -4,11 +4,11 @@ Parchment · Knowledge Graph · Колесо Миров · AI Архивариу
 """
 import json, uuid, re, subprocess, time, threading, os, hashlib, hmac, secrets, math
 import urllib.request as _ur
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import kuzu
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -298,10 +298,9 @@ def _maybe_reset_task(t: dict) -> dict:
     if t.get("task_type") != "repeat" or not t.get("last_reset_ts"):
         return t
     try:
-        from datetime import timedelta
         last = datetime.strptime(t["last_reset_ts"], "%Y-%m-%d %H:%M")
         due  = last + timedelta(hours=int(t.get("reset_hours", 24)))
-        if datetime.now() < due:
+        if _utcnow() < due:
             return t
         # Reset cycle
         cur  = int(t.get("current_iters", 0))
@@ -310,7 +309,7 @@ def _maybe_reset_task(t: dict) -> dict:
         best = int(t.get("best_streak", 0))
         if cur >= req: stk += 1; best = max(best, stk)
         else:          stk = 0
-        now_s = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now_s = _now_s()
         if (t.get("progress_mode") or "") == "timed_sessions":
             _conn.execute(
                 "MATCH (t:Task) WHERE t.id=$id "
@@ -326,8 +325,40 @@ def _maybe_reset_task(t: dict) -> dict:
     except: pass
     return t
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 def _now_s() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    return _utcnow().strftime("%Y-%m-%d %H:%M")
+
+def _date_s() -> str:
+    return _utcnow().strftime("%Y-%m-%d")
+
+def _client_tz_offset_minutes(request: Request | None) -> int:
+    if not request:
+        return 0
+    try:
+        return int(float(request.headers.get("X-Client-Tz-Offset", "0")))
+    except:
+        return 0
+
+def _client_day_bounds(request: Request | None, local_date: str = "") -> tuple[str, str]:
+    offset = _client_tz_offset_minutes(request)
+    if local_date:
+        try:
+            local_start = datetime.strptime(local_date[:10], "%Y-%m-%d")
+        except:
+            local_start = (_utcnow() - timedelta(minutes=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        local_start = (_utcnow() - timedelta(minutes=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_start = local_start + timedelta(minutes=offset)
+    utc_end = utc_start + timedelta(days=1)
+    return utc_start.strftime("%Y-%m-%d %H:%M"), utc_end.strftime("%Y-%m-%d %H:%M")
+
+def _ts_in_range(ts: str, start: str, end: str) -> bool:
+    if not ts:
+        return False
+    return start <= ts[:16] < end
 
 def _default_branch_id(mission_id: str) -> str:
     return f"{mission_id}:main"
@@ -428,7 +459,7 @@ def _force_hits(tokens: list[str], lex: dict) -> float:
 
 def _parse_ts(ts: str):
     try: return datetime.strptime((ts or "")[:16], "%Y-%m-%d %H:%M")
-    except: return datetime.now()
+    except: return _utcnow()
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
@@ -469,7 +500,7 @@ def _force_score_to_pct(total: float, evidence: float) -> int:
     return int(round(_clamp((avg / .34) * 100 * (.62 + .38 * confidence), 0, 100)))
 
 def _force_snapshot(user_id: str = "admin") -> dict:
-    now = datetime.now()
+    now = _utcnow()
     signals = []
     entity_rows = kuzu_rows(_conn.execute(
         "MATCH (e:Entity) WHERE e.user_id=$uid RETURN e.name,e.summary,e.tags LIMIT 220",
@@ -585,7 +616,7 @@ def _force_snapshot(user_id: str = "admin") -> dict:
         "integrity": int(round(integrity * 100)), "signals": len(signals),
         "evidence": round(total_w, 2),
         "days": len(day_set), "top_nodes": top_nodes,
-        "updated_ts": datetime.now().strftime("%Y-%m-%d %H:%M")
+        "updated_ts": _now_s()
     }
 
 def _timer_effective_seconds(total: int, started_ts: str) -> int:
@@ -596,7 +627,7 @@ def _timer_effective_seconds(total: int, started_ts: str) -> int:
     try:
         if not started:
             return total
-        return max(total, total + int((datetime.now() - started).total_seconds()))
+        return max(total, total + int((_utcnow() - started).total_seconds()))
     except:
         return total
 
@@ -604,11 +635,17 @@ def _timed_ritual_elapsed_seconds(task: dict) -> int:
     elapsed = max(0, int(float(task.get("progress_value") or 0)))
     started = _dt_from_s(task.get("timer_started_ts") or "")
     if started:
-        elapsed += max(0, int((datetime.now() - started).total_seconds()))
+        elapsed += max(0, int((_utcnow() - started).total_seconds()))
     return elapsed
 
 def _dt_from_s(ts: str) -> datetime | None:
     if not ts: return None
+    ts = str(ts).strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1]
+    ts = ts.replace("T", " ")
+    if "+" in ts:
+        ts = ts.split("+", 1)[0].strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try: return datetime.strptime(ts, fmt)
         except: pass
@@ -618,7 +655,7 @@ def _s_from_dt(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 def _timer_now_s() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return _utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 def _timer_current_period_effective(task: dict) -> int:
     seconds=int(task.get("timer_period_seconds") or 0)
@@ -628,8 +665,8 @@ def _timer_current_period_effective(task: dict) -> int:
     period_started=_dt_from_s(task.get("timer_period_started_ts") or "")
     if started and period_started:
         seg_start=max(started, period_started)
-        if datetime.now() > seg_start:
-            seconds += int((datetime.now() - seg_start).total_seconds())
+        if _utcnow() > seg_start:
+            seconds += int((_utcnow() - seg_start).total_seconds())
     return max(0, seconds)
 
 def _sync_timer_period_state(task: dict, user_id: str) -> dict:
@@ -638,7 +675,7 @@ def _sync_timer_period_state(task: dict, user_id: str) -> dict:
         if int(task.get("timer_best_session_seconds") or 0) <= 0 and float(task.get("record_value") or 0) > 0:
             task["timer_best_session_seconds"]=int(float(task.get("record_value") or 0))
         return task
-    now=datetime.now()
+    now=_utcnow()
     period_hours=max(1, int(task.get("timer_period_hours") or 24))
     period_len=timedelta(hours=period_hours)
     period_started=_dt_from_s(task.get("timer_period_started_ts") or "")
@@ -715,7 +752,7 @@ def _ensure_admin_user():
     r = kuzu_rows(_conn.execute("MATCH (u:User) WHERE u.login='admin' RETURN u.id"))
     if not r:
         _conn.execute("CREATE (:User {id:'admin',login:'admin',password_hash:$ph,ts:$ts})",
-                      {"ph": _hash_password("admin"), "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+                      {"ph": _hash_password("admin"), "ts": _now_s()})
 _migrate_user_columns()
 _ensure_admin_user()
 
@@ -1006,7 +1043,7 @@ def extract(raw, user_id: str = "admin"):
 
 def write_entry(raw, data, user_id: str = "admin"):
     eid = str(uuid.uuid4())
-    ts  = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts  = _now_s()
     an  = _clean_journal_text(data.get("archivist_note",""))
     narrative = _clean_journal_text(data.get("narrative", raw))
     _conn.execute(
@@ -1060,7 +1097,7 @@ def register(req: AuthReq):
     uid = str(uuid.uuid4())
     _conn.execute("CREATE (:User {id:$id,login:$l,password_hash:$ph,ts:$ts})",
                   {"id": uid, "l": login, "ph": _hash_password(req.password),
-                   "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+                   "ts": _now_s()})
     return {"token": _create_token(uid, login), "login": login, "user_id": uid}
 
 @app.post("/login")
@@ -1121,7 +1158,7 @@ def export_data(u: dict = Depends(current_user)):
     char = _char_data(uid)
     return {
         "version": 2,
-        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "exported_at": _now_s(),
         "entries":  [{"id":r[0],"ts":r[1],"raw_text":r[2],"narrative":r[3],"archivist_note":r[4]} for r in entries],
         "entities": [{"id":r[0],"name":r[1],"type":r[2],"summary":r[3],"tags":r[4] or "[]"} for r in entities],
         "missions": [{"id":r[0],"title":r[1],"description":r[2],"status":r[3],"ts":r[4],"lore":r[5] or ""} for r in missions],
@@ -1351,7 +1388,7 @@ def moonphase():
             result={"phase_en":a["moon_phase"],"illumination":int(a["moon_illumination"]),
                     "moonrise":a.get("moonrise"),"moonset":a.get("moonset"),
                     "sunrise":a.get("sunrise"),"sunset":a.get("sunset"),
-                    "source":"wttr.in","cached_at":datetime.now().strftime("%Y-%m-%d %H:%M")}
+                    "source":"wttr.in","cached_at":_now_s()}
         _moon_cache={"data":result,"ts":now}; return result
     except Exception as ex:
         return {"phase_en":None,"illumination":None,"source":"math_fallback","error":str(ex)}
@@ -1394,7 +1431,7 @@ def ingest(req: IngestReq, u: dict = Depends(current_user)):
         # Still write to inbox so JS polling works (removed on completion)
         try:
             inbox = json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-            inbox.append({"id": eid, "text": req.text, "user_id": uid, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+            inbox.append({"id": eid, "text": req.text, "user_id": uid, "ts": _now_s()})
             INBOX_FILE.write_text(json.dumps(inbox, ensure_ascii=False, indent=2))
         except: pass
         return {"entry_id": eid, "status": "processing", "_ai_pending": True}
@@ -1402,7 +1439,7 @@ def ingest(req: IngestReq, u: dict = Depends(current_user)):
         # No API key — write to inbox for manual processing
         try:
             inbox = json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
-            inbox.append({"id": eid, "text": req.text, "user_id": uid, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+            inbox.append({"id": eid, "text": req.text, "user_id": uid, "ts": _now_s()})
             INBOX_FILE.write_text(json.dumps(inbox, ensure_ascii=False, indent=2))
         except: pass
         return {"entry_id": eid, "status": "pending", "_ai_pending": True}
@@ -1482,7 +1519,7 @@ def _apply_analysis(eid: str, data: dict, user_id: str = "admin"):
                     {"f":f,"t":t,"uid":user_id,"l":rel.get("label","связан с"),"eid":eid})
             except: pass
     for q in data.get("quests",[]):
-        tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
+        tid=str(uuid.uuid4()); ts=_now_s()
         tt=q.get("task_type","once"); rh=int(q.get("reset_hours",24)); ri=int(q.get("required_iters",1))
         lr=ts if tt=="repeat" else ""
         mid=q.get("mission_id","")
@@ -1540,7 +1577,7 @@ def save(req: SaveReq, u: dict = Depends(current_user)):
           "quests":req.quests,"archivist_note":req.archivist_note}
     eid=write_entry(req.raw_text,data,uid)
     for q in req.quests:
-        tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
+        tid=str(uuid.uuid4()); ts=_now_s()
         mid=q.get("mission_id","")
         bid=_ensure_default_branch(mid, uid) if mid else ""
         try:
@@ -1893,7 +1930,7 @@ def update_mission_description(mid: str, req: MissionDescReq, u: dict = Depends(
 def add_mission(req: MissionReq, u: dict = Depends(current_user)):
     uid = _uid(u)
     mid=str(uuid.uuid4())
-    ts=datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts=_now_s()
     _conn.execute("CREATE (:Mission {id:$id,title:$t,description:$d,status:'active',ts:$ts,lore:'',user_id:$uid})",
                   {"id":mid,"t":req.title,"d":req.description,"ts":ts,"uid":uid})
     _sync_mission_entity(mid,req.title,req.description,"active",uid)
@@ -1927,7 +1964,7 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
     exists=kuzu_rows(_conn.execute("MATCH (m:Mission) WHERE m.id=$id AND m.user_id=$uid RETURN m.id",
                                    {"id":req.mission_id,"uid":uid}))
     if not exists: raise HTTPException(404)
-    tid=str(uuid.uuid4()); ts=datetime.now().strftime("%Y-%m-%d %H:%M")
+    tid=str(uuid.uuid4()); ts=_now_s()
     branch_id=req.branch_id or _ensure_default_branch(req.mission_id, uid)
     kind=req.quest_kind or ("ritual" if req.task_type == "repeat" else "task")
     progress_mode=req.progress_mode or ("count" if req.task_type == "repeat" else "check")
@@ -2204,7 +2241,7 @@ def tick_task(tid: str, u: dict = Depends(current_user)):
     cur=int(rows[0][0] or 0); req=int(rows[0][1] or 1); lr=rows[0][2] or ""; mid=rows[0][3] or ""
     new_cur=min(cur+1,req)
     new_progress=float((rows[0][4] or 0) + 1)
-    now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_s=_now_s()
     if not lr: lr=now_s
     cts=now_s if new_cur>=req else ""
     _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.current_iters=$c,t.progress_value=$p,t.last_reset_ts=$lr,t.completed_ts=$cts",
@@ -2381,7 +2418,7 @@ def save_task_note(tid: str, req: TaskNoteReq, u: dict = Depends(current_user)):
 @app.post("/tasks/{tid}/complete")
 def complete_task(tid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
-    now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_s=_now_s()
     rows=kuzu_rows(_conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.mission_id",
                                  {"id":tid,"uid":uid}))
     _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done',t.completed_ts=$ts,t.is_current='false'",
@@ -2400,20 +2437,22 @@ def delete_task(tid: str, u: dict = Depends(current_user)):
     return {"deleted":tid}
 
 @app.get("/tasks/completed-today")
-def completed_today(u: dict = Depends(current_user)):
+def completed_today(request: Request, u: dict = Depends(current_user)):
     uid = _uid(u)
-    today=datetime.now().strftime("%Y-%m-%d")
+    start, end = _client_day_bounds(request)
     # Completed once-tasks
     r1=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.user_id=$uid AND t.completed_ts STARTS WITH $d RETURN count(t)",
-        {"d":today,"uid":uid}))
-    done=int(r1[0][0]) if r1 else 0
+        "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.completed_ts",
+        {"uid":uid}))
+    done=sum(1 for r in r1 if _ts_in_range(r[0] or "", start, end))
     # Repeat tasks ticked today (any progress, even partial) — exclude already counted
     r2=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d "
-        "AND t.user_id=$uid AND t.current_iters > 0 AND (t.completed_ts IS NULL OR NOT t.completed_ts STARTS WITH $d) "
-        "RETURN count(t)",{"d":today,"uid":uid}))
-    partial=int(r2[0][0]) if r2 else 0
+        "MATCH (t:Task) WHERE t.task_type='repeat' AND t.user_id=$uid RETURN t.last_reset_ts,t.completed_ts,t.current_iters",
+        {"uid":uid}))
+    partial=sum(1 for r in r2
+                if int(r[2] or 0) > 0
+                and _ts_in_range(r[0] or "", start, end)
+                and not _ts_in_range(r[1] or "", start, end))
     return {"count": done+partial}
 
 @app.post("/entities/{eid}/delete")
@@ -2662,8 +2701,8 @@ def do_reanalyze(u: dict = Depends(current_user)):
         try:
             inbox=json.loads(INBOX_FILE.read_text()) if INBOX_FILE.exists() else []
             inbox=[i for i in inbox if not (i.get("type")=="reanalyze" and i.get("user_id","admin")==uid)]
-            rid="reanalyze_"+datetime.now().strftime("%Y%m%d_%H%M%S")
-            inbox.append({"id":rid,"type":"reanalyze","user_id":uid,"ts":datetime.now().strftime("%Y-%m-%d %H:%M")})
+            rid="reanalyze_"+_utcnow().strftime("%Y%m%d_%H%M%S")
+            inbox.append({"id":rid,"type":"reanalyze","user_id":uid,"ts":_now_s()})
             INBOX_FILE.write_text(json.dumps(inbox,ensure_ascii=False,indent=2))
         except: pass
         threading.Thread(target=_run_reanalyze_bg,args=(uid,),daemon=True).start()
@@ -2699,16 +2738,18 @@ def save_api_key(req: ApiKeyReq, u: dict = Depends(current_user)):
     return {"ok":True,"has_key":bool(cfg["api_key"])}
 
 @app.get("/today-narrative")
-def today_narrative(u: dict = Depends(current_user)):
+def today_narrative(request: Request, u: dict = Depends(current_user)):
     uid = _uid(u)
-    today=datetime.now().strftime("%Y-%m-%d")
+    start, end = _client_day_bounds(request)
     rows=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.user_id=$uid AND t.task_type='repeat' AND t.last_reset_ts STARTS WITH $d AND t.current_iters > 0 "
-        "RETURN t.title, t.current_iters, t.required_iters",{"d":today,"uid":uid}))
+        "MATCH (t:Task) WHERE t.user_id=$uid AND t.task_type='repeat' AND t.current_iters > 0 "
+        "RETURN t.title, t.current_iters, t.required_iters,t.last_reset_ts",{"uid":uid}))
     rows2=kuzu_rows(_conn.execute(
-        "MATCH (t:Task) WHERE t.user_id=$uid AND t.completed_ts STARTS WITH $d RETURN t.title, t.required_iters",
-        {"d":today,"uid":uid}))
-    all_tasks=rows+[[r[0],r[1],r[1]] for r in rows2]
+        "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.title, t.required_iters,t.completed_ts",
+        {"uid":uid}))
+    repeat_tasks=[[r[0],r[1],r[2]] for r in rows if _ts_in_range(r[3] or "", start, end)]
+    done_tasks=[[r[0],r[1],r[1]] for r in rows2 if _ts_in_range(r[2] or "", start, end)]
+    all_tasks=repeat_tasks+done_tasks
     if not all_tasks: return {"narrative":""}
     task_lines="\n".join(f"- {r[0]} ({r[1]}/{r[2]})" for r in all_tasks)
     p=f"""Ты — тихий редактор дневника Life RPG. Одним абзацем (1-2 предложения) подведи живой итог сегодняшних квестов ОТ ПЕРВОГО ЛИЦА.
@@ -2894,7 +2935,7 @@ def analyze_character(u: dict = Depends(current_user)):
         data["stats"]=stats
         data["antagonist_name"]=antag.get("name","")
         data["antagonist_desc"]=antag.get("desc","")
-        data["last_analyzed"]=datetime.now().strftime("%Y-%m-%d")
+        data["last_analyzed"]=_date_s()
         _save_char(data, uid)
     threading.Thread(target=_bg,daemon=True).start()
     return {"ok":True,"status":"analyzing"}
@@ -2903,7 +2944,7 @@ def analyze_character(u: dict = Depends(current_user)):
 def past_moon_entry(u: dict = Depends(current_user)):
     uid = _uid(u)
     from datetime import timedelta
-    today=datetime.now()
+    today=_utcnow()
     ws=(today-timedelta(days=35)).strftime("%Y-%m-%d %H:%M")
     we=(today-timedelta(days=25)).strftime("%Y-%m-%d %H:%M")
     rows=kuzu_rows(_conn.execute(
@@ -2923,7 +2964,7 @@ def _gen_epilogue_bg(mid: str, user_id: str = "admin"):
         {"id":mid,"uid":user_id}))
     task_lines="\n".join(f"- {r[0]}" for r in tasks) or "задания не записаны"
     p=f"""Ты — Архивариус. Путь завершён. Напиши эпическую эпитафию этому отрезку жизни Героя.
-2-3 предложения. Торжественная летопись. Дата завершения: {datetime.now().strftime("%Y-%m-%d")}.
+2-3 предложения. Торжественная летопись. Дата завершения: {_date_s()}.
 Путь: {title}\nОписание: {desc}\nЗадания:\n{task_lines}
 Верни только текст эпитафии, без кавычек."""
     text=_call_any_ai(p)
@@ -2949,7 +2990,7 @@ def add_finance(req: FinanceReq, u: dict = Depends(current_user)):
     _conn.execute(
         "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:$c,note:$n,ts:$ts,user_id:$uid})",
         {"id":fid,"a":req.amount,"d":req.direction,"c":req.category,
-         "n":req.note,"ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
+         "n":req.note,"ts":_now_s(),"uid":uid})
     return {"id":fid}
 
 # ── Pocket ───────────────────────────────────────────────────────────────────
@@ -2991,7 +3032,7 @@ def get_pocket(u: dict = Depends(current_user)):
 def pocket_income(req: PocketIncomeReq, u: dict = Depends(current_user)):
     uid = _uid(u)
     cfg=_pocket_cfg(uid); pct=cfg["reserve_pct"]/100
-    ts=datetime.now().strftime("%Y-%m-%d %H:%M")
+    ts=_now_s()
     deferred=round(req.amount*pct,2); spendable=round(req.amount-deferred,2)
     for d,a,n in [("p_income",spendable,req.source or "пополнение"),
                   ("p_deferred",deferred,f"резерв {cfg['reserve_pct']}% от {req.amount}")]:
@@ -3007,7 +3048,7 @@ def pocket_expense(req: PocketExpenseReq, u: dict = Depends(current_user)):
     _conn.execute(
         "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts,user_id:$uid})",
         {"id":str(uuid.uuid4()),"a":req.amount,"d":direction,
-         "n":req.note or "расход","ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
+         "n":req.note or "расход","ts":_now_s(),"uid":uid})
     return {"ok":True}
 
 @app.post("/pocket/config")
@@ -3027,7 +3068,7 @@ def pocket_adjust(req: PocketAdjustReq, u: dict = Depends(current_user)):
     _conn.execute(
         "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts,user_id:$uid})",
         {"id":str(uuid.uuid4()),"a":req.amount,"d":direction,"n":note,
-         "ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
+         "ts":_now_s(),"uid":uid})
     return {"ok":True}
 
 @app.get("/modes")
@@ -3044,7 +3085,7 @@ def add_mode(req: ModeReq, u: dict = Depends(current_user)):
     mid=str(uuid.uuid4())
     _conn.execute(
         "CREATE (:Mode {id:$id,name:$n,description:$d,active:'true',started_ts:$ts,user_id:$uid})",
-        {"id":mid,"n":req.name,"d":req.description,"ts":datetime.now().strftime("%Y-%m-%d %H:%M"),"uid":uid})
+        {"id":mid,"n":req.name,"d":req.description,"ts":_now_s(),"uid":uid})
     return {"id":mid,"name":req.name,"active":True}
 
 @app.post("/modes/{mid}/toggle")
@@ -4386,7 +4427,12 @@ section.active{display:block}
   window.fetch=function(url,opts={}){
     const tok=localStorage.getItem('lrpg_token');
     if(tok&&typeof url==='string'&&!url.startsWith('http')){
-      opts={...opts,headers:{...(opts.headers||{}),'Authorization':'Bearer '+tok}};
+      opts={...opts,headers:{
+        ...(opts.headers||{}),
+        'Authorization':'Bearer '+tok,
+        'X-Client-Tz-Offset':String(new Date().getTimezoneOffset()),
+        'X-Client-Timezone':Intl.DateTimeFormat().resolvedOptions().timeZone||''
+      }};
     }
     return _orig(url,opts);
   };
@@ -4816,7 +4862,8 @@ function streakMythName(n){
 
 // ── Visual Aging ──────────────────────────────────────────────────────────────
 function entryAgeStyle(tsStr){
-  const days=(Date.now()-new Date(tsStr.replace(' ','T')).getTime())/86400000;
+  const parsed=parseServerTs(tsStr);
+  const days=parsed?(Date.now()-parsed.getTime())/86400000:0;
   if(days<3) return '';
   if(days<8) return 'opacity:.92;filter:sepia(12%)';
   if(days<30) return 'opacity:.85;filter:sepia(28%)';
@@ -4929,6 +4976,35 @@ function linkify(text){
   return out;
 }
 
+// ── Time: server stores UTC, interface shows device-local time ───────────────
+function pad2(n){return String(n).padStart(2,'0');}
+function formatLocalDate(d){return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;}
+function localTodayKey(){return formatLocalDate(new Date());}
+function parseServerTs(ts){
+  if(!ts) return null;
+  if(ts instanceof Date) return ts;
+  const raw=String(ts).trim();
+  if(!raw) return null;
+  if(/[zZ]|[+-]\d\d:?\d\d$/.test(raw)) return new Date(raw.replace(' ','T'));
+  const m=raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if(!m) return null;
+  const y=Number(m[1]), mo=Number(m[2])-1, d=Number(m[3]);
+  const h=Number(m[4]||0), mi=Number(m[5]||0), s=Number(m[6]||0);
+  return new Date(Date.UTC(y,mo,d,h,mi,s));
+}
+function localDateKey(ts){
+  const d=parseServerTs(ts);
+  return d&&!Number.isNaN(d.getTime())?formatLocalDate(d):String(ts||'').slice(0,10);
+}
+function localTimeHM(ts){
+  const d=parseServerTs(ts);
+  return d&&!Number.isNaN(d.getTime())?`${pad2(d.getHours())}:${pad2(d.getMinutes())}`:'';
+}
+function localDisplayDate(ts){
+  const d=parseServerTs(ts);
+  return d&&!Number.isNaN(d.getTime())?formatLocalDate(d):(String(ts||'').split(' ')[0]||'');
+}
+
 // ── Journal ──────────────────────────────────────────────────────────────────
 async function loadJournal(){
   const [dr,er,ir,doneR,mr,narR,pmR]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today'),fetch('/missions'),fetch('/today-narrative'),fetch('/chronicle/past-moon')]);
@@ -4938,7 +5014,7 @@ async function loadJournal(){
   const missions=await mr.json();
   const todayNarrative=cleanJournalText((await narR.json()).narrative||'');
   const pastMoon=(await pmR.json()).entry||null;
-  const today=new Date().toISOString().slice(0,10);
+  const today=localTodayKey();
   const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>
     (t.task_type==='repeat'&&t.current_iters>0)
   ));
@@ -4951,7 +5027,7 @@ async function loadJournal(){
   }
   const byDate={};
   for(const e of diary){
-    const d=e.ts.split(' ')[0];
+    const d=localDateKey(e.ts);
     if(!byDate[d])byDate[d]=[];
     byDate[d].push(e);
   }
@@ -4959,15 +5035,15 @@ async function loadJournal(){
   const pastMoonHtml=pastMoon?`<div class="past-moon-block">
     <div class="past-moon-label">${calNow.phaseEmoji} В прошлую ${calNow.phase}</div>
     <div class="past-moon-text">${pastMoon.narrative?.slice(0,200)}${pastMoon.narrative?.length>200?'…':''}</div>
-    <div class="past-moon-ts">${pastMoon.ts?.split(' ')[0]||''}</div>
+    <div class="past-moon-ts">${localDisplayDate(pastMoon.ts)}</div>
   </div>`:'';
   el.innerHTML=pastMoonHtml+Object.entries(byDate).map(([date,entries])=>{
     const cal=WoW.convert(date);
     const items=entries
       .slice()
-      .sort((a,b)=>String(b.ts||'').localeCompare(String(a.ts||'')))
+      .sort((a,b)=>(parseServerTs(b.ts)?.getTime()||0)-(parseServerTs(a.ts)?.getTime()||0))
       .map(e=>{
-      const timeStr=e.ts.includes(' ')?e.ts.split(' ')[1]:'';
+      const timeStr=localTimeHM(e.ts);
       const isPending = pendingIds.has(e.id);
       const ageStyle=entryAgeStyle(e.ts);
       const rawText=String(e.raw||'');
@@ -4986,7 +5062,7 @@ async function loadJournal(){
         ${pendingHtml}
       </div>`;
     }).join('');
-    const isToday=date===new Date().toISOString().slice(0,10);
+    const isToday=date===localTodayKey();
     const doneBadge=isToday&&doneToday>0?`<span class="daily-done-badge">✓ ${doneToday} заданий сегодня</span>`:'';
     const progressBlock=isToday&&todayTasks.length?`<div style="margin:10px 0 16px;padding:14px 16px;background:var(--paper2);border:1px solid var(--border2);border-radius:3px">
       <div style="font-size:9px;letter-spacing:2px;color:var(--ink3);font-family:sans-serif;margin-bottom:10px">ХРОНИКИ ДНЯ</div>
@@ -5014,7 +5090,9 @@ async function loadJournal(){
 
 function _taskUrgency(t){
   if(t.task_type!=='repeat'||!t.last_reset_ts) return Infinity;
-  const due=new Date(t.last_reset_ts.replace(' ','T')).getTime()+(t.reset_hours||24)*3600000;
+  const last=parseServerTs(t.last_reset_ts);
+  if(!last) return Infinity;
+  const due=last.getTime()+(t.reset_hours||24)*3600000;
   return due-Date.now();
 }
 async function loadAsides(){
@@ -5134,7 +5212,7 @@ function questKindName(kind, taskType=''){
 }
 function runningElapsedSeconds(ts){
   if(!ts) return 0;
-  const started=new Date(String(ts).replace(' ','T')).getTime();
+  const started=parseServerTs(ts)?.getTime();
   if(!started||Number.isNaN(started)) return 0;
   return Math.max(0,Math.floor((Date.now()-started)/1000));
 }
@@ -6245,10 +6323,11 @@ function closeDlg(id){document.getElementById(id).classList.remove('open');}
 // Reload whenever inbox count changes — including when it drops to 0 (processing done)
 function fmtCountdown(lastTs, resetHours){
   if(!lastTs) return `сброс ${resetHours||24}ч`;
-  const last=new Date(lastTs.replace(' ','T'));
+  const last=parseServerTs(lastTs);
+  if(!last) return `сброс ${resetHours||24}ч`;
   const due=new Date(last.getTime()+(resetHours||24)*3600*1000);
   const diff=due-Date.now();
-  if(diff<=0) return 'сброс скоро';
+  if(diff<=0) return 'ожидает обновления';
   const h=Math.floor(diff/3600000);
   const m=Math.floor((diff%3600000)/60000);
   if(h>=1) return `сброс через ${h}ч ${m}м`;
@@ -6383,7 +6462,7 @@ async function exportData(){
   const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
-  a.download='liferpg-export-'+new Date().toISOString().slice(0,10)+'.json';
+  a.download='liferpg-export-'+localTodayKey()+'.json';
   a.click();
 }
 async function importData(input){
