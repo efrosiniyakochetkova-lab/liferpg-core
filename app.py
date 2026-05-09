@@ -293,14 +293,49 @@ def _migrate_quest_engine_columns():
         except: pass
 _migrate_quest_engine_columns()
 
-def _maybe_reset_task(t: dict) -> dict:
+def _daily_reset_anchor_s() -> str:
+    return _s_from_dt(_game_day_start_utc())
+
+def _is_daily_reset(t: dict) -> bool:
+    return int(t.get("reset_hours") or 24) == 24
+
+def _maybe_reset_task(t: dict, user_id: str = "") -> dict:
     """Check if repeatable task cycle is over; update DB and return updated dict."""
-    if t.get("task_type") != "repeat" or not t.get("last_reset_ts"):
+    if t.get("task_type") != "repeat":
         return t
     try:
+        if not t.get("last_reset_ts"):
+            anchor = _daily_reset_anchor_s() if _is_daily_reset(t) else _now_s()
+            params = {"id": t["id"], "ts": anchor}
+            where = "MATCH (t:Task) WHERE t.id=$id "
+            if user_id:
+                where = "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
+                params["uid"] = user_id
+            _conn.execute(where + "SET t.last_reset_ts=$ts", params)
+            t["last_reset_ts"] = anchor
+            return t
         last = datetime.strptime(t["last_reset_ts"], "%Y-%m-%d %H:%M")
-        due  = last + timedelta(hours=int(t.get("reset_hours", 24)))
-        if _utcnow() < due:
+        reset_ts = ""
+        if _is_daily_reset(t):
+            day_start = _game_day_start_utc()
+            if last >= day_start:
+                anchor_s = _s_from_dt(day_start)
+                if t.get("last_reset_ts") != anchor_s:
+                    params = {"id": t["id"], "ts": anchor_s}
+                    where = "MATCH (t:Task) WHERE t.id=$id "
+                    if user_id:
+                        where = "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
+                        params["uid"] = user_id
+                    _conn.execute(where + "SET t.last_reset_ts=$ts", params)
+                    t["last_reset_ts"] = anchor_s
+                return t
+            reset_ts = _s_from_dt(day_start)
+        else:
+            due = last + timedelta(hours=int(t.get("reset_hours", 24)))
+            if _utcnow() < due:
+                return t
+            reset_ts = _now_s()
+        if not reset_ts:
             return t
         # Reset cycle
         cur  = int(t.get("current_iters", 0))
@@ -309,19 +344,21 @@ def _maybe_reset_task(t: dict) -> dict:
         best = int(t.get("best_streak", 0))
         if cur >= req: stk += 1; best = max(best, stk)
         else:          stk = 0
-        now_s = _now_s()
+        params = {"id": t["id"], "ts": reset_ts, "s": stk, "b": best}
+        where = "MATCH (t:Task) WHERE t.id=$id "
+        if user_id:
+            where = "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid "
+            params["uid"] = user_id
         if (t.get("progress_mode") or "") == "timed_sessions":
             _conn.execute(
-                "MATCH (t:Task) WHERE t.id=$id "
-                "SET t.current_iters=0,t.progress_value=0,t.last_reset_ts=$ts,t.streak=$s,t.best_streak=$b",
-                {"id": t["id"], "ts": now_s, "s": stk, "b": best})
+                where + "SET t.current_iters=0,t.progress_value=0,t.last_reset_ts=$ts,t.streak=$s,t.best_streak=$b",
+                params)
             t["progress_value"] = 0
         else:
             _conn.execute(
-                "MATCH (t:Task) WHERE t.id=$id "
-                "SET t.current_iters=0,t.last_reset_ts=$ts,t.streak=$s,t.best_streak=$b",
-                {"id": t["id"], "ts": now_s, "s": stk, "b": best})
-        t.update({"current_iters": 0, "last_reset_ts": now_s, "streak": stk, "best_streak": best})
+                where + "SET t.current_iters=0,t.last_reset_ts=$ts,t.streak=$s,t.best_streak=$b",
+                params)
+        t.update({"current_iters": 0, "last_reset_ts": reset_ts, "streak": stk, "best_streak": best})
     except: pass
     return t
 
@@ -333,6 +370,31 @@ def _now_s() -> str:
 
 def _date_s() -> str:
     return _utcnow().strftime("%Y-%m-%d")
+
+GAME_TZ_OFFSET_MINUTES = 180
+GAME_DAY_START_HOUR = 2
+
+def _game_day_start_utc(now: datetime | None = None, local_date: str = "") -> datetime:
+    now = now or _utcnow()
+    offset = timedelta(minutes=GAME_TZ_OFFSET_MINUTES)
+    if local_date:
+        try:
+            y, m, d = [int(x) for x in local_date[:10].split("-")]
+            game_date = datetime(y, m, d)
+        except:
+            game_date = now + offset
+    else:
+        local_now = now + offset
+        game_date = local_now
+        if local_now.hour < GAME_DAY_START_HOUR:
+            game_date = local_now - timedelta(days=1)
+    local_start = datetime(game_date.year, game_date.month, game_date.day, GAME_DAY_START_HOUR, 0)
+    return local_start - offset
+
+def _game_day_bounds(local_date: str = "") -> tuple[str, str]:
+    utc_start = _game_day_start_utc(local_date=local_date)
+    utc_end = utc_start + timedelta(days=1)
+    return utc_start.strftime("%Y-%m-%d %H:%M"), utc_end.strftime("%Y-%m-%d %H:%M")
 
 def _client_tz_offset_minutes(request: Request | None) -> int:
     if not request:
@@ -677,10 +739,58 @@ def _sync_timer_period_state(task: dict, user_id: str) -> dict:
         return task
     now=_utcnow()
     period_hours=max(1, int(task.get("timer_period_hours") or 24))
-    period_len=timedelta(hours=period_hours)
     period_started=_dt_from_s(task.get("timer_period_started_ts") or "")
+    if period_hours == 24:
+        day_start = _game_day_start_utc()
+        if period_started and period_started > day_start:
+            period_started = day_start
+            task["timer_period_started_ts"] = _s_from_dt(period_started)
+            try:
+                _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_period_started_ts=$ts",
+                              {"id":task["id"],"uid":user_id,"ts":task["timer_period_started_ts"]})
+            except: pass
+        elif period_started and period_started < day_start:
+            raw_total=int(task.get("timer_total_seconds") or 0)
+            period_seconds=int(task.get("timer_period_seconds") or 0)
+            last_period=int(task.get("timer_last_period_seconds") or 0)
+            best_period=int(task.get("timer_best_period_seconds") or 0)
+            started=_dt_from_s(task.get("timer_started_ts") or "")
+            final_seconds=period_seconds
+            total_add=0
+            if started and started < day_start:
+                seg_start=max(started, period_started)
+                if day_start > seg_start:
+                    total_add=int((day_start - seg_start).total_seconds())
+                    final_seconds += total_add
+            last_period=max(0, final_seconds)
+            best_period=max(best_period, last_period)
+            if total_add and started:
+                raw_total += total_add
+                task["timer_started_ts"]=_s_from_dt(day_start)
+            task.update({
+                "timer_total_seconds":raw_total,
+                "timer_period_started_ts":_s_from_dt(day_start),
+                "timer_period_seconds":0,
+                "timer_last_period_seconds":last_period,
+                "timer_best_period_seconds":best_period,
+                "record_value":float(best_period),
+            })
+            try:
+                _conn.execute(
+                    "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET "
+                    "t.timer_total_seconds=$total,t.timer_started_ts=$started,"
+                    "t.timer_period_started_ts=$period_started,t.timer_period_seconds=0,"
+                    "t.timer_last_period_seconds=$last_period,t.timer_best_period_seconds=$best_period,"
+                    "t.record_value=$record",
+                    {"id":task["id"],"uid":user_id,"total":raw_total,
+                     "started":task.get("timer_started_ts") or "",
+                     "period_started":task["timer_period_started_ts"],
+                     "last_period":last_period,"best_period":best_period,
+                     "record":float(best_period)})
+            except Exception as e: print(f"[timer_period_roll] {e}")
+            return task
     if not period_started or period_started > now:
-        period_started=now
+        period_started=_game_day_start_utc() if period_hours == 24 else now
         task["timer_period_started_ts"]=_s_from_dt(period_started)
         try:
             _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.timer_period_started_ts=$ts",
@@ -688,6 +798,7 @@ def _sync_timer_period_state(task: dict, user_id: str) -> dict:
         except: pass
         return task
 
+    period_len=timedelta(hours=period_hours)
     raw_total=int(task.get("timer_total_seconds") or 0)
     period_seconds=int(task.get("timer_period_seconds") or 0)
     last_period=int(task.get("timer_last_period_seconds") or 0)
@@ -1846,7 +1957,7 @@ def get_missions(u: dict = Depends(current_user)):
                 td["timer_best_period_seconds"]=max(int(td.get("timer_best_period_seconds") or 0),
                                                     int(td.get("timer_current_period_seconds") or 0))
             td["timer_total_seconds"]=_timer_effective_seconds(int(td.get("timer_total_seconds") or 0), td.get("timer_started_ts") or "")
-            td=_maybe_reset_task(td)
+            td=_maybe_reset_task(td, uid)
             td["timed_elapsed_seconds"]=_timed_ritual_elapsed_seconds(td) if td.get("progress_mode") == "timed_sessions" else int(float(td.get("progress_value") or 0))
             task_list.append(td)
         # Linked entities
@@ -1977,8 +2088,8 @@ def add_task(req: TaskReq, u: dict = Depends(current_user)):
     if kind != "timer":
         timer_record_mode = "none"
     timer_period_hours = max(1, int(req.timer_period_hours or 24))
-    timer_period_started_ts = ts if timer_record_mode == "period" else ""
-    init_reset = ts if task_type == "repeat" else ""
+    timer_period_started_ts = (_daily_reset_anchor_s() if timer_period_hours == 24 else ts) if timer_record_mode == "period" else ""
+    init_reset = (_daily_reset_anchor_s() if int(req.reset_hours or 24) == 24 else ts) if task_type == "repeat" else ""
     target_value = float(req.target_value or req.required_iters or 1)
     if task_type == "repeat":
         if progress_mode == "timed_sessions":
@@ -2126,7 +2237,7 @@ def set_timer_record(tid: str, req: TaskTimerRecordReq, u: dict = Depends(curren
     if (kind or "") != "timer":
         _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.quest_kind='timer',t.progress_mode='timer'",
                       {"id":tid,"uid":uid})
-    now_s=_now_s()
+    now_s=_daily_reset_anchor_s() if hours == 24 else _now_s()
     record_enabled="true" if mode != "none" else "false"
     best_session=int(old_best_session or old_record or 0)
     if mode == "period":
@@ -2161,7 +2272,7 @@ def set_ritual_settings(tid: str, req: TaskRitualSettingsReq, u: dict = Depends(
         "MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid RETURN t.last_reset_ts,t.timer_started_ts,t.current_iters",
         {"id":tid,"uid":uid}))
     if not rows: raise HTTPException(404)
-    last_reset=rows[0][0] or _now_s()
+    last_reset=_daily_reset_anchor_s() if reset_hours == 24 else (rows[0][0] or _now_s())
     timer_started=rows[0][1] or ""
     current_iters=int(rows[0][2] or 0)
     target=float(session_seconds if mode == "timed_sessions" else required)
@@ -2439,7 +2550,7 @@ def delete_task(tid: str, u: dict = Depends(current_user)):
 @app.get("/tasks/completed-today")
 def completed_today(request: Request, u: dict = Depends(current_user)):
     uid = _uid(u)
-    start, end = _client_day_bounds(request)
+    start, end = _game_day_bounds()
     # Completed once-tasks
     r1=kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.user_id=$uid RETURN t.completed_ts",
@@ -2740,7 +2851,7 @@ def save_api_key(req: ApiKeyReq, u: dict = Depends(current_user)):
 @app.get("/today-narrative")
 def today_narrative(request: Request, u: dict = Depends(current_user)):
     uid = _uid(u)
-    start, end = _client_day_bounds(request)
+    start, end = _game_day_bounds()
     rows=kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.user_id=$uid AND t.task_type='repeat' AND t.current_iters > 0 "
         "RETURN t.title, t.current_iters, t.required_iters,t.last_reset_ts",{"uid":uid}))
@@ -2943,13 +3054,13 @@ def analyze_character(u: dict = Depends(current_user)):
 @app.get("/chronicle/past-moon")
 def past_moon_entry(u: dict = Depends(current_user)):
     uid = _uid(u)
-    from datetime import timedelta
     today=_utcnow()
     ws=(today-timedelta(days=35)).strftime("%Y-%m-%d %H:%M")
     we=(today-timedelta(days=25)).strftime("%Y-%m-%d %H:%M")
     rows=kuzu_rows(_conn.execute(
-        "MATCH (e:Entry) WHERE e.user_id=$uid AND e.ts >= $s AND e.ts <= $e "
-        "RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 1",{"s":ws,"e":we,"uid":uid}))
+        "MATCH (e:Entry) WHERE e.user_id=$uid RETURN e.narrative, e.ts ORDER BY e.ts DESC LIMIT 200",
+        {"uid":uid}))
+    rows=[r for r in rows if ws <= (r[1] or "")[:16] <= we]
     if not rows: return {"entry":None}
     return {"entry":{"narrative":rows[0][0],"ts":rows[0][1]}}
 
@@ -5004,6 +5115,18 @@ function localDisplayDate(ts){
   const d=parseServerTs(ts);
   return d&&!Number.isNaN(d.getTime())?formatLocalDate(d):(String(ts||'').split(' ')[0]||'');
 }
+const GAME_TZ_OFFSET_MINUTES=180;
+const GAME_DAY_START_HOUR=2;
+function formatUTCDate(d){return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`;}
+function gameDateKeyFromDate(d){
+  const shifted=new Date(d.getTime()+(GAME_TZ_OFFSET_MINUTES/60-GAME_DAY_START_HOUR)*3600000);
+  return formatUTCDate(shifted);
+}
+function gameTodayKey(){return gameDateKeyFromDate(new Date());}
+function gameDateKey(ts){
+  const d=parseServerTs(ts);
+  return d&&!Number.isNaN(d.getTime())?gameDateKeyFromDate(d):String(ts||'').slice(0,10);
+}
 
 // ── Journal ──────────────────────────────────────────────────────────────────
 async function loadJournal(){
@@ -5014,7 +5137,6 @@ async function loadJournal(){
   const missions=await mr.json();
   const todayNarrative=cleanJournalText((await narR.json()).narrative||'');
   const pastMoon=(await pmR.json()).entry||null;
-  const today=localTodayKey();
   const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>
     (t.task_type==='repeat'&&t.current_iters>0)
   ));
@@ -5027,7 +5149,7 @@ async function loadJournal(){
   }
   const byDate={};
   for(const e of diary){
-    const d=localDateKey(e.ts);
+    const d=gameDateKey(e.ts);
     if(!byDate[d])byDate[d]=[];
     byDate[d].push(e);
   }
@@ -5062,7 +5184,7 @@ async function loadJournal(){
         ${pendingHtml}
       </div>`;
     }).join('');
-    const isToday=date===localTodayKey();
+    const isToday=date===gameTodayKey();
     const doneBadge=isToday&&doneToday>0?`<span class="daily-done-badge">✓ ${doneToday} заданий сегодня</span>`:'';
     const progressBlock=isToday&&todayTasks.length?`<div style="margin:10px 0 16px;padding:14px 16px;background:var(--paper2);border:1px solid var(--border2);border-radius:3px">
       <div style="font-size:9px;letter-spacing:2px;color:var(--ink3);font-family:sans-serif;margin-bottom:10px">ХРОНИКИ ДНЯ</div>
@@ -6249,7 +6371,7 @@ async function openEnt(name){
       <span class="rel-badge">${r.label}</span>
     </div>`).join('')||'<div style="color:var(--ink3);font-size:12px;font-family:sans-serif">нет</div>';
   const ments=e.mentions.map(m=>
-    `<div class="ment-ts">${m.ts}</div>
+    `<div class="ment-ts">${localTimeHM(m.ts)||''}${localDisplayDate(m.ts)?' · '+localDisplayDate(m.ts):''}</div>
     <div class="ment-text">${m.narrative}</div>
     ${m.archivist_note?`<div class="ment-archivist">◆ ${m.archivist_note}</div>`:''}`).join('');
   const entTagsArr=Array.isArray(e.tags)?e.tags:typeof e.tags==='string'&&e.tags?e.tags.split(',').filter(Boolean):[];
@@ -6377,7 +6499,7 @@ async function loadPocket(){
     <div class="pocket-tx-item">
       <div>
         <div class="pocket-tx-note">${LABEL[t.direction]||t.direction} · ${t.note}</div>
-        <div class="pocket-tx-ts">${t.ts}</div>
+        <div class="pocket-tx-ts">${localTimeHM(t.ts)||''}${localDisplayDate(t.ts)?' · '+localDisplayDate(t.ts):''}</div>
       </div>
       <div class="pocket-tx-amount ${DIR[t.direction]||''}">${SIGN[t.direction]||''}${fmt(t.amount)} ₽</div>
     </div>`).join(''):
@@ -6462,7 +6584,7 @@ async function exportData(){
   const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
-  a.download='liferpg-export-'+localTodayKey()+'.json';
+  a.download='liferpg-export-'+gameTodayKey()+'.json';
   a.click();
 }
 async function importData(input){
