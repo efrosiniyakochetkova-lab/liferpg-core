@@ -8,6 +8,8 @@ server.log
 app_config.json
 pocket_config.json
 pocket_config.*.json
+day_rhythm.json
+day_rhythm.*.json
 inbox.json
 sessions.json
 character.json

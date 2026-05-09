@@ -3231,6 +3231,72 @@ def add_finance(req: FinanceReq, u: dict = Depends(current_user)):
 # ── Pocket ───────────────────────────────────────────────────────────────────
 POCKET_CFG = _DATA_DIR / "pocket_config.json"
 
+def _default_day_rhythm():
+    return {
+        "reminders": True,
+        "blocks": [
+            {"id": "home_morning", "title": "Домашнее окно", "start": "07:00", "end": "11:00",
+             "note": "Лучше быть дома: город просыпается, улицы и дороги забиты движением."},
+            {"id": "open_day", "title": "Уличное окно", "start": "11:00", "end": "16:00",
+             "note": "Хорошее время для прогулок, стримов, турника и дел вне дома."},
+            {"id": "deep_rest", "title": "Сон / укрытие", "start": "16:00", "end": "02:00",
+             "note": "Время восстановиться, когда вокруг больше суеты и лишнего шума."},
+            {"id": "night_clarity", "title": "Ночная ясность", "start": "02:00", "end": "07:00",
+             "note": "Тихое окно для прогулок, работы, стримов и спокойной концентрации."},
+        ],
+    }
+
+def _hhmm(v: str | None) -> str | None:
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(v or ""))
+    if not m: return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h < 0 or h > 23 or mi < 0 or mi > 59: return None
+    return f"{h:02d}:{mi:02d}"
+
+def _hhmm_minutes(v: str) -> int:
+    h, m = [int(x) for x in v.split(":")]
+    return h * 60 + m
+
+def _normalize_day_rhythm(data: dict | None) -> dict:
+    src = data if isinstance(data, dict) else {}
+    blocks = []
+    for b in src.get("blocks") or []:
+        if not isinstance(b, dict): continue
+        start, end = _hhmm(b.get("start")), _hhmm(b.get("end"))
+        title = str(b.get("title") or "").strip()[:60]
+        note = str(b.get("note") or "").strip()[:320]
+        if not start or not end or start == end or not title: continue
+        bid = re.sub(r"[^a-zA-Z0-9_-]+", "", str(b.get("id") or ""))[:48] or str(uuid.uuid4())
+        blocks.append({"id": bid, "title": title, "start": start, "end": end, "note": note})
+    if not blocks:
+        blocks = _default_day_rhythm()["blocks"]
+    blocks.sort(key=lambda b: _hhmm_minutes(b["start"]))
+    return {"reminders": bool(src.get("reminders", True)), "blocks": blocks[:16]}
+
+def _day_rhythm(user_id: str = "admin"):
+    f = _user_json_file("day_rhythm.json", user_id)
+    if f.exists():
+        try: return _normalize_day_rhythm(json.loads(f.read_text()))
+        except: pass
+    return _default_day_rhythm()
+
+def _save_day_rhythm(cfg: dict, user_id: str = "admin"):
+    _user_json_file("day_rhythm.json", user_id).write_text(json.dumps(cfg, ensure_ascii=False))
+
+class DayRhythmReq(BaseModel):
+    reminders: bool = True
+    blocks: list[dict] = []
+
+@app.get("/day-rhythm")
+def get_day_rhythm(u: dict = Depends(current_user)):
+    return _day_rhythm(_uid(u))
+
+@app.post("/day-rhythm")
+def save_day_rhythm(req: DayRhythmReq, u: dict = Depends(current_user)):
+    cfg = _normalize_day_rhythm({"reminders": req.reminders, "blocks": req.blocks})
+    _save_day_rhythm(cfg, _uid(u))
+    return cfg
+
 def _pocket_cfg(user_id: str = "admin"):
     f = _user_json_file("pocket_config.json", user_id)
     if f.exists():
@@ -3386,6 +3452,21 @@ aside{grid-column:1;grid-row:2/4;background:var(--paper2);
 .cal-sun{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-top:3px}
 .cal-effect{font-size:10px;color:var(--ink3);font-family:sans-serif;font-style:italic;
   margin-top:4px;opacity:.8;line-height:1.4}
+.rhythm-widget{padding-bottom:14px;margin-bottom:14px;border-bottom:1px solid var(--border2)}
+.rhythm-card{background:rgba(139,105,20,.06);border-left:2px solid var(--gold);
+  padding:9px 10px 10px;border-radius:0 3px 3px 0}
+.rhythm-now{font-size:13px;color:var(--ink);font-family:'Georgia',serif;line-height:1.25}
+.rhythm-window{font-size:10px;color:var(--gold);font-family:sans-serif;margin-top:3px}
+.rhythm-note{font-size:11px;color:var(--ink3);font-family:sans-serif;line-height:1.45;margin-top:7px}
+.rhythm-next{font-size:10px;color:var(--ink3);font-family:sans-serif;margin-top:7px}
+.rhythm-actions{display:flex;gap:6px;margin-top:9px;flex-wrap:wrap}
+.rhythm-link{border:1px solid var(--border2);background:var(--paper);color:var(--ink2);
+  font-family:sans-serif;font-size:10px;padding:4px 8px;border-radius:3px;cursor:pointer}
+.rhythm-link:hover{border-color:var(--gold);color:var(--gold)}
+.rhythm-progress{height:4px;background:rgba(200,184,154,.42);border-radius:999px;
+  overflow:hidden;margin-top:8px}
+.rhythm-progress-fill{height:100%;background:linear-gradient(90deg,var(--gold),var(--blue));
+  border-radius:999px;transition:width .25s}
 .aside-bottom{margin-top:auto;padding-top:12px;border-top:1px solid var(--border2)}
 .aside-bottom-link{cursor:pointer;font-size:11px;font-family:sans-serif;
   color:var(--ink3);padding:6px 4px;transition:color .12s}
@@ -3810,6 +3891,24 @@ section.active{display:block}
   outline:none;resize:none;height:80px;margin-bottom:10px}
 .dlg-textarea:focus{border-color:var(--gold)}
 .dlg-btns{display:flex;gap:10px;justify-content:flex-end;margin-top:6px}
+.rhythm-dlg-box{width:560px;max-width:calc(100vw - 28px)}
+.rhythm-editor-list{max-height:48vh;overflow:auto;margin-bottom:12px;padding-right:4px}
+.rhythm-edit-row{border:1px solid var(--border2);background:rgba(139,105,20,.04);
+  border-radius:4px;padding:12px;margin-bottom:10px}
+.rhythm-edit-head{display:grid;grid-template-columns:1fr 92px 92px 34px;gap:8px;align-items:start}
+.rhythm-edit-head .dlg-input{margin-bottom:8px}
+.rhythm-remove{border:1px solid var(--border2);background:transparent;color:var(--red);
+  min-height:39px;border-radius:3px;cursor:pointer;font-size:18px}
+.rhythm-remove:hover{border-color:var(--red);background:rgba(128,47,31,.06)}
+.rhythm-reminder-row{display:flex;align-items:flex-start;gap:9px;font-size:12px;
+  color:var(--ink3);font-family:sans-serif;line-height:1.45;margin:8px 0 14px}
+#rhythm-toast{position:fixed;left:258px;bottom:22px;z-index:1400;max-width:320px;
+  background:var(--paper);border:1.5px solid var(--gold);box-shadow:0 8px 24px rgba(0,0,0,.2);
+  border-radius:4px;padding:12px 14px;display:none}
+#rhythm-toast.show{display:block;animation:toastIn .18s ease-out}
+.rhythm-toast-title{font-size:13px;color:var(--ink);font-family:'Georgia',serif;margin-bottom:4px}
+.rhythm-toast-note{font-size:11px;color:var(--ink3);font-family:sans-serif;line-height:1.45}
+@keyframes toastIn{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
 .btn-primary{background:var(--gold);border:none;color:#fff;font-family:'Georgia',serif;
   font-size:14px;padding:8px 24px;border-radius:3px;cursor:pointer}
 .btn-primary:hover{background:#a07820}
@@ -4084,6 +4183,8 @@ section.active{display:block}
   .topbar-settings{padding:4px 6px}
   aside{max-height:150px;padding:8px 10px;gap:10px}
   aside > *{flex-basis:190px;max-height:130px}
+  .rhythm-edit-head{grid-template-columns:1fr 1fr 34px}
+  .rhythm-edit-head .rhythm-title-input{grid-column:1/-1}
   .cal-season{font-size:14px}
   .journal-main{padding:22px 16px 36px}
   .day-heading{letter-spacing:2px;gap:8px;align-items:flex-start;flex-wrap:wrap}
@@ -4264,6 +4365,7 @@ section.active{display:block}
     width:100%; max-width:100%; border-radius:18px 18px 0 0;
     max-height:88dvh; overflow-y:auto; padding:24px 20px 36px;
   }
+  #rhythm-toast{left:14px;right:14px;bottom:calc(68px + env(safe-area-inset-bottom));max-width:none}
   #reanalyze-box{
     width:100%; max-width:100%; border-radius:18px 18px 0 0;
     max-height:88dvh; overflow-y:auto;
@@ -4316,6 +4418,7 @@ section.active{display:block}
 
 <aside id="sidebar">
   <div class="cal-widget" id="sidebar-cal"></div>
+  <div class="rhythm-widget" id="day-rhythm-widget"></div>
   <div class="aside-section">
     <div class="aside-label">Активные пути</div>
     <div id="aside-missions"></div>
@@ -4471,6 +4574,11 @@ section.active{display:block}
   <button id="send-btn" onclick="sendEntry()">Записать →</button>
 </div>
 
+<div id="rhythm-toast">
+  <div class="rhythm-toast-title" id="rhythm-toast-title"></div>
+  <div class="rhythm-toast-note" id="rhythm-toast-note"></div>
+</div>
+
 <!-- Oracle Modal -->
 <div id="oracle-modal">
   <div id="oracle-box">
@@ -4513,6 +4621,26 @@ section.active{display:block}
         <input type="file" accept=".json" style="display:none" onchange="importData(this)">
       </label>
       <span id="import-status" style="font-size:11px;font-family:sans-serif;color:var(--ink3)"></span>
+    </div>
+  </div>
+</div>
+
+<div class="dlg" id="rhythm-dlg">
+  <div class="dlg-box rhythm-dlg-box">
+    <div class="dlg-title">Ритм дня</div>
+    <div class="dlg-hint" style="margin-bottom:14px">
+      Это не расписание-долг, а карта комфортных окон: что сейчас за время, зачем оно тебе, и какое окно придёт следующим.
+    </div>
+    <div id="rhythm-editor-list" class="rhythm-editor-list"></div>
+    <button class="btn-cancel" style="margin-bottom:10px" onclick="addDayRhythmBlock()">+ окно времени</button>
+    <label class="rhythm-reminder-row">
+      <input type="checkbox" id="rhythm-reminders" style="margin-top:2px">
+      <span>Мягко напоминать при смене окна, пока Life RPG открыт.</span>
+    </label>
+    <div class="dlg-btns">
+      <button class="btn-cancel" onclick="requestRhythmNotifications()">Уведомления ОС</button>
+      <button class="btn-primary" onclick="saveDayRhythm()">Сохранить</button>
+      <button class="btn-cancel" onclick="closeDlg('rhythm-dlg')">Закрыть</button>
     </div>
   </div>
 </div>
@@ -4703,7 +4831,7 @@ async function doLogin(){
       const d=await r.json();
       localStorage.setItem('lrpg_token',d.token);
       window._me=d; hideLogin();
-      loadJournal();loadAsides();loadCharacter();
+      loadJournal();loadAsides();loadCharacter();loadDayRhythm();
     } else { const d=await r.json(); err.textContent=d.detail||'Ошибка'; }
   }catch{err.textContent='Нет связи с сервером';}
 }
@@ -4721,7 +4849,7 @@ async function doRegister(){
       const d=await r.json();
       localStorage.setItem('lrpg_token',d.token);
       window._me=d; hideLogin();
-      loadJournal();loadAsides();loadCharacter();
+      loadJournal();loadAsides();loadCharacter();loadDayRhythm();
     } else { const d=await r.json(); err.textContent=d.detail||'Ошибка'; }
   }catch{err.textContent='Нет связи с сервером';}
 }
@@ -4730,6 +4858,8 @@ function doLogout(){
   document.getElementById('ls-login').value='';
   document.getElementById('ls-pw').value='';
   document.getElementById('ls-pw2').value='';
+  const rhythmEl=document.getElementById('day-rhythm-widget');
+  if(rhythmEl) rhythmEl.innerHTML='';
   showLogin();
 }
 // ── State ────────────────────────────────────────────────────────────────────
@@ -4902,6 +5032,178 @@ function tickClock(){
     (cal.sunrise?`<div class="cal-sun">☀️ ${cal.sunrise} — ${cal.sunset}</div>`:'');
 }
 tickClock(); setInterval(tickClock,30000);
+
+// ── Day Rhythm ───────────────────────────────────────────────────────────────
+function defaultDayRhythm(){
+  return {reminders:true,blocks:[
+    {id:'home_morning',title:'Домашнее окно',start:'07:00',end:'11:00',note:'Лучше быть дома: город просыпается, улицы и дороги забиты движением.'},
+    {id:'open_day',title:'Уличное окно',start:'11:00',end:'16:00',note:'Хорошее время для прогулок, стримов, турника и дел вне дома.'},
+    {id:'deep_rest',title:'Сон / укрытие',start:'16:00',end:'02:00',note:'Время восстановиться, когда вокруг больше суеты и лишнего шума.'},
+    {id:'night_clarity',title:'Ночная ясность',start:'02:00',end:'07:00',note:'Тихое окно для прогулок, работы, стримов и спокойной концентрации.'}
+  ]};
+}
+let dayRhythm=defaultDayRhythm();
+let _rhythmInterval=null;
+let _rhythmLastKey=null;
+let _rhythmToastTimer=null;
+function rhythmId(){
+  return 'rh_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
+}
+function hmToMin(v){
+  const m=String(v||'').match(/^(\d{1,2}):(\d{2})$/);
+  if(!m) return null;
+  const h=Number(m[1]), mi=Number(m[2]);
+  if(h<0||h>23||mi<0||mi>59) return null;
+  return h*60+mi;
+}
+function minNow(){const d=new Date();return d.getHours()*60+d.getMinutes();}
+function rhythmBlocks(){
+  return (dayRhythm.blocks||[]).filter(b=>hmToMin(b.start)!==null&&hmToMin(b.end)!==null&&b.start!==b.end)
+    .slice().sort((a,b)=>hmToMin(a.start)-hmToMin(b.start));
+}
+function rhythmContains(b,m){
+  const s=hmToMin(b.start), e=hmToMin(b.end);
+  if(s===null||e===null||s===e) return false;
+  return s<e ? (m>=s&&m<e) : (m>=s||m<e);
+}
+function rhythmProgress(b,m){
+  const s=hmToMin(b.start), e=hmToMin(b.end);
+  const total=(e-s+1440)%1440;
+  const passed=(m-s+1440)%1440;
+  return Math.max(0,Math.min(100,(passed/Math.max(1,total))*100));
+}
+function rhythmUntil(target,m){
+  let diff=(target-m+1440)%1440;
+  if(diff===0) return 'сейчас';
+  const h=Math.floor(diff/60), mi=diff%60;
+  return h?`через ${h}ч ${mi}м`:`через ${mi}м`;
+}
+function rhythmState(){
+  const blocks=rhythmBlocks();
+  const m=minNow();
+  const current=blocks.find(b=>rhythmContains(b,m))||null;
+  const next=blocks
+    .map(b=>({b,delta:(hmToMin(b.start)-m+1440)%1440||1440}))
+    .sort((a,b)=>a.delta-b.delta)[0]?.b||null;
+  return {blocks,m,current,next};
+}
+function renderDayRhythm(){
+  const el=document.getElementById('day-rhythm-widget');
+  if(!el) return;
+  const {blocks,m,current,next}=rhythmState();
+  if(!blocks.length){
+    el.innerHTML=`<div class="aside-label">Ритм дня</div>
+      <button class="rhythm-link" onclick="openDayRhythmSettings()">настроить</button>`;
+    return;
+  }
+  const title=current?current.title:'Свободное окно';
+  const windowText=current?`${current.start} — ${current.end}`:'вне заданных окон';
+  const note=current?(current.note||'Это окно ещё не описано.'):'Сейчас нет выбранного режима: можно оставить пространство пустым или добавить новое окно.';
+  const progress=current?rhythmProgress(current,m):0;
+  const nextText=next?`дальше: ${htmlesc(next.title)} в ${next.start} · ${rhythmUntil(hmToMin(next.start),m)}`:'';
+  el.innerHTML=`<div class="aside-label">Ритм дня</div>
+    <div class="rhythm-card">
+      <div class="rhythm-now">${htmlesc(title)}</div>
+      <div class="rhythm-window">${windowText}</div>
+      ${current?`<div class="rhythm-progress"><div class="rhythm-progress-fill" style="width:${progress}%"></div></div>`:''}
+      <div class="rhythm-note">${htmlesc(note)}</div>
+      ${nextText?`<div class="rhythm-next">${nextText}</div>`:''}
+      <div class="rhythm-actions">
+        <button class="rhythm-link" onclick="openDayRhythmSettings()">настроить</button>
+      </div>
+    </div>`;
+}
+function showRhythmToast(title,note){
+  const box=document.getElementById('rhythm-toast');
+  if(!box) return;
+  document.getElementById('rhythm-toast-title').textContent=title;
+  document.getElementById('rhythm-toast-note').textContent=note||'';
+  box.classList.add('show');
+  clearTimeout(_rhythmToastTimer);
+  _rhythmToastTimer=setTimeout(()=>box.classList.remove('show'),6500);
+}
+function notifyRhythmBlock(b){
+  const title='Ритм дня · '+b.title;
+  const note=b.note||`${b.start} — ${b.end}`;
+  showRhythmToast(title,note);
+  if('Notification' in window&&Notification.permission==='granted'){
+    try{new Notification(title,{body:note});}catch(e){}
+  }
+}
+function tickDayRhythm(){
+  const {current}=rhythmState();
+  const key=current?current.id:'free';
+  if(_rhythmLastKey&&current&&key!==_rhythmLastKey&&dayRhythm.reminders) notifyRhythmBlock(current);
+  _rhythmLastKey=key;
+  renderDayRhythm();
+}
+function ensureDayRhythmTicker(){
+  if(_rhythmInterval) return;
+  _rhythmInterval=setInterval(tickDayRhythm,30000);
+}
+async function loadDayRhythm(){
+  try{
+    const r=await fetch('/day-rhythm');
+    if(r.ok) dayRhythm=await r.json();
+  }catch(e){ dayRhythm=defaultDayRhythm(); }
+  _rhythmLastKey=rhythmState().current?.id||'free';
+  renderDayRhythm();
+  ensureDayRhythmTicker();
+}
+function rhythmEditorBlocks(){
+  return Array.from(document.querySelectorAll('.rhythm-edit-row')).map(row=>({
+    id:row.dataset.id||rhythmId(),
+    title:row.querySelector('[data-rhythm-field="title"]').value.trim(),
+    start:row.querySelector('[data-rhythm-field="start"]').value||'00:00',
+    end:row.querySelector('[data-rhythm-field="end"]').value||'01:00',
+    note:row.querySelector('[data-rhythm-field="note"]').value.trim()
+  })).filter(b=>b.title&&b.start&&b.end&&b.start!==b.end);
+}
+function renderRhythmEditor(){
+  const list=document.getElementById('rhythm-editor-list');
+  const blocks=dayRhythm.blocks&&dayRhythm.blocks.length?dayRhythm.blocks:defaultDayRhythm().blocks;
+  list.innerHTML=blocks.map(raw=>{
+    const b={...raw,id:raw.id||rhythmId()};
+    return `<div class="rhythm-edit-row" data-id="${htmlesc(b.id)}">
+    <div class="rhythm-edit-head">
+      <input class="dlg-input rhythm-title-input" data-rhythm-field="title" value="${htmlesc(b.title)}" placeholder="Название окна">
+      <input class="dlg-input" data-rhythm-field="start" type="time" value="${htmlesc(b.start)}">
+      <input class="dlg-input" data-rhythm-field="end" type="time" value="${htmlesc(b.end)}">
+      <button class="rhythm-remove" onclick="removeDayRhythmBlock('${_jsEsc(b.id)}')" title="Удалить окно">×</button>
+    </div>
+    <textarea class="dlg-textarea" data-rhythm-field="note" placeholder="Почему это время такое? Что в нём удобно?">${htmlesc(b.note||'')}</textarea>
+  </div>`;
+  }).join('');
+  document.getElementById('rhythm-reminders').checked=dayRhythm.reminders!==false;
+}
+function openDayRhythmSettings(){
+  renderRhythmEditor();
+  openDlg('rhythm-dlg');
+}
+function addDayRhythmBlock(){
+  dayRhythm.blocks=rhythmEditorBlocks();
+  dayRhythm.blocks.push({id:rhythmId(),title:'Новое окно',start:'09:00',end:'11:00',note:''});
+  renderRhythmEditor();
+}
+function removeDayRhythmBlock(id){
+  dayRhythm.blocks=rhythmEditorBlocks().filter(b=>b.id!==id);
+  renderRhythmEditor();
+}
+async function saveDayRhythm(){
+  const cfg={reminders:document.getElementById('rhythm-reminders').checked,blocks:rhythmEditorBlocks()};
+  const r=await fetch('/day-rhythm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
+  if(!r.ok){alert('Не удалось сохранить ритм дня');return;}
+  dayRhythm=await r.json();
+  _rhythmLastKey=rhythmState().current?.id||'free';
+  closeDlg('rhythm-dlg');
+  renderDayRhythm();
+  showRhythmToast('Ритм дня сохранён','Карта времени обновлена.');
+}
+async function requestRhythmNotifications(){
+  if(!('Notification' in window)){showRhythmToast('Уведомления недоступны','Браузер не поддерживает системные уведомления.');return;}
+  const p=await Notification.requestPermission();
+  showRhythmToast('Уведомления ОС',p==='granted'?'Разрешены. При смене окна будет мягкий сигнал.':'Не разрешены. Останутся внутренние подсказки.');
+}
 
 // ── Oracle ───────────────────────────────────────────────────────────────────
 function renderForceOracle(d){
@@ -6684,7 +6986,7 @@ function bootLifeRpg(){
   checkApiStatus();
   authInit().then(()=>{
     if(localStorage.getItem('lrpg_token')){
-      loadJournal(); loadAsides(); loadCharacter();
+      loadJournal(); loadAsides(); loadCharacter(); loadDayRhythm();
     }
   });
   if(window.innerWidth<=768){
