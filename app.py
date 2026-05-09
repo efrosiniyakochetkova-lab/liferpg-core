@@ -3241,7 +3241,7 @@ def _pocket_cfg(user_id: str = "admin"):
 def _save_pocket_cfg(cfg: dict, user_id: str = "admin"):
     _user_json_file("pocket_config.json", user_id).write_text(json.dumps(cfg,ensure_ascii=False))
 
-class PocketIncomeReq(BaseModel): amount: float; source: str = ""
+class PocketIncomeReq(BaseModel): amount: float; source: str = ""; reserve_pct: int = -1
 class PocketExpenseReq(BaseModel): amount: float; note: str = ""; from_deferred: bool = False
 class PocketCfgReq(BaseModel): reserve_pct: int
 
@@ -3266,15 +3266,19 @@ def get_pocket(u: dict = Depends(current_user)):
 @app.post("/pocket/income")
 def pocket_income(req: PocketIncomeReq, u: dict = Depends(current_user)):
     uid = _uid(u)
-    cfg=_pocket_cfg(uid); pct=cfg["reserve_pct"]/100
+    cfg=_pocket_cfg(uid)
+    reserve_pct = cfg["reserve_pct"] if req.reserve_pct < 0 else max(0, min(99, req.reserve_pct))
+    pct=reserve_pct/100
     ts=_now_s()
     deferred=round(req.amount*pct,2); spendable=round(req.amount-deferred,2)
-    for d,a,n in [("p_income",spendable,req.source or "пополнение"),
-                  ("p_deferred",deferred,f"резерв {cfg['reserve_pct']}% от {req.amount}")]:
+    records=[("p_income",spendable,req.source or "пополнение")]
+    if deferred > 0:
+        records.append(("p_deferred",deferred,f"резерв {reserve_pct}% от {req.amount}"))
+    for d,a,n in records:
         _conn.execute(
             "CREATE (:Finance {id:$id,amount:$a,direction:$d,category:'pocket',note:$n,ts:$ts,user_id:$uid})",
             {"id":str(uuid.uuid4()),"a":a,"d":d,"n":n,"ts":ts,"uid":uid})
-    return {"ok":True,"spendable":spendable,"deferred":deferred}
+    return {"ok":True,"spendable":spendable,"deferred":deferred,"reserve_pct":reserve_pct}
 
 @app.post("/pocket/expense")
 def pocket_expense(req: PocketExpenseReq, u: dict = Depends(current_user)):
@@ -3358,8 +3362,6 @@ body{background:var(--page);color:var(--ink);font-family:'Georgia',serif;
   padding:0 20px;gap:0;box-shadow:0 1px 5px var(--shadow);z-index:10}
 .topbar-logo{font-size:15px;color:var(--ink2);letter-spacing:2px;font-style:italic;
   padding-right:22px;border-right:1px solid var(--border2);margin-right:4px;white-space:nowrap}
-.topbar-tagline{font-size:9px;color:var(--ink3);font-family:sans-serif;
-  letter-spacing:1.5px;text-transform:uppercase;margin-left:6px;margin-right:12px}
 nav{display:flex;align-items:center;min-width:0}
 .nav-item{padding:0 15px;height:52px;cursor:pointer;font-family:sans-serif;font-size:13px;
   color:var(--ink3);display:flex;align-items:center;gap:7px;
@@ -3367,11 +3369,9 @@ nav{display:flex;align-items:center;min-width:0}
 .nav-item:hover{color:var(--ink2)}
 .nav-item.active{color:var(--ink);border-bottom-color:var(--gold)}
 .topbar-right{margin-left:auto;display:flex;align-items:center;gap:14px;min-width:0}
-.topbar-date{font-size:12px;color:var(--ink3);font-family:sans-serif}
 .topbar-settings{cursor:pointer;font-size:14px;color:var(--ink3);
   padding:4px 8px;border-radius:3px;transition:color .12s;font-family:sans-serif}
 .topbar-settings:hover{color:var(--ink)}
-#nav-api-status{font-size:10px;font-family:sans-serif;color:var(--ink3)}
 
 /* ── SIDEBAR ── */
 aside{grid-column:1;grid-row:2/4;background:var(--paper2);
@@ -3894,12 +3894,6 @@ section.active{display:block}
 .pocket-tx-amount.deferred{color:var(--gold)}
 .pocket-section-title{font-size:11px;letter-spacing:3px;text-transform:uppercase;
   font-family:sans-serif;color:var(--ink3);margin-bottom:14px}
-/* ── SOUND TOGGLE ── */
-.sound-btn{background:none;border:1px solid var(--border2);color:var(--ink3);
-  font-family:sans-serif;font-size:11px;padding:3px 10px;border-radius:10px;
-  cursor:pointer;transition:all .15s;white-space:nowrap}
-.sound-btn:hover{border-color:var(--gold);color:var(--gold)}
-.sound-btn.on{border-color:var(--gold);color:var(--gold);background:rgba(138,92,42,.07)}
 /* ── TWO FORCES SIDEBAR ── */
 .char-section{margin-top:4px;padding-top:14px;border-top:1px solid var(--border2)}
 .force-card{position:relative;padding:10px 0 2px}
@@ -4035,7 +4029,6 @@ section.active{display:block}
     align-items:center;flex-wrap:wrap;
   }
   .topbar-logo{padding-right:12px;margin-right:0}
-  .topbar-tagline{margin:0;font-size:8px}
   nav{
     order:3;width:100%;overflow-x:auto;overflow-y:hidden;
     -webkit-overflow-scrolling:touch;scrollbar-width:none;
@@ -4044,8 +4037,6 @@ section.active{display:block}
   .nav-item[data-s="base"]{display:flex!important}
   .nav-item{height:38px;padding:0 12px;font-size:12px;flex:0 0 auto}
   .topbar-right{gap:8px;flex-wrap:wrap;justify-content:flex-end}
-  .topbar-date{font-size:11px}
-  #nav-api-status{font-size:9px}
   aside{
     grid-column:1;grid-row:2;border-right:none;border-bottom:1.5px solid var(--border);
     padding:10px 12px;display:flex;flex-direction:row;gap:12px;
@@ -4090,8 +4081,6 @@ section.active{display:block}
 @media (max-width: 560px){
   .topbar{padding:7px 10px}
   .topbar-logo{font-size:14px;letter-spacing:1.5px}
-  .topbar-tagline{display:none}
-  .sound-btn{padding:3px 8px;font-size:10px}
   .topbar-settings{padding:4px 6px}
   aside{max-height:150px;padding:8px 10px;gap:10px}
   aside > *{flex-basis:190px;max-height:130px}
@@ -4166,11 +4155,7 @@ section.active{display:block}
   }
   .topbar > nav{ display:none !important; }
   .topbar-logo{ font-size:15px; letter-spacing:2px; padding-right:0; margin-right:0; }
-  .topbar-tagline{ display:none; }
   .topbar-right{ gap:6px; flex-wrap:nowrap; }
-  .topbar-date{ display:none; }
-  #nav-api-status{ display:none; }
-  .sound-btn{ padding:3px 8px; font-size:10px; }
   .topbar-settings{ padding:5px 7px; font-size:15px; }
 
   /* hamburger button visible on mobile */
@@ -4314,7 +4299,6 @@ section.active{display:block}
 <div class="topbar">
   <div id="mob-hamburger" onclick="toggleDrawer()">☰</div>
   <div class="topbar-logo">Life RPG</div>
-  <div class="topbar-tagline">живая летопись</div>
   <nav>
     <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
     <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
@@ -4322,9 +4306,6 @@ section.active{display:block}
     <div class="nav-item" data-s="base" onclick="nav(this)" style="display:none">🗄️ База знаний</div>
   </nav>
   <div class="topbar-right">
-    <div id="nav-api-status"></div>
-    <div class="topbar-date" id="hdr-date"></div>
-    <button class="sound-btn" id="sound-btn" onclick="toggleSound()">♪ амбиент</button>
     <div class="topbar-settings" onclick="openSettings()">⚙</div>
     <div class="topbar-settings" onclick="doLogout()" title="Выйти из аккаунта" style="font-size:11px;letter-spacing:.5px">Выход</div>
   </div>
@@ -4436,6 +4417,7 @@ section.active{display:block}
       <div class="pocket-form-title">ПОПОЛНЕНИЕ</div>
       <input type="number" id="pf-income-amount" placeholder="Сумма" min="0" step="0.01">
       <input type="text" id="pf-income-source" placeholder="Откуда пришли деньги">
+      <input type="number" id="pf-income-reserve-pct" placeholder="% в Отложено" min="0" max="99" step="1">
       <div class="pocket-form-row">
         <button class="pocket-btn" onclick="submitPocketIncome()">Добавить</button>
         <button class="pocket-btn secondary" onclick="closePocketForms()">Отмена</button>
@@ -4908,10 +4890,6 @@ function _oc(type,value,effect,label){
 function tickClock(){
   const cal=WoW.now();
   const t=new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
-  const hdrDate=document.getElementById('hdr-date');
-  if(hdrDate) hdrDate.innerHTML=
-    `<span class="cal-clickable" ${_oc('moon',cal.phase,cal.phaseEffect,cal.phaseEmoji+' '+cal.phase)} style="color:var(--red)">${cal.phaseEmoji} ${cal.phase}</span>`+
-    `<span style="color:var(--ink3)"> · ${t}</span>`;
   const calEl=document.getElementById('sidebar-cal');
   if(calEl) calEl.innerHTML=
     `<div class="cal-season"><span class="cal-clickable" ${_oc('season',cal.season,'Сезон: '+cal.element,cal.seasonEmoji+' '+cal.season)}>${cal.seasonEmoji} ${cal.season}</span></div>`+
@@ -5003,106 +4981,6 @@ function loadMechanics(){
         </div>
       </div>`).join('')}
   </div>`;
-}
-
-// ── Ambient Sound Engine ─────────────────────────────────────────────────────
-const Amb={
-  ctx:null,_nodes:[],_mg:null,_on:false,_season:null,
-  _init(){
-    if(this.ctx)return;
-    this.ctx=new(window.AudioContext||window.webkitAudioContext)();
-    this._mg=this.ctx.createGain(); this._mg.gain.value=0.45;
-    this._mg.connect(this.ctx.destination);
-  },
-  _buf(sec=4){
-    const b=this.ctx.createBuffer(1,this.ctx.sampleRate*sec,this.ctx.sampleRate);
-    const d=b.getChannelData(0); for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
-    const s=this.ctx.createBufferSource(); s.buffer=b; s.loop=true; return s;
-  },
-  _bq(type,freq,Q=1){const f=this.ctx.createBiquadFilter();f.type=type;f.frequency.value=freq;f.Q.value=Q;return f;},
-  _g(v){const g=this.ctx.createGain();g.gain.value=v;return g;},
-  _osc(freq,type='sine'){const o=this.ctx.createOscillator();o.type=type;o.frequency.value=freq;return o;},
-  _lfo(freq,depth,target){const l=this._osc(freq),g=this._g(depth);l.connect(g);g.connect(target);return l;},
-  _add(...n){this._nodes.push(...n);},
-  _start(...n){n.forEach(x=>x.start());this._add(...n);},
-  stop(){this._nodes.forEach(n=>{try{n.stop?.();n.disconnect();}catch(e){}});this._nodes=[];},
-  _wire(src,dst){src.connect(dst);return src;},
-
-  play(season){
-    this._init();
-    if(this.ctx.state==='suspended')this.ctx.resume();
-    this.stop(); this._season=season;
-    if(!this._on)return;
-    const fn=this['_'+season]; if(fn)fn.call(this);
-  },
-
-  /* ПРОБУЖДЕНИЕ — spring wind + bright air */
-  _Пробуждение(){
-    const w=this._buf(4),lp=this._bq('lowpass',450,.4),g=this._g(.05);
-    const lfo=this._lfo(.07,.03,g.gain);
-    w.connect(lp);lp.connect(g);g.connect(this._mg);
-    const b=this._buf(2),bp=this._bq('bandpass',2800,2.5),g2=this._g(.006);
-    const lfo2=this._lfo(.14,.005,g2.gain);
-    b.connect(bp);bp.connect(g2);g2.connect(this._mg);
-    this._start(w,lfo,b,lfo2);
-  },
-
-  /* ЗНОЙ — crickets (AM noise) + heat haze */
-  _Зной(){
-    const n=this._buf(2),bp=this._bq('bandpass',5800,10),g=this._g(.0);
-    const am=this._lfo(15,.025,g.gain);
-    const sw=this._lfo(.04,.015,g.gain);
-    n.connect(bp);bp.connect(g);g.connect(this._mg);
-    const w=this._buf(4),lp=this._bq('lowpass',280,.3),gw=this._g(.018);
-    const lwfo=this._lfo(.05,.015,gw.gain);
-    w.connect(lp);lp.connect(gw);gw.connect(this._mg);
-    this._start(n,am,sw,w,lwfo);
-  },
-
-  /* ЖАТВА — deeper wind + rustle */
-  _Жатва(){
-    const w=this._buf(4),lp=this._bq('lowpass',320,.5),g=this._g(.055);
-    const lfo=this._lfo(.045,.028,g.gain);
-    w.connect(lp);lp.connect(g);g.connect(this._mg);
-    const r=this._buf(1),bp=this._bq('bandpass',1800,3),g2=this._g(.012);
-    const lfo2=this._lfo(.22,.011,g2.gain);
-    r.connect(bp);bp.connect(g2);g2.connect(this._mg);
-    this._start(w,lfo,r,lfo2);
-  },
-
-  /* УГАСАНИЕ — haunting drone + slow wind */
-  _Угасание(){
-    const dr=this._osc(55,'triangle'),g=this._g(.038);
-    const lfo=this._lfo(.025,.02,g.gain);
-    dr.connect(g);g.connect(this._mg);
-    const w=this._buf(4),lp=this._bq('lowpass',250,.4),gw=this._g(.042);
-    const lwfo=this._lfo(.055,.03,gw.gain);
-    w.connect(lp);lp.connect(gw);gw.connect(this._mg);
-    this._start(dr,lfo,w,lwfo);
-  },
-
-  /* МОРОЗ — deep cold wind + sub bass pulse */
-  _Мороз(){
-    const w=this._buf(8),lp=this._bq('lowpass',180,.3),g=this._g(.032);
-    const lfo=this._lfo(.022,.028,g.gain);
-    w.connect(lp);lp.connect(g);g.connect(this._mg);
-    const sub=this._osc(38,'sine'),sg=this._g(.022);
-    const slfo=this._lfo(.035,.018,sg.gain);
-    sub.connect(sg);sg.connect(this._mg);
-    this._start(w,lfo,sub,slfo);
-  }
-};
-
-function toggleSound(){
-  const btn=document.getElementById('sound-btn');
-  Amb._on=!Amb._on;
-  if(Amb._on){
-    Amb.play(WoW.now().season);
-    btn.textContent='♪ амбиент'; btn.classList.add('on');
-  } else {
-    Amb.stop();
-    btn.textContent='♪ амбиент'; btn.classList.remove('on');
-  }
 }
 
 // ── Streak Mythology ──────────────────────────────────────────────────────────
@@ -6628,11 +6506,18 @@ setInterval(async ()=>{
 
 // ── Pocket ───────────────────────────────────────────────────────────────────
 function fmt(n){return n.toLocaleString('ru-RU',{minimumFractionDigits:0,maximumFractionDigits:2});}
+function clampPocketPct(raw, fallback=20){
+  const n=parseInt(raw,10);
+  if(!Number.isFinite(n)) return fallback;
+  return Math.max(0,Math.min(99,n));
+}
 async function loadPocket(){
   const d=await (await fetch('/pocket')).json();
   document.getElementById('pc-balance').textContent=fmt(d.balance)+' ₽';
   document.getElementById('pc-deferred').textContent=fmt(d.deferred)+' ₽';
   document.getElementById('pc-reserve-pct').value=d.reserve_pct;
+  const incomeReserve=document.getElementById('pf-income-reserve-pct');
+  if(incomeReserve && incomeReserve.value==='') incomeReserve.value=d.reserve_pct;
   const DIR={p_income:'income',p_expense:'expense',p_deferred:'deferred',p_deferred_spend:'expense',p_adjust:'income',p_deferred_adjust:'deferred'};
   const LABEL={p_income:'+ доход',p_expense:'− расход',p_deferred:'→ резерв',p_deferred_spend:'← из резерва',p_adjust:'✎ корректировка баланса',p_deferred_adjust:'✎ корректировка резерва'};
   const SIGN={p_income:'+',p_expense:'−',p_deferred:'→',p_deferred_spend:'←',p_adjust:'±',p_deferred_adjust:'±'};
@@ -6648,7 +6533,7 @@ async function loadPocket(){
     '<div class="empty" style="padding:20px 0">Транзакций пока нет</div>';
 }
 async function savePocketCfg(){
-  const pct=parseInt(document.getElementById('pc-reserve-pct').value)||20;
+  const pct=clampPocketPct(document.getElementById('pc-reserve-pct').value,20);
   await fetch('/pocket/config',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({reserve_pct:pct})});
   loadPocket();
@@ -6658,6 +6543,10 @@ function togglePocketForm(which){
     const el=document.getElementById('pf-'+f);
     el.classList.toggle('open',f===which&&!el.classList.contains('open'));
   });
+  if(which==='income'){
+    const reserveEl=document.getElementById('pf-income-reserve-pct');
+    if(reserveEl && reserveEl.value==='') reserveEl.value=document.getElementById('pc-reserve-pct').value||20;
+  }
 }
 function closePocketForms(){
   ['income','expense','deferred-spend','adjust'].forEach(f=>document.getElementById('pf-'+f).classList.remove('open'));
@@ -6665,9 +6554,11 @@ function closePocketForms(){
 async function submitPocketIncome(){
   const amount=parseFloat(document.getElementById('pf-income-amount').value)||0;
   const source=document.getElementById('pf-income-source').value.trim();
+  const reserve_pct=clampPocketPct(document.getElementById('pf-income-reserve-pct').value,
+    clampPocketPct(document.getElementById('pc-reserve-pct').value,20));
   if(!amount) return;
   await fetch('/pocket/income',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({amount,source})});
+    body:JSON.stringify({amount,source,reserve_pct})});
   document.getElementById('pf-income-amount').value='';
   document.getElementById('pf-income-source').value='';
   closePocketForms(); loadPocket();
@@ -6701,12 +6592,7 @@ async function submitPocketAdjust(){
 async function checkApiStatus(){
   try{
     const d=await (await fetch('/config/status')).json();
-    const el=document.getElementById('nav-api-status');
-    const active=d.active;
-    const labels={anthropic:'✓ Claude активен',gigachat:'✓ GigaChat активен',none:'⚠ ИИ не настроен'};
-    const colors={anthropic:'#6a9940',gigachat:'#6a9940',none:'#c06030'};
-    if(el){el.textContent=labels[active]||labels.none; el.style.color=colors[active]||colors.none;}
-    return active!=='none';
+    return d.active!=='none';
   }catch(e){ return false; }
 }
 function openSettings(){
