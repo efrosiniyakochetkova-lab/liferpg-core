@@ -11,7 +11,7 @@ import kuzu
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 _DATA_DIR = Path("/data") if Path("/data").exists() else Path(__file__).parent
 APP_CFG_FILE = _DATA_DIR / "app_config.json"
@@ -1342,6 +1342,7 @@ def export_data(u: dict = Depends(current_user)):
         "MATCH (e:Entry)-[:MENTIONS]->(n:Entity) WHERE e.user_id=$uid AND n.user_id=$uid RETURN e.id,n.id",
         {"uid":uid}))
     char = _char_data(uid)
+    arcana = _arcana_state(uid)
     return {
         "version": 2,
         "exported_at": _now_s(),
@@ -1380,6 +1381,7 @@ def export_data(u: dict = Depends(current_user)):
         "links":    [{"from":r[0],"label":r[1],"to":r[2],"entry_id":r[3] or ""} for r in links],
         "mentions": [{"entry_id":r[0],"entity_id":r[1]} for r in mentions],
         "character": char,
+        "arcana": arcana,
     }
 
 class ImportReq(BaseModel):
@@ -1391,7 +1393,7 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     d = req.data
     if d.get("version",1) < 1:
         raise HTTPException(400, "Неверный формат")
-    imported = {"entries":0,"entities":0,"missions":0,"tasks":0,"finances":0,"links":0}
+    imported = {"entries":0,"entities":0,"missions":0,"tasks":0,"finances":0,"links":0,"arcana":0}
     # Entries
     for e in d.get("entries",[]):
         try:
@@ -1564,6 +1566,9 @@ def import_data(req: ImportReq, u: dict = Depends(current_user)):
     # Character
     if d.get("character"):
         _save_char(d["character"], uid)
+    if d.get("arcana"):
+        _save_arcana_state(d["arcana"], uid)
+        imported["arcana"] = 1
     return {"ok": True, "imported": imported}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3297,6 +3302,331 @@ def save_day_rhythm(req: DayRhythmReq, u: dict = Depends(current_user)):
     _save_day_rhythm(cfg, _uid(u))
     return cfg
 
+# ── Abilities / Inventory / Effects ─────────────────────────────────────────
+_ARCANA_LOCK = threading.RLock()
+
+def _arcana_file(user_id: str = "admin") -> Path:
+    return _user_json_file("arcana_state.json", user_id)
+
+def _effect_tpl(label: str, kind: str, axis: str, power: float, duration_hours: float, note: str = "") -> dict:
+    return {"id": str(uuid.uuid4()), "label": label, "kind": kind, "axis": axis,
+            "power": power, "duration_hours": duration_hours, "note": note}
+
+def _default_arcana_state() -> dict:
+    return {
+        "abilities": [
+            {
+                "id": "meditation", "name": "Медитация", "practice": "Медитировать 20 минут",
+                "description": "Поддерживает ясность, присутствие и спокойную точность.",
+                "duration_minutes": 20, "cooldown_hours": 0, "miss_after_hours": 0,
+                "effects": [_effect_tpl("Осознанность", "buff", "Ясность", 2, 12,
+                                        "Я лучше слышу себя и мягче выбираю следующий шаг.")],
+                "miss_effects": [], "last_cast_ts": "", "cast_count": 0,
+            },
+            {
+                "id": "sleep", "name": "Сон", "practice": "Поспать и восстановиться",
+                "description": "Базовая способность восстановления. Если долго не применять, возникает дебаф.",
+                "duration_minutes": 420, "cooldown_hours": 0, "miss_after_hours": 24,
+                "effects": [_effect_tpl("Восстановление", "buff", "Энергия", 3, 18,
+                                        "Тело возвращает запас сил и снижает внутренний шум.")],
+                "miss_effects": [_effect_tpl("Недосып", "debuff", "Энергия", -3, 24,
+                                             "Слишком долго без восстановления: действия требуют больше воли.")],
+                "last_cast_ts": "", "cast_count": 0,
+            },
+        ],
+        "inventory": [
+            {
+                "id": "lions_mane", "name": "Ежовик гребенчатый", "category": "добавка",
+                "quantity": 100, "unit": "г", "default_amount": 5,
+                "note": "Расходник для поддержки фокуса и ясности.",
+                "effects": [_effect_tpl("Грибная ясность", "buff", "Фокус", 1, 8,
+                                        "Мягкая поддержка внимания без ощущения долга.")],
+            },
+            {
+                "id": "meat", "name": "Мясо", "category": "еда",
+                "quantity": 5, "unit": "кг", "default_amount": 0.25,
+                "note": "Запас еды. Можно расходовать частями.",
+                "effects": [_effect_tpl("Сытость", "buff", "Тело", 1, 6,
+                                        "Тело получает топливо, нервная система спокойнее.")],
+            },
+        ],
+        "effects": [],
+        "log": [],
+    }
+
+def _parse_arcana_dt(ts: str) -> datetime | None:
+    if not ts: return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try: return datetime.strptime(ts, fmt)
+        except: pass
+    return None
+
+def _clean_float(v, default=0.0, lo=None, hi=None) -> float:
+    try: n = float(v)
+    except: n = default
+    if lo is not None: n = max(lo, n)
+    if hi is not None: n = min(hi, n)
+    return n
+
+def _clean_int(v, default=0, lo=None, hi=None) -> int:
+    return int(round(_clean_float(v, default, lo, hi)))
+
+def _clean_effect_template(e: dict | None) -> dict:
+    e = e if isinstance(e, dict) else {}
+    kind = str(e.get("kind") or "buff").strip().lower()
+    if kind not in ("buff", "debuff"): kind = "buff"
+    power = _clean_float(e.get("power", 1), 1, -99, 99)
+    if kind == "debuff" and power > 0: power = -power
+    if kind == "buff" and power < 0: power = abs(power)
+    return {
+        "id": str(e.get("id") or uuid.uuid4()),
+        "label": str(e.get("label") or ("Баф" if kind == "buff" else "Дебаф")).strip()[:80],
+        "kind": kind,
+        "axis": str(e.get("axis") or "Состояние").strip()[:60],
+        "power": power,
+        "duration_hours": _clean_float(e.get("duration_hours", 12), 12, 0.05, 10000),
+        "note": str(e.get("note") or "").strip()[:500],
+    }
+
+def _clean_ability(a: dict | None) -> dict:
+    a = a if isinstance(a, dict) else {}
+    aid = re.sub(r"[^a-zA-Z0-9_-]+", "", str(a.get("id") or ""))[:64] or str(uuid.uuid4())
+    effects = [_clean_effect_template(e) for e in (a.get("effects") or []) if isinstance(e, dict)]
+    miss_effects = [_clean_effect_template(e) for e in (a.get("miss_effects") or []) if isinstance(e, dict)]
+    if not effects:
+        effects = [_clean_effect_template({"label": "Состояние", "kind": "buff", "axis": "Состояние", "power": 1, "duration_hours": 12})]
+    return {
+        "id": aid,
+        "name": str(a.get("name") or "Способность").strip()[:90],
+        "practice": str(a.get("practice") or "").strip()[:200],
+        "description": str(a.get("description") or "").strip()[:800],
+        "duration_minutes": _clean_int(a.get("duration_minutes", 20), 20, 0, 1440),
+        "cooldown_hours": _clean_float(a.get("cooldown_hours", 0), 0, 0, 10000),
+        "miss_after_hours": _clean_float(a.get("miss_after_hours", 0), 0, 0, 10000),
+        "effects": effects[:8],
+        "miss_effects": miss_effects[:4],
+        "last_cast_ts": str(a.get("last_cast_ts") or ""),
+        "cast_count": _clean_int(a.get("cast_count", 0), 0, 0, 10**9),
+    }
+
+def _clean_item(i: dict | None) -> dict:
+    i = i if isinstance(i, dict) else {}
+    iid = re.sub(r"[^a-zA-Z0-9_-]+", "", str(i.get("id") or ""))[:64] or str(uuid.uuid4())
+    effects = [_clean_effect_template(e) for e in (i.get("effects") or []) if isinstance(e, dict)]
+    return {
+        "id": iid,
+        "name": str(i.get("name") or "Предмет").strip()[:90],
+        "category": str(i.get("category") or "расходник").strip()[:80],
+        "quantity": _clean_float(i.get("quantity", 0), 0, 0, 10**12),
+        "unit": str(i.get("unit") or "шт").strip()[:20],
+        "default_amount": _clean_float(i.get("default_amount", 1), 1, 0.0001, 10**12),
+        "note": str(i.get("note") or "").strip()[:800],
+        "effects": effects[:8],
+    }
+
+def _clean_arcana_state(data: dict | None) -> dict:
+    d = data if isinstance(data, dict) else _default_arcana_state()
+    effects = []
+    cutoff = _utcnow() - timedelta(days=7)
+    for e in d.get("effects") or []:
+        if not isinstance(e, dict): continue
+        exp = _parse_arcana_dt(str(e.get("expires_ts") or ""))
+        if exp and exp < cutoff: continue
+        e2 = _clean_effect_template(e)
+        e2.update({
+            "id": str(e.get("id") or uuid.uuid4()),
+            "source_type": str(e.get("source_type") or ""),
+            "source_id": str(e.get("source_id") or ""),
+            "source_name": str(e.get("source_name") or ""),
+            "started_ts": str(e.get("started_ts") or ""),
+            "expires_ts": str(e.get("expires_ts") or ""),
+            "amount": _clean_float(e.get("amount", 1), 1, 0, 10**12),
+        })
+        effects.append(e2)
+    log = [x for x in (d.get("log") or []) if isinstance(x, dict)][-80:]
+    return {
+        "abilities": [_clean_ability(a) for a in (d.get("abilities") or [])],
+        "inventory": [_clean_item(i) for i in (d.get("inventory") or [])],
+        "effects": effects[-160:],
+        "log": log,
+    }
+
+def _arcana_state(user_id: str = "admin") -> dict:
+    f = _arcana_file(user_id)
+    if f.exists():
+        try: return _clean_arcana_state(json.loads(f.read_text()))
+        except: pass
+    return _clean_arcana_state(_default_arcana_state())
+
+def _save_arcana_state(state: dict, user_id: str = "admin"):
+    _arcana_file(user_id).write_text(json.dumps(_clean_arcana_state(state), ensure_ascii=False))
+
+def _effect_instance(tpl: dict, source_type: str, source_id: str, source_name: str, amount: float = 1, scale: float = 1) -> dict:
+    now = _utcnow()
+    t = _clean_effect_template(tpl)
+    dur = _clean_float(t.get("duration_hours", 12), 12, 0.05, 10000)
+    return {
+        **t,
+        "id": str(uuid.uuid4()),
+        "source_type": source_type,
+        "source_id": source_id,
+        "source_name": source_name,
+        "started_ts": now.strftime("%Y-%m-%d %H:%M"),
+        "expires_ts": (now + timedelta(hours=dur)).strftime("%Y-%m-%d %H:%M"),
+        "amount": amount,
+        "power": round(_clean_float(t.get("power", 1), 1, -99, 99) * scale, 2),
+    }
+
+def _active_arcana_effects(state: dict) -> list[dict]:
+    now = _utcnow()
+    active = []
+    for e in state.get("effects", []):
+        exp = _parse_arcana_dt(e.get("expires_ts", ""))
+        if exp and exp > now: active.append(e)
+    for a in state.get("abilities", []):
+        miss_after = _clean_float(a.get("miss_after_hours", 0), 0, 0, 10000)
+        if not miss_after or not a.get("miss_effects"): continue
+        last = _parse_arcana_dt(a.get("last_cast_ts", ""))
+        if not last or (now - last).total_seconds() / 3600 >= miss_after:
+            for tpl in a.get("miss_effects", []):
+                e = _effect_instance(tpl, "ability_miss", a["id"], a["name"], 1, 1)
+                e["id"] = f"miss:{a['id']}:{tpl.get('id','')}"
+                e["started_ts"] = (last or now).strftime("%Y-%m-%d %H:%M")
+                e["expires_ts"] = ""
+                active.append(e)
+    return sorted(active, key=lambda e: (e.get("kind") == "debuff", e.get("expires_ts") or "9999"), reverse=True)
+
+def _arcana_payload(state: dict) -> dict:
+    return {**state, "active_effects": _active_arcana_effects(state), "server_now": _now_s()}
+
+class AbilityReq(BaseModel):
+    id: str = ""
+    name: str = ""
+    practice: str = ""
+    description: str = ""
+    duration_minutes: int = 20
+    cooldown_hours: float = 0
+    miss_after_hours: float = 0
+    effects: list[dict] = Field(default_factory=list)
+    miss_effects: list[dict] = Field(default_factory=list)
+
+class InventoryItemReq(BaseModel):
+    id: str = ""
+    name: str = ""
+    category: str = "расходник"
+    quantity: float = 0
+    unit: str = "шт"
+    default_amount: float = 1
+    note: str = ""
+    effects: list[dict] = Field(default_factory=list)
+
+class ConsumeReq(BaseModel):
+    amount: float = 1
+    note: str = ""
+
+@app.get("/arcana")
+def get_arcana(u: dict = Depends(current_user)):
+    with _ARCANA_LOCK:
+        return _arcana_payload(_arcana_state(_uid(u)))
+
+@app.post("/abilities")
+def save_ability(req: AbilityReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        incoming = _clean_ability(req.model_dump() if hasattr(req, "model_dump") else req.dict())
+        existing = next((a for a in state["abilities"] if a["id"] == incoming["id"]), None)
+        if existing:
+            incoming["last_cast_ts"] = existing.get("last_cast_ts", "")
+            incoming["cast_count"] = existing.get("cast_count", 0)
+            state["abilities"] = [incoming if a["id"] == incoming["id"] else a for a in state["abilities"]]
+        else:
+            state["abilities"].append(incoming)
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/cast")
+def cast_ability(aid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        ability = next((a for a in state["abilities"] if a["id"] == aid), None)
+        if not ability: raise HTTPException(404, "Способность не найдена")
+        last = _parse_arcana_dt(ability.get("last_cast_ts", ""))
+        cooldown = _clean_float(ability.get("cooldown_hours", 0), 0, 0, 10000)
+        if last and cooldown and _utcnow() < last + timedelta(hours=cooldown):
+            ready = (last + timedelta(hours=cooldown)).strftime("%Y-%m-%d %H:%M")
+            raise HTTPException(409, f"Способность перезаряжается до {ready}")
+        effects = [_effect_instance(t, "ability", aid, ability["name"]) for t in ability.get("effects", [])]
+        state["effects"].extend(effects)
+        ability["last_cast_ts"] = _now_s()
+        ability["cast_count"] = _clean_int(ability.get("cast_count", 0), 0) + 1
+        state["log"].append({"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_cast",
+                             "source": ability["name"], "note": ability.get("practice", ""),
+                             "effects": [e["label"] for e in effects]})
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/delete")
+def delete_ability(aid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        state["abilities"] = [a for a in state["abilities"] if a["id"] != aid]
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/inventory")
+def save_inventory_item(req: InventoryItemReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        incoming = _clean_item(req.model_dump() if hasattr(req, "model_dump") else req.dict())
+        if any(i["id"] == incoming["id"] for i in state["inventory"]):
+            state["inventory"] = [incoming if i["id"] == incoming["id"] else i for i in state["inventory"]]
+        else:
+            state["inventory"].append(incoming)
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/inventory/{iid}/consume")
+def consume_inventory_item(iid: str, req: ConsumeReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        item = next((i for i in state["inventory"] if i["id"] == iid), None)
+        if not item: raise HTTPException(404, "Предмет не найден")
+        amount = _clean_float(req.amount, item.get("default_amount", 1), 0.0001, 10**12)
+        if amount > item["quantity"]:
+            raise HTTPException(400, "Недостаточно ресурса")
+        item["quantity"] = round(item["quantity"] - amount, 4)
+        scale = amount / max(float(item.get("default_amount") or 1), 0.0001)
+        effects = [_effect_instance(t, "inventory", iid, item["name"], amount, scale) for t in item.get("effects", [])]
+        state["effects"].extend(effects)
+        state["log"].append({"id": str(uuid.uuid4()), "ts": _now_s(), "type": "item_consume",
+                             "source": item["name"], "amount": amount, "unit": item.get("unit", ""),
+                             "note": req.note, "effects": [e["label"] for e in effects]})
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/inventory/{iid}/delete")
+def delete_inventory_item(iid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        state["inventory"] = [i for i in state["inventory"] if i["id"] != iid]
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/effects/{eid}/clear")
+def clear_effect(eid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        state["effects"] = [e for e in state["effects"] if e["id"] != eid]
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
 def _pocket_cfg(user_id: str = "admin"):
     f = _user_json_file("pocket_config.json", user_id)
     if f.exists():
@@ -3435,6 +3765,11 @@ nav{display:flex;align-items:center;min-width:0}
 .nav-item:hover{color:var(--ink2)}
 .nav-item.active{color:var(--ink);border-bottom-color:var(--gold)}
 .topbar-right{margin-left:auto;display:flex;align-items:center;gap:14px;min-width:0}
+.top-effects{display:flex;align-items:center;gap:6px;min-width:0;max-width:420px;overflow:hidden}
+.top-effect-badge{font-size:10px;font-family:sans-serif;white-space:nowrap;border:1px solid var(--border2);
+  border-radius:999px;padding:3px 8px;color:var(--ink2);background:rgba(139,105,20,.04);cursor:pointer}
+.top-effect-badge.buff{border-color:rgba(42,94,122,.45);color:var(--blue)}
+.top-effect-badge.debuff{border-color:rgba(128,47,31,.45);color:var(--red)}
 .topbar-settings{cursor:pointer;font-size:14px;color:var(--ink3);
   padding:4px 8px;border-radius:3px;transition:color .12s;font-family:sans-serif}
 .topbar-settings:hover{color:var(--ink)}
@@ -3993,6 +4328,39 @@ section.active{display:block}
 .pocket-tx-amount.deferred{color:var(--gold)}
 .pocket-section-title{font-size:11px;letter-spacing:3px;text-transform:uppercase;
   font-family:sans-serif;color:var(--ink3);margin-bottom:14px}
+/* ── ABILITIES / INVENTORY ── */
+#s-abilities,#s-inventory{padding:40px 56px 60px;overflow-y:auto;background:var(--paper)}
+.arcana-topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:24px}
+.arcana-eyebrow{font-size:10px;letter-spacing:4px;text-transform:uppercase;color:var(--red);font-family:sans-serif;margin-bottom:6px}
+.arcana-heading{font-size:24px;color:var(--ink);margin-bottom:5px}
+.arcana-sub{font-size:12px;color:var(--ink3);font-family:sans-serif;line-height:1.5}
+.effects-panel{border:1px solid var(--border2);background:var(--paper2);border-radius:4px;
+  padding:16px 18px;margin-bottom:24px;max-width:980px}
+.effects-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.effect-card{border-left:3px solid var(--blue);background:var(--paper);padding:11px 12px;border-radius:0 4px 4px 0}
+.effect-card.debuff{border-left-color:var(--red)}
+.effect-title{font-size:14px;color:var(--ink);margin-bottom:4px}
+.effect-meta{font-size:10px;color:var(--ink3);font-family:sans-serif;line-height:1.45}
+.effect-note{font-size:11px;color:var(--ink2);font-family:sans-serif;line-height:1.45;margin-top:7px}
+.arcana-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;max-width:1100px}
+.arcana-card{background:var(--paper2);border:1px solid var(--border2);border-radius:4px;padding:18px 20px}
+.arcana-card-title{font-size:18px;color:var(--ink);margin-bottom:6px}
+.arcana-card-sub{font-size:12px;color:var(--ink3);font-family:sans-serif;line-height:1.5;margin-bottom:12px}
+.arcana-effects{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+.effect-chip{font-size:10px;font-family:sans-serif;border:1px solid rgba(42,94,122,.35);color:var(--blue);
+  border-radius:999px;padding:3px 8px;background:rgba(42,94,122,.05)}
+.effect-chip.debuff{border-color:rgba(128,47,31,.35);color:var(--red);background:rgba(128,47,31,.05)}
+.arcana-card-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.arcana-muted{font-size:11px;color:var(--ink3);font-family:sans-serif}
+.inventory-qty{font-size:24px;color:var(--gold);margin:6px 0 3px}
+.effect-edit-row{border:1px solid var(--border2);background:rgba(139,105,20,.04);border-radius:4px;
+  padding:10px;margin-bottom:10px}
+.effect-edit-grid{display:grid;grid-template-columns:1.2fr 96px 1fr 72px 88px 34px;gap:8px}
+.effect-edit-grid .dlg-input{margin-bottom:8px}
+.effect-edit-row .dlg-textarea{height:54px;margin-bottom:0}
+.consume-row{display:flex;gap:8px;margin-top:10px}
+.consume-row input{flex:1;background:var(--paper);border:1px solid var(--border);color:var(--ink);
+  font-family:'Georgia',serif;font-size:13px;padding:8px 10px;border-radius:3px;outline:none}
 /* ── TWO FORCES SIDEBAR ── */
 .char-section{margin-top:4px;padding-top:14px;border-top:1px solid var(--border2)}
 .force-card{position:relative;padding:10px 0 2px}
@@ -4161,12 +4529,15 @@ section.active{display:block}
   .entry-text{text-align:left;line-height:1.8}
   .missions-wrap{max-width:none;padding:30px 22px 56px}
   .missions-sub{margin-bottom:24px}
-  .base-wrap,#s-pocket{padding:28px 22px 48px}
+  .base-wrap,#s-pocket,#s-abilities,#s-inventory{padding:28px 22px 48px}
   .base-topbar{gap:12px;align-items:flex-start}
   .base-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr))}
   .mech-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,210px),1fr))}
   .pocket-cards{grid-template-columns:repeat(2,minmax(0,1fr));max-width:none}
   .pocket-form,.pocket-tx-list{max-width:none}
+  .arcana-topbar{flex-direction:column}
+  .effect-edit-grid{grid-template-columns:1fr 1fr}
+  .top-effects{display:none}
   .btn-edit-inline{opacity:1}
   .dlg,#ent-modal,#settings-modal,#oracle-modal{padding:12px;align-items:center}
   .dlg-box,#settings-box,#ent-box,#oracle-box{
@@ -4190,7 +4561,7 @@ section.active{display:block}
   .day-heading{letter-spacing:2px;gap:8px;align-items:flex-start;flex-wrap:wrap}
   .day-heading::after{min-width:80px}
   .daily-done-badge{margin-left:0;font-size:11px}
-  .missions-wrap,.base-wrap,#s-pocket{padding:22px 16px 40px}
+  .missions-wrap,.base-wrap,#s-pocket,#s-abilities,#s-inventory{padding:22px 16px 40px}
   .missions-topbar,.base-topbar{align-items:stretch;flex-direction:column}
   .base-topbar-right,.mission-actions,.dlg-btns,.pocket-form-row{
     width:100%;justify-content:flex-start;flex-wrap:wrap;
@@ -4208,6 +4579,9 @@ section.active{display:block}
   .pocket-card-amount{font-size:24px;letter-spacing:0}
   .pocket-reserve-row{align-items:flex-start;flex-wrap:wrap}
   .pocket-actions{gap:9px;margin-bottom:24px}
+  .arcana-grid,.effects-grid{grid-template-columns:1fr}
+  .effect-edit-grid{grid-template-columns:1fr}
+  .effect-edit-grid .rhythm-remove{width:44px}
   .pocket-btn{padding:8px 14px}
   .pocket-tx-item{gap:8px}
   .pocket-tx-amount{margin-left:0}
@@ -4347,7 +4721,7 @@ section.active{display:block}
 
   /* ── Content padding: bottom = bottom-nav + input-bar height ── */
   .journal-main{ padding:18px 16px 176px; }
-  .missions-wrap,.base-wrap,#s-pocket{ padding:18px 16px 80px; }
+  .missions-wrap,.base-wrap,#s-pocket,#s-abilities,#s-inventory{ padding:18px 16px 80px; }
   .missions-sub{ margin-bottom:20px; }
 
   /* ── Cards ── */
@@ -4355,6 +4729,9 @@ section.active{display:block}
   .mech-grid{ grid-template-columns:repeat(auto-fill,minmax(min(100%,210px),1fr)); }
   .pocket-cards{ grid-template-columns:1fr; max-width:none; gap:12px; margin-bottom:20px; }
   .pocket-form,.pocket-tx-list{ max-width:none; }
+  .arcana-grid,.effects-grid{ grid-template-columns:1fr; }
+  .arcana-topbar{ align-items:stretch; flex-direction:column; }
+  .effect-edit-grid{ grid-template-columns:1fr; }
 
   /* ── Full-screen sheet modals ── */
   .dlg,#ent-modal,#settings-modal,#oracle-modal,#reanalyze-modal{
@@ -4404,10 +4781,13 @@ section.active{display:block}
   <nav>
     <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
     <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
+    <div class="nav-item" data-s="abilities" onclick="nav(this)">✦ Бафы</div>
+    <div class="nav-item" data-s="inventory" onclick="nav(this)">🎒 Инвентарь</div>
     <div class="nav-item" data-s="pocket" onclick="nav(this)">💰 Карман</div>
     <div class="nav-item" data-s="base" onclick="nav(this)" style="display:none">🗄️ База знаний</div>
   </nav>
   <div class="topbar-right">
+    <div id="top-effects" class="top-effects"></div>
     <div class="topbar-settings" onclick="openSettings()">⚙</div>
     <div class="topbar-settings" onclick="doLogout()" title="Выйти из аккаунта" style="font-size:11px;letter-spacing:.5px">Выход</div>
   </div>
@@ -4436,6 +4816,12 @@ section.active{display:block}
   </div>
   <div class="bnav-item" data-s="missions" onclick="navMob(this)">
     <span class="bnav-icon">⚔️</span><span>Пути</span>
+  </div>
+  <div class="bnav-item" data-s="abilities" onclick="navMob(this)">
+    <span class="bnav-icon">✦</span><span>Бафы</span>
+  </div>
+  <div class="bnav-item" data-s="inventory" onclick="navMob(this)">
+    <span class="bnav-icon">🎒</span><span>Инв.</span>
   </div>
   <div class="bnav-item" data-s="pocket" onclick="navMob(this)">
     <span class="bnav-icon">💰</span><span>Карман</span>
@@ -4482,6 +4868,38 @@ section.active{display:block}
         <div class="empty">Загрузка базы знаний...</div>
       </div>
     </div>
+  </section>
+
+  <section id="s-abilities">
+    <div class="arcana-topbar">
+      <div>
+        <div class="arcana-eyebrow">КНИГА СПОСОБНОСТЕЙ</div>
+        <div class="arcana-heading">Бафы</div>
+        <div class="arcana-sub">Практики, ритуалы и активности, которые поддерживают состояние Героя.</div>
+      </div>
+      <button class="btn-add" onclick="openAbilityDlg()">+ способность</button>
+    </div>
+    <div class="effects-panel">
+      <div class="pocket-section-title">Активные эффекты</div>
+      <div id="abilities-effects"><div class="empty" style="padding:14px">Эффектов пока нет</div></div>
+    </div>
+    <div class="arcana-grid" id="abilities-list"></div>
+  </section>
+
+  <section id="s-inventory">
+    <div class="arcana-topbar">
+      <div>
+        <div class="arcana-eyebrow">ИНВЕНТАРЬ ГЕРОЯ</div>
+        <div class="arcana-heading">Инвентарь</div>
+        <div class="arcana-sub">Расходуемые ресурсы: еда, добавки, предметы и любые вещи, которые можно тратить частями.</div>
+      </div>
+      <button class="btn-add" onclick="openInventoryDlg()">+ предмет</button>
+    </div>
+    <div class="effects-panel">
+      <div class="pocket-section-title">Активные эффекты</div>
+      <div id="inventory-effects"><div class="empty" style="padding:14px">Эффектов пока нет</div></div>
+    </div>
+    <div class="arcana-grid" id="inventory-list"></div>
   </section>
 
   <section id="s-pocket">
@@ -4641,6 +5059,53 @@ section.active{display:block}
       <button class="btn-cancel" onclick="requestRhythmNotifications()">Уведомления ОС</button>
       <button class="btn-primary" onclick="saveDayRhythm()">Сохранить</button>
       <button class="btn-cancel" onclick="closeDlg('rhythm-dlg')">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<div class="dlg" id="ability-dlg">
+  <div class="dlg-box" style="width:680px;max-width:calc(100vw - 28px)">
+    <div class="dlg-title" id="ability-dlg-title">Способность</div>
+    <input type="hidden" id="ab-id">
+    <input class="dlg-input" id="ab-name" placeholder="Название: Медитация, Сон, Спорт...">
+    <input class="dlg-input" id="ab-practice" placeholder="Что сделать: медитировать 20 минут, поспать, сходить в зал...">
+    <textarea class="dlg-textarea" id="ab-description" placeholder="Зачем эта способность нужна Герою"></textarea>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
+      <input class="dlg-input" id="ab-duration" type="number" min="0" placeholder="Минут практики">
+      <input class="dlg-input" id="ab-cooldown" type="number" min="0" step="0.5" placeholder="КД, часов">
+      <input class="dlg-input" id="ab-miss-after" type="number" min="0" step="1" placeholder="Дебаф если не делать, часов">
+    </div>
+    <div class="pocket-section-title">Эффекты при применении</div>
+    <div id="ab-effects-editor"></div>
+    <button class="btn-cancel" onclick="addEffectRow('ab-effects-editor')">+ эффект</button>
+    <div class="pocket-section-title" style="margin-top:16px">Дебаф при пропуске</div>
+    <div id="ab-miss-effects-editor"></div>
+    <button class="btn-cancel" onclick="addEffectRow('ab-miss-effects-editor','debuff')">+ дебаф</button>
+    <div class="dlg-btns" style="margin-top:14px">
+      <button class="btn-primary" onclick="saveAbility()">Сохранить</button>
+      <button class="btn-cancel" onclick="closeDlg('ability-dlg')">Отмена</button>
+    </div>
+  </div>
+</div>
+
+<div class="dlg" id="inventory-dlg">
+  <div class="dlg-box" style="width:680px;max-width:calc(100vw - 28px)">
+    <div class="dlg-title" id="inventory-dlg-title">Предмет</div>
+    <input type="hidden" id="inv-id">
+    <input class="dlg-input" id="inv-name" placeholder="Название: ежовик, мясо, магний...">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
+      <input class="dlg-input" id="inv-category" placeholder="Категория">
+      <input class="dlg-input" id="inv-quantity" type="number" min="0" step="0.0001" placeholder="Количество">
+      <input class="dlg-input" id="inv-unit" placeholder="Ед.: г, кг, шт">
+      <input class="dlg-input" id="inv-default-amount" type="number" min="0.0001" step="0.0001" placeholder="Разовая доза">
+    </div>
+    <textarea class="dlg-textarea" id="inv-note" placeholder="Что это за ресурс и как ты хочешь его использовать"></textarea>
+    <div class="pocket-section-title">Эффекты при расходе разовой дозы</div>
+    <div id="inv-effects-editor"></div>
+    <button class="btn-cancel" onclick="addEffectRow('inv-effects-editor')">+ эффект</button>
+    <div class="dlg-btns" style="margin-top:14px">
+      <button class="btn-primary" onclick="saveInventoryItem()">Сохранить</button>
+      <button class="btn-cancel" onclick="closeDlg('inventory-dlg')">Отмена</button>
     </div>
   </div>
 </div>
@@ -4831,7 +5296,7 @@ async function doLogin(){
       const d=await r.json();
       localStorage.setItem('lrpg_token',d.token);
       window._me=d; hideLogin();
-      loadJournal();loadAsides();loadCharacter();loadDayRhythm();
+      loadJournal();loadAsides();loadCharacter();loadDayRhythm();loadArcana();
     } else { const d=await r.json(); err.textContent=d.detail||'Ошибка'; }
   }catch{err.textContent='Нет связи с сервером';}
 }
@@ -4849,7 +5314,7 @@ async function doRegister(){
       const d=await r.json();
       localStorage.setItem('lrpg_token',d.token);
       window._me=d; hideLogin();
-      loadJournal();loadAsides();loadCharacter();loadDayRhythm();
+      loadJournal();loadAsides();loadCharacter();loadDayRhythm();loadArcana();
     } else { const d=await r.json(); err.textContent=d.detail||'Ошибка'; }
   }catch{err.textContent='Нет связи с сервером';}
 }
@@ -4860,6 +5325,8 @@ function doLogout(){
   document.getElementById('ls-pw2').value='';
   const rhythmEl=document.getElementById('day-rhythm-widget');
   if(rhythmEl) rhythmEl.innerHTML='';
+  const topEffects=document.getElementById('top-effects');
+  if(topEffects) topEffects.innerHTML='';
   showLogin();
 }
 // ── State ────────────────────────────────────────────────────────────────────
@@ -5338,8 +5805,220 @@ async function triggerAnalyze(){
   await loadCharacter();
 }
 
+// ── Abilities / Inventory / Effects ─────────────────────────────────────────
+let arcanaState={abilities:[],inventory:[],effects:[],active_effects:[],log:[]};
+let _arcanaTimer=null;
+function effectTtl(e){
+  if(!e.expires_ts) return 'пока не исправишь';
+  const d=parseServerTs(e.expires_ts);
+  if(!d) return '';
+  const diff=d.getTime()-Date.now();
+  if(diff<=0) return 'истёк';
+  const h=Math.floor(diff/3600000);
+  const m=Math.floor((diff%3600000)/60000);
+  return h?`${h}ч ${m}м`:`${Math.max(1,m)}м`;
+}
+function effectChip(e){
+  const kind=e.kind==='debuff'?'debuff':'buff';
+  const sign=Number(e.power||0)>0?'+':'';
+  return `<span class="effect-chip ${kind}">${htmlesc(e.label)} · ${htmlesc(e.axis)} ${sign}${e.power}</span>`;
+}
+function effectCard(e){
+  const kind=e.kind==='debuff'?'debuff':'buff';
+  const canClear=e.id&&!String(e.id).startsWith('miss:');
+  return `<div class="effect-card ${kind}">
+    <div class="effect-title">${kind==='debuff'?'↓':'↑'} ${htmlesc(e.label)}</div>
+    <div class="effect-meta">${htmlesc(e.axis)} ${Number(e.power||0)>0?'+':''}${e.power} · ${effectTtl(e)} · ${htmlesc(e.source_name||'')}</div>
+    ${e.note?`<div class="effect-note">${htmlesc(e.note)}</div>`:''}
+    ${canClear?`<div class="arcana-card-actions"><button class="btn-sm btn-danger" onclick="clearEffect('${_jsEsc(e.id)}')">снять</button></div>`:''}
+  </div>`;
+}
+function renderEffectsInto(id){
+  const el=document.getElementById(id);
+  if(!el) return;
+  const effects=arcanaState.active_effects||[];
+  el.innerHTML=effects.length?`<div class="effects-grid">${effects.map(effectCard).join('')}</div>`:
+    '<div class="empty" style="padding:14px">Эффектов пока нет</div>';
+}
+function renderTopEffects(){
+  const el=document.getElementById('top-effects');
+  if(!el) return;
+  const effects=(arcanaState.active_effects||[]).slice(0,5);
+  el.innerHTML=effects.map(e=>`<span class="top-effect-badge ${e.kind==='debuff'?'debuff':'buff'}" title="${htmlesc(e.note||'')}">${e.kind==='debuff'?'↓':'↑'} ${htmlesc(e.label)} · ${effectTtl(e)}</span>`).join('');
+}
+function renderAbilityCard(a){
+  const last=a.last_cast_ts?`последний каст: ${localTimeHM(a.last_cast_ts)||''} ${localDisplayDate(a.last_cast_ts)||''}`:'ещё не применялась';
+  const miss=a.miss_after_hours?` · дебаф после ${a.miss_after_hours}ч пропуска`:'';
+  return `<div class="arcana-card">
+    <div class="arcana-card-title">✦ ${htmlesc(a.name)}</div>
+    <div class="arcana-card-sub">${htmlesc(a.practice||a.description||'Практика без описания.')}</div>
+    ${a.description?`<div class="arcana-muted">${htmlesc(a.description)}</div>`:''}
+    <div class="arcana-effects">${(a.effects||[]).map(effectChip).join('')}${(a.miss_effects||[]).map(effectChip).join('')}</div>
+    <div class="arcana-muted">${a.duration_minutes||0} мин · КД ${a.cooldown_hours||0}ч${miss}<br>${last}</div>
+    <div class="arcana-card-actions">
+      <button class="pocket-btn" onclick="castAbility('${_jsEsc(a.id)}')">каст</button>
+      <button class="pocket-btn secondary" onclick="openAbilityDlg('${_jsEsc(a.id)}')">настроить</button>
+      <button class="btn-sm btn-danger" onclick="deleteAbility('${_jsEsc(a.id)}')">удалить</button>
+    </div>
+  </div>`;
+}
+function renderAbilities(){
+  renderEffectsInto('abilities-effects');
+  const el=document.getElementById('abilities-list');
+  if(el) el.innerHTML=(arcanaState.abilities||[]).length?(arcanaState.abilities||[]).map(renderAbilityCard).join(''):
+    '<div class="empty">Способностей пока нет</div>';
+}
+function renderInventoryCard(i){
+  const effects=(i.effects||[]).map(effectChip).join('');
+  return `<div class="arcana-card">
+    <div class="arcana-card-title">🎒 ${htmlesc(i.name)}</div>
+    <div class="arcana-card-sub">${htmlesc(i.category||'расходник')}</div>
+    <div class="inventory-qty">${Number(i.quantity||0).toLocaleString('ru-RU')} ${htmlesc(i.unit||'шт')}</div>
+    <div class="arcana-muted">разовая доза: ${Number(i.default_amount||1).toLocaleString('ru-RU')} ${htmlesc(i.unit||'')}</div>
+    ${i.note?`<div class="effect-note">${htmlesc(i.note)}</div>`:''}
+    <div class="arcana-effects">${effects||'<span class="arcana-muted">без эффектов</span>'}</div>
+    <div class="consume-row">
+      <input id="consume-${htmlesc(i.id)}" type="number" min="0.0001" step="0.0001" value="${i.default_amount||1}">
+      <button class="pocket-btn" onclick="consumeItem('${_jsEsc(i.id)}')">израсходовать</button>
+    </div>
+    <div class="arcana-card-actions">
+      <button class="pocket-btn secondary" onclick="openInventoryDlg('${_jsEsc(i.id)}')">настроить</button>
+      <button class="btn-sm btn-danger" onclick="deleteInventoryItem('${_jsEsc(i.id)}')">удалить</button>
+    </div>
+  </div>`;
+}
+function renderInventory(){
+  renderEffectsInto('inventory-effects');
+  const el=document.getElementById('inventory-list');
+  if(el) el.innerHTML=(arcanaState.inventory||[]).length?(arcanaState.inventory||[]).map(renderInventoryCard).join(''):
+    '<div class="empty">Инвентарь пуст</div>';
+}
+function renderArcana(){
+  renderTopEffects();
+  renderEffectsInto('abilities-effects');
+  renderEffectsInto('inventory-effects');
+  if(document.querySelector('#s-abilities.active')) renderAbilities();
+  if(document.querySelector('#s-inventory.active')) renderInventory();
+}
+async function loadArcana(){
+  try{
+    const r=await fetch('/arcana');
+    if(r.ok) arcanaState=await r.json();
+  }catch(e){}
+  renderArcana();
+  if(!_arcanaTimer) _arcanaTimer=setInterval(renderArcana,30000);
+}
+function effectRowHtml(e={},kind='buff'){
+  const rowId='eff_'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+  const k=e.kind||kind||'buff';
+  return `<div class="effect-edit-row" data-effect-row id="${rowId}">
+    <div class="effect-edit-grid">
+      <input class="dlg-input" data-effect-field="label" placeholder="Название эффекта" value="${htmlesc(e.label||'')}">
+      <select class="dlg-input" data-effect-field="kind">
+        <option value="buff" ${k==='buff'?'selected':''}>баф</option>
+        <option value="debuff" ${k==='debuff'?'selected':''}>дебаф</option>
+      </select>
+      <input class="dlg-input" data-effect-field="axis" placeholder="Параметр: Фокус" value="${htmlesc(e.axis||'')}">
+      <input class="dlg-input" data-effect-field="power" type="number" step="0.5" placeholder="Сила" value="${e.power??1}">
+      <input class="dlg-input" data-effect-field="duration_hours" type="number" min="0.05" step="0.5" placeholder="Часов" value="${e.duration_hours??12}">
+      <button class="rhythm-remove" onclick="this.closest('[data-effect-row]').remove()">×</button>
+    </div>
+    <textarea class="dlg-textarea" data-effect-field="note" placeholder="Что этот эффект значит в игре">${htmlesc(e.note||'')}</textarea>
+  </div>`;
+}
+function addEffectRow(containerId,kind='buff',effect=null){
+  const el=document.getElementById(containerId);
+  if(el) el.insertAdjacentHTML('beforeend',effectRowHtml(effect||{},kind));
+}
+function fillEffectEditor(containerId,effects,kind='buff'){
+  const el=document.getElementById(containerId);
+  if(!el) return;
+  el.innerHTML='';
+  (effects&&effects.length?effects:[{kind}]).forEach(e=>addEffectRow(containerId,e.kind||kind,e));
+}
+function collectEffects(containerId){
+  return Array.from(document.querySelectorAll(`#${containerId} [data-effect-row]`)).map(row=>{
+    const get=f=>row.querySelector(`[data-effect-field="${f}"]`)?.value || '';
+    return {label:get('label'),kind:get('kind')||'buff',axis:get('axis')||'Состояние',
+      power:parseFloat(get('power')||'1'),duration_hours:parseFloat(get('duration_hours')||'12'),note:get('note')};
+  }).filter(e=>e.label.trim());
+}
+function openAbilityDlg(id=''){
+  const a=(arcanaState.abilities||[]).find(x=>x.id===id)||{};
+  document.getElementById('ability-dlg-title').textContent=id?'Настроить способность':'Новая способность';
+  document.getElementById('ab-id').value=a.id||'';
+  document.getElementById('ab-name').value=a.name||'';
+  document.getElementById('ab-practice').value=a.practice||'';
+  document.getElementById('ab-description').value=a.description||'';
+  document.getElementById('ab-duration').value=a.duration_minutes??20;
+  document.getElementById('ab-cooldown').value=a.cooldown_hours??0;
+  document.getElementById('ab-miss-after').value=a.miss_after_hours??0;
+  fillEffectEditor('ab-effects-editor',a.effects||[],'buff');
+  fillEffectEditor('ab-miss-effects-editor',a.miss_effects||[],'debuff');
+  openDlg('ability-dlg');
+}
+async function saveAbility(){
+  const payload={id:document.getElementById('ab-id').value,name:document.getElementById('ab-name').value,
+    practice:document.getElementById('ab-practice').value,description:document.getElementById('ab-description').value,
+    duration_minutes:parseInt(document.getElementById('ab-duration').value||'20',10),
+    cooldown_hours:parseFloat(document.getElementById('ab-cooldown').value||'0'),
+    miss_after_hours:parseFloat(document.getElementById('ab-miss-after').value||'0'),
+    effects:collectEffects('ab-effects-editor'),miss_effects:collectEffects('ab-miss-effects-editor')};
+  const r=await fetch('/abilities',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  if(!r.ok){alert('Не удалось сохранить способность');return;}
+  arcanaState=await r.json(); closeDlg('ability-dlg'); renderAbilities(); renderTopEffects();
+}
+async function castAbility(id){
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/cast`,{method:'POST'});
+  if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось применить'})); alert(d.detail||'Не удалось применить'); return;}
+  arcanaState=await r.json(); renderAbilities(); renderTopEffects();
+}
+async function deleteAbility(id){
+  if(!confirm('Удалить способность?')) return;
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/delete`,{method:'POST'});
+  if(r.ok){arcanaState=await r.json(); renderAbilities(); renderTopEffects();}
+}
+function openInventoryDlg(id=''){
+  const i=(arcanaState.inventory||[]).find(x=>x.id===id)||{};
+  document.getElementById('inventory-dlg-title').textContent=id?'Настроить предмет':'Новый предмет';
+  document.getElementById('inv-id').value=i.id||'';
+  document.getElementById('inv-name').value=i.name||'';
+  document.getElementById('inv-category').value=i.category||'расходник';
+  document.getElementById('inv-quantity').value=i.quantity??0;
+  document.getElementById('inv-unit').value=i.unit||'шт';
+  document.getElementById('inv-default-amount').value=i.default_amount??1;
+  document.getElementById('inv-note').value=i.note||'';
+  fillEffectEditor('inv-effects-editor',i.effects||[],'buff');
+  openDlg('inventory-dlg');
+}
+async function saveInventoryItem(){
+  const payload={id:document.getElementById('inv-id').value,name:document.getElementById('inv-name').value,
+    category:document.getElementById('inv-category').value,quantity:parseFloat(document.getElementById('inv-quantity').value||'0'),
+    unit:document.getElementById('inv-unit').value||'шт',default_amount:parseFloat(document.getElementById('inv-default-amount').value||'1'),
+    note:document.getElementById('inv-note').value,effects:collectEffects('inv-effects-editor')};
+  const r=await fetch('/inventory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  if(!r.ok){alert('Не удалось сохранить предмет');return;}
+  arcanaState=await r.json(); closeDlg('inventory-dlg'); renderInventory(); renderTopEffects();
+}
+async function consumeItem(id){
+  const amount=parseFloat(document.getElementById('consume-'+id)?.value||'0');
+  if(!amount) return;
+  const r=await fetch(`/inventory/${encodeURIComponent(id)}/consume`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount})});
+  if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось израсходовать'})); alert(d.detail||'Не удалось израсходовать'); return;}
+  arcanaState=await r.json(); renderInventory(); renderTopEffects();
+}
+async function deleteInventoryItem(id){
+  if(!confirm('Удалить предмет из инвентаря?')) return;
+  const r=await fetch(`/inventory/${encodeURIComponent(id)}/delete`,{method:'POST'});
+  if(r.ok){arcanaState=await r.json(); renderInventory(); renderTopEffects();}
+}
+async function clearEffect(id){
+  const r=await fetch(`/effects/${encodeURIComponent(id)}/clear`,{method:'POST'});
+  if(r.ok){arcanaState=await r.json(); renderArcana();}
+}
+
 // ── Nav ──────────────────────────────────────────────────────────────────────
-const TITLES={journal:'Дневник',missions:'Пути',base:'База знаний',pocket:'Карман'};
+const TITLES={journal:'Дневник',missions:'Пути',base:'База знаний',pocket:'Карман',abilities:'Бафы',inventory:'Инвентарь'};
 function nav(el){
   document.querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'));
   el.classList.add('active');
@@ -5357,6 +6036,8 @@ function nav(el){
   if(s==='missions') loadMissions();
   if(s==='base') loadBase();
   if(s==='pocket') loadPocket();
+  if(s==='abilities'){loadArcana().then(renderAbilities);}
+  if(s==='inventory'){loadArcana().then(renderInventory);}
 }
 
 function navMob(el){
@@ -5372,6 +6053,8 @@ function navMob(el){
     if(s==='missions') loadMissions();
     if(s==='base') loadBase();
     if(s==='pocket') loadPocket();
+    if(s==='abilities'){loadArcana().then(renderAbilities);}
+    if(s==='inventory'){loadArcana().then(renderInventory);}
   }
 }
 
@@ -5453,10 +6136,12 @@ function gameDateKey(ts){
 // ── Journal ──────────────────────────────────────────────────────────────────
 async function loadJournal(){
   const [dr,er,ir,doneR,mr,narR,pmR]=await Promise.all([fetch('/diary'),fetch('/entities'),fetch('/inbox'),fetch('/tasks/completed-today'),fetch('/missions'),fetch('/today-narrative'),fetch('/chronicle/past-moon')]);
-  const diary=await dr.json(); allEntities=await er.json();
-  const inboxRaw=await ir.json();
+  const diaryRaw=await dr.json(); const diary=Array.isArray(diaryRaw)?diaryRaw:[];
+  const entitiesRaw=await er.json(); allEntities=Array.isArray(entitiesRaw)?entitiesRaw:[];
+  const inboxJson=await ir.json(); const inboxRaw=Array.isArray(inboxJson)?inboxJson:[];
   const doneToday=(await doneR.json()).count||0;
-  const missions=await mr.json();
+  const missionsJson=await mr.json();
+  const missions=Array.isArray(missionsJson)?missionsJson:(Array.isArray(missionsJson.missions)?missionsJson.missions:[]);
   const todayNarrative=cleanJournalText((await narR.json()).narrative||'');
   const pastMoon=(await pmR.json()).entry||null;
   const todayTasks=missions.flatMap(m=>m.tasks.filter(t=>
@@ -6986,7 +7671,7 @@ function bootLifeRpg(){
   checkApiStatus();
   authInit().then(()=>{
     if(localStorage.getItem('lrpg_token')){
-      loadJournal(); loadAsides(); loadCharacter(); loadDayRhythm();
+      loadJournal(); loadAsides(); loadCharacter(); loadDayRhythm(); loadArcana();
     }
   });
   if(window.innerWidth<=768){

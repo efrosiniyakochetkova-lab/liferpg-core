@@ -10,11 +10,14 @@ pocket_config.json
 pocket_config.*.json
 day_rhythm.json
 day_rhythm.*.json
+arcana_state.json
+arcana_state.*.json
 inbox.json
 sessions.json
 character.json
 character.*.json
 .schema_v
+liferpg.db.bak*
 __pycache__/
 *.pyc
 .env
