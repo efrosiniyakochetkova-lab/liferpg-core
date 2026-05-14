@@ -3325,12 +3325,14 @@ def _default_arcana_state() -> dict:
             },
             {
                 "id": "sleep", "name": "Сон", "practice": "Поспать и восстановиться",
-                "description": "Базовая способность восстановления. Если долго не применять, возникает дебаф.",
-                "duration_minutes": 420, "cooldown_hours": 0, "miss_after_hours": 24,
-                "effects": [_effect_tpl("Восстановление", "buff", "Энергия", 3, 18,
-                                        "Тело возвращает запас сил и снижает внутренний шум.")],
-                "miss_effects": [_effect_tpl("Недосып", "debuff", "Энергия", -3, 24,
-                                             "Слишком долго без восстановления: действия требуют больше воли.")],
+                "description": "Сессия восстановления: лечь, проснуться, дать игре посчитать качество сна.",
+                "mode": "session", "duration_minutes": 480, "cooldown_hours": 0, "miss_after_hours": 24,
+                "ideal_start_time": "23:00", "ideal_end_time": "02:00",
+                "min_effect_ratio": 0.25, "overcap_ratio": 1, "debt_step_hours": 8, "debt_max_stage": 3,
+                "effects": [_effect_tpl("Бодрость", "buff", "Энергия", 2, 16,
+                                        "Время для активной жизни до следующего ухода ко сну.")],
+                "miss_effects": [_effect_tpl("Усталость", "debuff", "Энергия", -2, 24,
+                                             "Тело просит восстановиться: пора закрыть цикл сна.")],
                 "last_cast_ts": "", "cast_count": 0,
             },
         ],
@@ -3388,24 +3390,53 @@ def _clean_effect_template(e: dict | None) -> dict:
         "note": str(e.get("note") or "").strip()[:500],
     }
 
+def _clean_hhmm(v: str) -> str:
+    s = str(v or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if not m: return ""
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59): return ""
+    return f"{h:02d}:{mi:02d}"
+
 def _clean_ability(a: dict | None) -> dict:
     a = a if isinstance(a, dict) else {}
     aid = re.sub(r"[^a-zA-Z0-9_-]+", "", str(a.get("id") or ""))[:64] or str(uuid.uuid4())
+    mode = str(a.get("mode") or "").strip().lower()
+    if mode not in ("instant", "session"):
+        name_l = str(a.get("name") or "").lower()
+        mode = "session" if aid == "sleep" or "сон" in name_l else "instant"
     effects = [_clean_effect_template(e) for e in (a.get("effects") or []) if isinstance(e, dict)]
     miss_effects = [_clean_effect_template(e) for e in (a.get("miss_effects") or []) if isinstance(e, dict)]
     if not effects:
         effects = [_clean_effect_template({"label": "Состояние", "kind": "buff", "axis": "Состояние", "power": 1, "duration_hours": 12})]
+    active_session = a.get("active_session") if isinstance(a.get("active_session"), dict) else {}
+    if active_session:
+        active_session = {
+            "started_ts": str(active_session.get("started_ts") or ""),
+            "note": str(active_session.get("note") or "").strip()[:300],
+        }
     return {
         "id": aid,
         "name": str(a.get("name") or "Способность").strip()[:90],
         "practice": str(a.get("practice") or "").strip()[:200],
         "description": str(a.get("description") or "").strip()[:800],
+        "mode": mode,
         "duration_minutes": _clean_int(a.get("duration_minutes", 20), 20, 0, 1440),
         "cooldown_hours": _clean_float(a.get("cooldown_hours", 0), 0, 0, 10000),
         "miss_after_hours": _clean_float(a.get("miss_after_hours", 0), 0, 0, 10000),
+        "ideal_start_time": _clean_hhmm(a.get("ideal_start_time", "")),
+        "ideal_end_time": _clean_hhmm(a.get("ideal_end_time", "")),
+        "min_effect_ratio": _clean_float(a.get("min_effect_ratio", 0.25), 0.25, 0, 1),
+        "overcap_ratio": _clean_float(a.get("overcap_ratio", 1), 1, 0.1, 3),
+        "debt_step_hours": _clean_float(a.get("debt_step_hours", 8), 8, 0, 10000),
+        "debt_max_stage": _clean_int(a.get("debt_max_stage", 3), 3, 1, 12),
+        "active_session": active_session,
         "effects": effects[:8],
         "miss_effects": miss_effects[:4],
+        "created_ts": str(a.get("created_ts") or _now_s()),
         "last_cast_ts": str(a.get("last_cast_ts") or ""),
+        "last_session_minutes": _clean_int(a.get("last_session_minutes", 0), 0, 0, 10**9),
+        "total_session_minutes": _clean_int(a.get("total_session_minutes", 0), 0, 0, 10**12),
         "cast_count": _clean_int(a.get("cast_count", 0), 0, 0, 10**9),
     }
 
@@ -3444,10 +3475,12 @@ def _clean_arcana_state(data: dict | None) -> dict:
         })
         effects.append(e2)
     log = [x for x in (d.get("log") or []) if isinstance(x, dict)][-80:]
+    sessions = [x for x in (d.get("sessions") or []) if isinstance(x, dict)][-160:]
     return {
         "abilities": [_clean_ability(a) for a in (d.get("abilities") or [])],
         "inventory": [_clean_item(i) for i in (d.get("inventory") or [])],
         "effects": effects[-160:],
+        "sessions": sessions,
         "log": log,
     }
 
@@ -3461,16 +3494,18 @@ def _arcana_state(user_id: str = "admin") -> dict:
 def _save_arcana_state(state: dict, user_id: str = "admin"):
     _arcana_file(user_id).write_text(json.dumps(_clean_arcana_state(state), ensure_ascii=False))
 
-def _effect_instance(tpl: dict, source_type: str, source_id: str, source_name: str, amount: float = 1, scale: float = 1) -> dict:
+def _effect_instance(tpl: dict, source_type: str, source_id: str, source_name: str, amount: float = 1,
+                     scale: float = 1, duration_scale: float = 1) -> dict:
     now = _utcnow()
     t = _clean_effect_template(tpl)
-    dur = _clean_float(t.get("duration_hours", 12), 12, 0.05, 10000)
+    dur = _clean_float(t.get("duration_hours", 12), 12, 0.05, 10000) * _clean_float(duration_scale, 1, 0.05, 100)
     return {
         **t,
         "id": str(uuid.uuid4()),
         "source_type": source_type,
         "source_id": source_id,
         "source_name": source_name,
+        "duration_hours": round(dur, 2),
         "started_ts": now.strftime("%Y-%m-%d %H:%M"),
         "expires_ts": (now + timedelta(hours=dur)).strftime("%Y-%m-%d %H:%M"),
         "amount": amount,
@@ -3486,12 +3521,25 @@ def _active_arcana_effects(state: dict) -> list[dict]:
     for a in state.get("abilities", []):
         miss_after = _clean_float(a.get("miss_after_hours", 0), 0, 0, 10000)
         if not miss_after or not a.get("miss_effects"): continue
+        if a.get("active_session", {}).get("started_ts"): continue
         last = _parse_arcana_dt(a.get("last_cast_ts", ""))
-        if not last or (now - last).total_seconds() / 3600 >= miss_after:
+        created = _parse_arcana_dt(a.get("created_ts", ""))
+        anchor = last or created
+        elapsed_hours = (now - anchor).total_seconds() / 3600 if anchor else miss_after
+        if elapsed_hours >= miss_after:
+            overdue = max(0, elapsed_hours - miss_after)
+            step = _clean_float(a.get("debt_step_hours", 8), 8, 0, 10000)
+            max_stage = _clean_int(a.get("debt_max_stage", 3), 3, 1, 12)
+            stage = 1 + (int(overdue // step) if step else 0)
+            stage = max(1, min(max_stage, stage))
             for tpl in a.get("miss_effects", []):
-                e = _effect_instance(tpl, "ability_miss", a["id"], a["name"], 1, 1)
+                e = _effect_instance(tpl, "ability_miss", a["id"], a["name"], 1, stage)
                 e["id"] = f"miss:{a['id']}:{tpl.get('id','')}"
-                e["started_ts"] = (last or now).strftime("%Y-%m-%d %H:%M")
+                e["debt_stage"] = stage
+                e["base_label"] = e["label"]
+                if stage > 1:
+                    e["label"] = f"{e['label']} {stage}"
+                e["started_ts"] = (anchor or now).strftime("%Y-%m-%d %H:%M")
                 e["expires_ts"] = ""
                 active.append(e)
     return sorted(active, key=lambda e: (e.get("kind") == "debuff", e.get("expires_ts") or "9999"), reverse=True)
@@ -3499,14 +3547,64 @@ def _active_arcana_effects(state: dict) -> list[dict]:
 def _arcana_payload(state: dict) -> dict:
     return {**state, "active_effects": _active_arcana_effects(state), "server_now": _now_s()}
 
+def _ability_session_quality(ability: dict, minutes: float) -> dict:
+    target = max(1, _clean_float(ability.get("duration_minutes", 20), 20, 1, 1440))
+    raw_ratio = max(0, minutes) / target
+    min_ratio = _clean_float(ability.get("min_effect_ratio", 0.25), 0.25, 0, 1)
+    cap = _clean_float(ability.get("overcap_ratio", 1), 1, 0.1, 3)
+    ratio = min(raw_ratio, cap)
+    full = raw_ratio >= 0.95
+    useful = raw_ratio >= min_ratio
+    if full:
+        label = "полный цикл"
+    elif useful:
+        label = "частичный цикл"
+    else:
+        label = "слишком коротко"
+    return {"target": target, "raw_ratio": raw_ratio, "ratio": ratio, "min_ratio": min_ratio, "useful": useful, "label": label}
+
+def _finish_ability_session(state: dict, ability: dict, minutes: float, note: str = "", started_ts: str = "") -> dict:
+    minutes = _clean_float(minutes, 0, 0, 1000000)
+    q = _ability_session_quality(ability, minutes)
+    effects = []
+    if q["useful"]:
+        effects = [_effect_instance(t, "ability_session", ability["id"], ability["name"], minutes,
+                                    q["ratio"], q["ratio"]) for t in ability.get("effects", [])]
+    elif ability.get("miss_effects"):
+        # Very short sessions are recorded honestly: no reward, only a soft "not enough" signal.
+        short_scale = max(0.5, 1 - q["raw_ratio"])
+        effects = [_effect_instance(t, "ability_short", ability["id"], ability["name"], minutes,
+                                    short_scale, 1) for t in ability.get("miss_effects", [])]
+    state["effects"].extend(effects)
+    now_s = _now_s()
+    ability["active_session"] = {}
+    ability["last_cast_ts"] = now_s
+    ability["last_session_minutes"] = int(round(minutes))
+    ability["total_session_minutes"] = _clean_int(ability.get("total_session_minutes", 0), 0) + int(round(minutes))
+    ability["cast_count"] = _clean_int(ability.get("cast_count", 0), 0) + 1
+    record = {"id": str(uuid.uuid4()), "ts": now_s, "type": "ability_session",
+              "source": ability["name"], "minutes": round(minutes, 1), "target_minutes": q["target"],
+              "ratio": round(q["raw_ratio"], 3), "quality": q["label"], "note": str(note or "")[:500],
+              "started_ts": started_ts, "effects": [e["label"] for e in effects]}
+    state.setdefault("sessions", []).append(record)
+    state["log"].append(record)
+    return record
+
 class AbilityReq(BaseModel):
     id: str = ""
     name: str = ""
     practice: str = ""
     description: str = ""
+    mode: str = "instant"
     duration_minutes: int = 20
     cooldown_hours: float = 0
     miss_after_hours: float = 0
+    ideal_start_time: str = ""
+    ideal_end_time: str = ""
+    min_effect_ratio: float = 0.25
+    overcap_ratio: float = 1
+    debt_step_hours: float = 8
+    debt_max_stage: int = 3
     effects: list[dict] = Field(default_factory=list)
     miss_effects: list[dict] = Field(default_factory=list)
 
@@ -3524,6 +3622,10 @@ class ConsumeReq(BaseModel):
     amount: float = 1
     note: str = ""
 
+class AbilitySessionManualReq(BaseModel):
+    minutes: float = 0
+    note: str = ""
+
 @app.get("/arcana")
 def get_arcana(u: dict = Depends(current_user)):
     with _ARCANA_LOCK:
@@ -3537,8 +3639,12 @@ def save_ability(req: AbilityReq, u: dict = Depends(current_user)):
         incoming = _clean_ability(req.model_dump() if hasattr(req, "model_dump") else req.dict())
         existing = next((a for a in state["abilities"] if a["id"] == incoming["id"]), None)
         if existing:
+            incoming["created_ts"] = existing.get("created_ts", incoming.get("created_ts", _now_s()))
             incoming["last_cast_ts"] = existing.get("last_cast_ts", "")
             incoming["cast_count"] = existing.get("cast_count", 0)
+            incoming["active_session"] = existing.get("active_session", {})
+            incoming["last_session_minutes"] = existing.get("last_session_minutes", 0)
+            incoming["total_session_minutes"] = existing.get("total_session_minutes", 0)
             state["abilities"] = [incoming if a["id"] == incoming["id"] else a for a in state["abilities"]]
         else:
             state["abilities"].append(incoming)
@@ -3552,6 +3658,14 @@ def cast_ability(aid: str, u: dict = Depends(current_user)):
         state = _arcana_state(uid)
         ability = next((a for a in state["abilities"] if a["id"] == aid), None)
         if not ability: raise HTTPException(404, "Способность не найдена")
+        if ability.get("mode") == "session":
+            if ability.get("active_session", {}).get("started_ts"):
+                raise HTTPException(409, "Сессия уже идёт")
+            ability["active_session"] = {"started_ts": _now_s(), "note": ""}
+            state["log"].append({"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_session_start",
+                                 "source": ability["name"], "note": ability.get("practice", "")})
+            _save_arcana_state(state, uid)
+            return _arcana_payload(state)
         last = _parse_arcana_dt(ability.get("last_cast_ts", ""))
         cooldown = _clean_float(ability.get("cooldown_hours", 0), 0, 0, 10000)
         if last and cooldown and _utcnow() < last + timedelta(hours=cooldown):
@@ -3564,6 +3678,66 @@ def cast_ability(aid: str, u: dict = Depends(current_user)):
         state["log"].append({"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_cast",
                              "source": ability["name"], "note": ability.get("practice", ""),
                              "effects": [e["label"] for e in effects]})
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/start")
+def start_ability_session(aid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        ability = next((a for a in state["abilities"] if a["id"] == aid), None)
+        if not ability: raise HTTPException(404, "Способность не найдена")
+        if ability.get("active_session", {}).get("started_ts"):
+            raise HTTPException(409, "Сессия уже идёт")
+        last = _parse_arcana_dt(ability.get("last_cast_ts", ""))
+        cooldown = _clean_float(ability.get("cooldown_hours", 0), 0, 0, 10000)
+        if last and cooldown and _utcnow() < last + timedelta(hours=cooldown):
+            ready = (last + timedelta(hours=cooldown)).strftime("%Y-%m-%d %H:%M")
+            raise HTTPException(409, f"Способность перезаряжается до {ready}")
+        ability["active_session"] = {"started_ts": _now_s(), "note": ""}
+        state["log"].append({"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_session_start",
+                             "source": ability["name"], "note": ability.get("practice", "")})
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/finish")
+def finish_ability_session(aid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        ability = next((a for a in state["abilities"] if a["id"] == aid), None)
+        if not ability: raise HTTPException(404, "Способность не найдена")
+        session = ability.get("active_session") if isinstance(ability.get("active_session"), dict) else {}
+        started = _parse_arcana_dt(session.get("started_ts", ""))
+        if not started: raise HTTPException(409, "Активной сессии нет")
+        minutes = max(0, (_utcnow() - started).total_seconds() / 60)
+        _finish_ability_session(state, ability, minutes, session.get("note", ""), session.get("started_ts", ""))
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/manual")
+def manual_ability_session(aid: str, req: AbilitySessionManualReq, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        ability = next((a for a in state["abilities"] if a["id"] == aid), None)
+        if not ability: raise HTTPException(404, "Способность не найдена")
+        minutes = _clean_float(req.minutes, 0, 0.1, 1000000)
+        _finish_ability_session(state, ability, minutes, req.note, "")
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/cancel-session")
+def cancel_ability_session(aid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        ability = next((a for a in state["abilities"] if a["id"] == aid), None)
+        if not ability: raise HTTPException(404, "Способность не найдена")
+        ability["active_session"] = {}
+        state["log"].append({"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_session_cancel",
+                             "source": ability["name"]})
         _save_arcana_state(state, uid)
         return _arcana_payload(state)
 
@@ -4352,6 +4526,20 @@ section.active{display:block}
 .effect-chip.debuff{border-color:rgba(128,47,31,.35);color:var(--red);background:rgba(128,47,31,.05)}
 .arcana-card-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 .arcana-muted{font-size:11px;color:var(--ink3);font-family:sans-serif}
+.ability-pill{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--border);
+  border-radius:999px;padding:3px 8px;font-size:10px;font-family:sans-serif;color:var(--ink2);background:rgba(139,105,20,.05)}
+.ability-session-box{border:1px solid var(--border2);background:rgba(42,94,122,.045);
+  border-radius:4px;padding:10px 12px;margin:12px 0}
+.ability-session-live{font-size:12px;font-family:sans-serif;color:var(--blue);font-weight:700;margin-bottom:7px}
+.arcana-progress{height:8px;background:rgba(139,105,20,.16);border-radius:999px;overflow:hidden;margin-top:7px}
+.arcana-progress span{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--gold));border-radius:999px}
+.dlg-label{display:block;font-size:10px;letter-spacing:2px;text-transform:uppercase;
+  font-family:sans-serif;color:var(--ink3);margin:10px 0 5px}
+.dlg-help{font-size:11px;line-height:1.45;font-family:sans-serif;color:var(--ink3);margin:-2px 0 10px}
+.dlg-grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.dlg-grid-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+.ability-session-settings{border:1px solid var(--border2);background:rgba(139,105,20,.04);
+  border-radius:4px;padding:12px;margin:10px 0 14px}
 .inventory-qty{font-size:24px;color:var(--gold);margin:6px 0 3px}
 .effect-edit-row{border:1px solid var(--border2);background:rgba(139,105,20,.04);border-radius:4px;
   padding:10px;margin-bottom:10px}
@@ -4537,6 +4725,7 @@ section.active{display:block}
   .pocket-form,.pocket-tx-list{max-width:none}
   .arcana-topbar{flex-direction:column}
   .effect-edit-grid{grid-template-columns:1fr 1fr}
+  .dlg-grid-3,.dlg-grid-4{grid-template-columns:1fr 1fr}
   .top-effects{display:none}
   .btn-edit-inline{opacity:1}
   .dlg,#ent-modal,#settings-modal,#oracle-modal{padding:12px;align-items:center}
@@ -4581,6 +4770,7 @@ section.active{display:block}
   .pocket-actions{gap:9px;margin-bottom:24px}
   .arcana-grid,.effects-grid{grid-template-columns:1fr}
   .effect-edit-grid{grid-template-columns:1fr}
+  .dlg-grid-3,.dlg-grid-4{grid-template-columns:1fr}
   .effect-edit-grid .rhythm-remove{width:44px}
   .pocket-btn{padding:8px 14px}
   .pocket-tx-item{gap:8px}
@@ -4732,6 +4922,7 @@ section.active{display:block}
   .arcana-grid,.effects-grid{ grid-template-columns:1fr; }
   .arcana-topbar{ align-items:stretch; flex-direction:column; }
   .effect-edit-grid{ grid-template-columns:1fr; }
+  .dlg-grid-3,.dlg-grid-4{ grid-template-columns:1fr; }
 
   /* ── Full-screen sheet modals ── */
   .dlg,#ent-modal,#settings-modal,#oracle-modal,#reanalyze-modal{
@@ -5067,13 +5258,36 @@ section.active{display:block}
   <div class="dlg-box" style="width:680px;max-width:calc(100vw - 28px)">
     <div class="dlg-title" id="ability-dlg-title">Способность</div>
     <input type="hidden" id="ab-id">
+    <label class="dlg-label">Название</label>
     <input class="dlg-input" id="ab-name" placeholder="Название: Медитация, Сон, Спорт...">
+    <label class="dlg-label">Действие</label>
     <input class="dlg-input" id="ab-practice" placeholder="Что сделать: медитировать 20 минут, поспать, сходить в зал...">
+    <label class="dlg-label">Смысл</label>
     <textarea class="dlg-textarea" id="ab-description" placeholder="Зачем эта способность нужна Герою"></textarea>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
-      <input class="dlg-input" id="ab-duration" type="number" min="0" placeholder="Минут практики">
-      <input class="dlg-input" id="ab-cooldown" type="number" min="0" step="0.5" placeholder="КД, часов">
-      <input class="dlg-input" id="ab-miss-after" type="number" min="0" step="1" placeholder="Дебаф если не делать, часов">
+    <label class="dlg-label">Как работает</label>
+    <div class="dlg-grid-4">
+      <select class="dlg-input" id="ab-mode" onchange="toggleAbilityModeFields()">
+        <option value="instant">мгновенно</option>
+        <option value="session">сессия / таймер</option>
+      </select>
+      <input class="dlg-input" id="ab-duration" type="number" min="0" placeholder="Цель, минут">
+      <input class="dlg-input" id="ab-cooldown" type="number" min="0" step="0.5" placeholder="Пауза, часов">
+      <input class="dlg-input" id="ab-miss-after" type="number" min="0" step="1" placeholder="Долг, часов">
+    </div>
+    <div class="dlg-help">Цель в минутах нужна для сессий: сон 480, медитация 20, тренировка 60. Пауза ограничивает повтор. Долг включает дебаф, если способность давно не закрывалась.</div>
+    <div class="ability-session-settings" id="ab-session-settings">
+      <label class="dlg-label" style="margin-top:0">Настройки сессии</label>
+      <div class="dlg-grid-4">
+        <input class="dlg-input" id="ab-ideal-start" type="time" placeholder="Лучше начать">
+        <input class="dlg-input" id="ab-ideal-end" type="time" placeholder="Лучше закончить">
+        <input class="dlg-input" id="ab-min-ratio" type="number" min="0" max="1" step="0.05" placeholder="Мин. доля">
+        <input class="dlg-input" id="ab-debt-step" type="number" min="0" step="1" placeholder="Шаг долга, ч">
+      </div>
+      <div class="dlg-grid-4">
+        <input class="dlg-input" id="ab-overcap" type="number" min="0.1" max="3" step="0.1" placeholder="Потолок силы">
+        <input class="dlg-input" id="ab-debt-max" type="number" min="1" max="12" step="1" placeholder="Ступеней долга">
+      </div>
+      <div class="dlg-help">Для сна: цель 480, мин. доля 0.25, шаг долга 8. Если поспал меньше цели, игра сама ослабит силу и длительность бафа.</div>
     </div>
     <div class="pocket-section-title">Эффекты при применении</div>
     <div id="ab-effects-editor"></div>
@@ -5084,6 +5298,21 @@ section.active{display:block}
     <div class="dlg-btns" style="margin-top:14px">
       <button class="btn-primary" onclick="saveAbility()">Сохранить</button>
       <button class="btn-cancel" onclick="closeDlg('ability-dlg')">Отмена</button>
+    </div>
+  </div>
+</div>
+
+<div class="dlg" id="session-dlg">
+  <div class="dlg-box" style="width:440px;max-width:calc(100vw - 28px)">
+    <div class="dlg-title" id="session-dlg-title">Записать сессию</div>
+    <input type="hidden" id="session-ability-id">
+    <label class="dlg-label">Сколько длилось</label>
+    <input class="dlg-input" id="session-minutes" type="number" min="1" step="1" placeholder="Минуты: например 480">
+    <label class="dlg-label">Заметка</label>
+    <textarea class="dlg-textarea" id="session-note" placeholder="Необязательно: как прошёл сон / практика"></textarea>
+    <div class="dlg-btns" style="margin-top:14px">
+      <button class="btn-primary" onclick="saveManualSession()">Записать</button>
+      <button class="btn-cancel" onclick="closeDlg('session-dlg')">Отмена</button>
     </div>
   </div>
 </div>
@@ -5821,7 +6050,7 @@ function effectTtl(e){
 function effectChip(e){
   const kind=e.kind==='debuff'?'debuff':'buff';
   const sign=Number(e.power||0)>0?'+':'';
-  return `<span class="effect-chip ${kind}">${htmlesc(e.label)} · ${htmlesc(e.axis)} ${sign}${e.power}</span>`;
+  return `<span class="effect-chip ${kind}" title="Сила: ${sign}${e.power}; длительность: ${e.duration_hours||0}ч">${htmlesc(e.label)} · ${htmlesc(e.axis)} ${sign}${e.power}</span>`;
 }
 function effectCard(e){
   const kind=e.kind==='debuff'?'debuff':'buff';
@@ -5846,17 +6075,59 @@ function renderTopEffects(){
   const effects=(arcanaState.active_effects||[]).slice(0,5);
   el.innerHTML=effects.map(e=>`<span class="top-effect-badge ${e.kind==='debuff'?'debuff':'buff'}" title="${htmlesc(e.note||'')}">${e.kind==='debuff'?'↓':'↑'} ${htmlesc(e.label)} · ${effectTtl(e)}</span>`).join('');
 }
+function fmtMinutesRu(mins){
+  mins=Math.max(0,Math.round(Number(mins||0)));
+  const h=Math.floor(mins/60), m=mins%60;
+  if(h&&m) return `${h}ч ${m}м`;
+  if(h) return `${h}ч`;
+  return `${m}м`;
+}
+function abilitySessionElapsed(a){
+  const ts=a.active_session?.started_ts;
+  const d=parseServerTs(ts);
+  if(!d) return 0;
+  return Math.max(0,(Date.now()-d.getTime())/60000);
+}
+function abilityRatio(a,mins){
+  const target=Math.max(1,Number(a.duration_minutes||20));
+  return Math.max(0,Math.min(100,(Number(mins||0)/target)*100));
+}
+function abilityWindowText(a){
+  if(!a.ideal_start_time&&!a.ideal_end_time) return '';
+  return ` · окно ${a.ideal_start_time||'--:--'}–${a.ideal_end_time||'--:--'}`;
+}
 function renderAbilityCard(a){
-  const last=a.last_cast_ts?`последний каст: ${localTimeHM(a.last_cast_ts)||''} ${localDisplayDate(a.last_cast_ts)||''}`:'ещё не применялась';
-  const miss=a.miss_after_hours?` · дебаф после ${a.miss_after_hours}ч пропуска`:'';
+  const isSession=a.mode==='session';
+  const active=!!a.active_session?.started_ts;
+  const elapsed=active?abilitySessionElapsed(a):0;
+  const last=a.last_cast_ts?`последний цикл: ${localTimeHM(a.last_cast_ts)||''} ${localDisplayDate(a.last_cast_ts)||''}`:'ещё не закрывалась';
+  const target=Number(a.duration_minutes||0);
+  const miss=a.miss_after_hours?` · долг после ${a.miss_after_hours}ч`:'';
+  const modeLabel=isSession?'сессия':'мгновенно';
+  const lastProgress=a.last_session_minutes?`<div class="arcana-progress"><span style="width:${abilityRatio(a,a.last_session_minutes)}%"></span></div>`:'';
+  const sessionBox=isSession?`<div class="ability-session-box">
+    ${active?`<div class="ability-session-live">идёт сейчас: ${fmtMinutesRu(elapsed)} из ${fmtMinutesRu(target)}</div>
+      <div class="arcana-progress"><span style="width:${abilityRatio(a,elapsed)}%"></span></div>`:
+      `<div class="arcana-muted">цель цикла: ${fmtMinutesRu(target)}${abilityWindowText(a)}${miss}</div>
+       ${a.last_session_minutes?`<div class="arcana-muted">прошлый цикл: ${fmtMinutesRu(a.last_session_minutes)} из ${fmtMinutesRu(target)}</div>${lastProgress}`:''}`}
+  </div>`:'';
+  const primaryButtons=isSession
+    ? (active
+        ? `<button class="pocket-btn" onclick="finishAbilitySession('${_jsEsc(a.id)}')">завершить</button>
+           <button class="pocket-btn secondary" onclick="cancelAbilitySession('${_jsEsc(a.id)}')">отменить</button>`
+        : `<button class="pocket-btn" onclick="startAbilitySession('${_jsEsc(a.id)}')">начать</button>
+           <button class="pocket-btn secondary" onclick="openSessionManualDlg('${_jsEsc(a.id)}')">записать</button>`)
+    : `<button class="pocket-btn" onclick="castAbility('${_jsEsc(a.id)}')">применить</button>`;
   return `<div class="arcana-card">
     <div class="arcana-card-title">✦ ${htmlesc(a.name)}</div>
+    <div><span class="ability-pill">${modeLabel}</span></div>
     <div class="arcana-card-sub">${htmlesc(a.practice||a.description||'Практика без описания.')}</div>
     ${a.description?`<div class="arcana-muted">${htmlesc(a.description)}</div>`:''}
     <div class="arcana-effects">${(a.effects||[]).map(effectChip).join('')}${(a.miss_effects||[]).map(effectChip).join('')}</div>
-    <div class="arcana-muted">${a.duration_minutes||0} мин · КД ${a.cooldown_hours||0}ч${miss}<br>${last}</div>
+    ${sessionBox}
+    <div class="arcana-muted">${isSession?'сессия':fmtMinutesRu(target)} · пауза ${a.cooldown_hours||0}ч${!isSession?miss:''}<br>${last}</div>
     <div class="arcana-card-actions">
-      <button class="pocket-btn" onclick="castAbility('${_jsEsc(a.id)}')">каст</button>
+      ${primaryButtons}
       <button class="pocket-btn secondary" onclick="openAbilityDlg('${_jsEsc(a.id)}')">настроить</button>
       <button class="btn-sm btn-danger" onclick="deleteAbility('${_jsEsc(a.id)}')">удалить</button>
     </div>
@@ -5906,7 +6177,7 @@ async function loadArcana(){
     if(r.ok) arcanaState=await r.json();
   }catch(e){}
   renderArcana();
-  if(!_arcanaTimer) _arcanaTimer=setInterval(renderArcana,30000);
+  if(!_arcanaTimer) _arcanaTimer=setInterval(renderArcana,10000);
 }
 function effectRowHtml(e={},kind='buff'){
   const rowId='eff_'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
@@ -5943,6 +6214,11 @@ function collectEffects(containerId){
       power:parseFloat(get('power')||'1'),duration_hours:parseFloat(get('duration_hours')||'12'),note:get('note')};
   }).filter(e=>e.label.trim());
 }
+function toggleAbilityModeFields(){
+  const mode=document.getElementById('ab-mode')?.value||'instant';
+  const box=document.getElementById('ab-session-settings');
+  if(box) box.style.display=mode==='session'?'block':'none';
+}
 function openAbilityDlg(id=''){
   const a=(arcanaState.abilities||[]).find(x=>x.id===id)||{};
   document.getElementById('ability-dlg-title').textContent=id?'Настроить способность':'Новая способность';
@@ -5950,19 +6226,34 @@ function openAbilityDlg(id=''){
   document.getElementById('ab-name').value=a.name||'';
   document.getElementById('ab-practice').value=a.practice||'';
   document.getElementById('ab-description').value=a.description||'';
+  document.getElementById('ab-mode').value=a.mode||'instant';
   document.getElementById('ab-duration').value=a.duration_minutes??20;
   document.getElementById('ab-cooldown').value=a.cooldown_hours??0;
   document.getElementById('ab-miss-after').value=a.miss_after_hours??0;
+  document.getElementById('ab-ideal-start').value=a.ideal_start_time||'';
+  document.getElementById('ab-ideal-end').value=a.ideal_end_time||'';
+  document.getElementById('ab-min-ratio').value=a.min_effect_ratio??0.25;
+  document.getElementById('ab-debt-step').value=a.debt_step_hours??8;
+  document.getElementById('ab-overcap').value=a.overcap_ratio??1;
+  document.getElementById('ab-debt-max').value=a.debt_max_stage??3;
   fillEffectEditor('ab-effects-editor',a.effects||[],'buff');
   fillEffectEditor('ab-miss-effects-editor',a.miss_effects||[],'debuff');
+  toggleAbilityModeFields();
   openDlg('ability-dlg');
 }
 async function saveAbility(){
   const payload={id:document.getElementById('ab-id').value,name:document.getElementById('ab-name').value,
     practice:document.getElementById('ab-practice').value,description:document.getElementById('ab-description').value,
+    mode:document.getElementById('ab-mode').value||'instant',
     duration_minutes:parseInt(document.getElementById('ab-duration').value||'20',10),
     cooldown_hours:parseFloat(document.getElementById('ab-cooldown').value||'0'),
     miss_after_hours:parseFloat(document.getElementById('ab-miss-after').value||'0'),
+    ideal_start_time:document.getElementById('ab-ideal-start').value||'',
+    ideal_end_time:document.getElementById('ab-ideal-end').value||'',
+    min_effect_ratio:parseFloat(document.getElementById('ab-min-ratio').value||'0.25'),
+    overcap_ratio:parseFloat(document.getElementById('ab-overcap').value||'1'),
+    debt_step_hours:parseFloat(document.getElementById('ab-debt-step').value||'8'),
+    debt_max_stage:parseInt(document.getElementById('ab-debt-max').value||'3',10),
     effects:collectEffects('ab-effects-editor'),miss_effects:collectEffects('ab-miss-effects-editor')};
   const r=await fetch('/abilities',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   if(!r.ok){alert('Не удалось сохранить способность');return;}
@@ -5972,6 +6263,38 @@ async function castAbility(id){
   const r=await fetch(`/abilities/${encodeURIComponent(id)}/cast`,{method:'POST'});
   if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось применить'})); alert(d.detail||'Не удалось применить'); return;}
   arcanaState=await r.json(); renderAbilities(); renderTopEffects();
+}
+async function startAbilitySession(id){
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/start`,{method:'POST'});
+  if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось начать'})); alert(d.detail||'Не удалось начать'); return;}
+  arcanaState=await r.json(); renderAbilities(); renderTopEffects();
+}
+async function finishAbilitySession(id){
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/finish`,{method:'POST'});
+  if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось завершить'})); alert(d.detail||'Не удалось завершить'); return;}
+  arcanaState=await r.json(); renderAbilities(); renderTopEffects();
+}
+async function cancelAbilitySession(id){
+  if(!confirm('Отменить текущую сессию без эффекта?')) return;
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/cancel-session`,{method:'POST'});
+  if(r.ok){arcanaState=await r.json(); renderAbilities(); renderTopEffects();}
+}
+function openSessionManualDlg(id){
+  const a=(arcanaState.abilities||[]).find(x=>x.id===id)||{};
+  document.getElementById('session-ability-id').value=id;
+  document.getElementById('session-dlg-title').textContent=`Записать: ${a.name||'сессия'}`;
+  document.getElementById('session-minutes').value=a.duration_minutes||'';
+  document.getElementById('session-note').value='';
+  openDlg('session-dlg');
+}
+async function saveManualSession(){
+  const id=document.getElementById('session-ability-id').value;
+  const minutes=parseFloat(document.getElementById('session-minutes').value||'0');
+  const note=document.getElementById('session-note').value||'';
+  if(!id||!minutes){alert('Укажи длительность в минутах');return;}
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/manual`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({minutes,note})});
+  if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось записать'})); alert(d.detail||'Не удалось записать'); return;}
+  arcanaState=await r.json(); closeDlg('session-dlg'); renderAbilities(); renderTopEffects();
 }
 async function deleteAbility(id){
   if(!confirm('Удалить способность?')) return;
