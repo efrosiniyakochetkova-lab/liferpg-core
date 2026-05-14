@@ -3335,6 +3335,15 @@ def _default_arcana_state() -> dict:
                                              "Тело просит восстановиться: пора закрыть цикл сна.")],
                 "last_cast_ts": "", "cast_count": 0,
             },
+            {
+                "id": "carnivore", "name": "Карнивор", "practice": "День на животных продуктах без углеводов",
+                "description": "Режим питания, который поддерживает кетоз и считает непрерывную серию.",
+                "mode": "regime", "duration_minutes": 0, "cooldown_hours": 24, "miss_after_hours": 12,
+                "effects": [_effect_tpl("Кетоз", "buff", "Метаболизм", 1, 24,
+                                        "День питания кетонами: стабильная энергия без углеводного отката.")],
+                "miss_effects": [], "last_cast_ts": "", "cast_count": 0,
+                "regime_streak": 0, "regime_best_streak": 0, "regime_last_reset_ts": "",
+            },
         ],
         "inventory": [
             {
@@ -3402,7 +3411,7 @@ def _clean_ability(a: dict | None) -> dict:
     a = a if isinstance(a, dict) else {}
     aid = re.sub(r"[^a-zA-Z0-9_-]+", "", str(a.get("id") or ""))[:64] or str(uuid.uuid4())
     mode = str(a.get("mode") or "").strip().lower()
-    if mode not in ("instant", "session"):
+    if mode not in ("instant", "session", "regime"):
         name_l = str(a.get("name") or "").lower()
         mode = "session" if aid == "sleep" or "сон" in name_l else "instant"
     effects = [_clean_effect_template(e) for e in (a.get("effects") or []) if isinstance(e, dict)]
@@ -3437,6 +3446,9 @@ def _clean_ability(a: dict | None) -> dict:
         "last_cast_ts": str(a.get("last_cast_ts") or ""),
         "last_session_minutes": _clean_int(a.get("last_session_minutes", 0), 0, 0, 10**9),
         "total_session_minutes": _clean_int(a.get("total_session_minutes", 0), 0, 0, 10**12),
+        "regime_streak": _clean_int(a.get("regime_streak", 0), 0, 0, 10**9),
+        "regime_best_streak": _clean_int(a.get("regime_best_streak", 0), 0, 0, 10**9),
+        "regime_last_reset_ts": str(a.get("regime_last_reset_ts") or ""),
         "cast_count": _clean_int(a.get("cast_count", 0), 0, 0, 10**9),
     }
 
@@ -3472,6 +3484,8 @@ def _clean_arcana_state(data: dict | None) -> dict:
             "started_ts": str(e.get("started_ts") or ""),
             "expires_ts": str(e.get("expires_ts") or ""),
             "amount": _clean_float(e.get("amount", 1), 1, 0, 10**12),
+            "regime_streak": _clean_int(e.get("regime_streak", 0), 0, 0, 10**9),
+            "base_label": str(e.get("base_label") or ""),
         })
         effects.append(e2)
     log = [x for x in (d.get("log") or []) if isinstance(x, dict)][-80:]
@@ -3590,6 +3604,60 @@ def _finish_ability_session(state: dict, ability: dict, minutes: float, note: st
     state["log"].append(record)
     return record
 
+def _regime_cycle_hours(ability: dict) -> float:
+    durations = [_clean_float(e.get("duration_hours", 24), 24, 0.05, 10000) for e in ability.get("effects", [])]
+    base = durations[0] if durations else 24
+    cooldown = _clean_float(ability.get("cooldown_hours", 0), 0, 0, 10000)
+    return max(base, cooldown, 0.05)
+
+def _support_ability_regime(state: dict, ability: dict, note: str = "") -> dict:
+    now = _utcnow()
+    last = _parse_arcana_dt(ability.get("last_cast_ts", ""))
+    cooldown = _clean_float(ability.get("cooldown_hours", 0), 0, 0, 10000)
+    if last and cooldown and now < last + timedelta(hours=cooldown):
+        ready = (last + timedelta(hours=cooldown)).strftime("%Y-%m-%d %H:%M")
+        raise HTTPException(409, f"Режим уже поддержан. Следующий цикл после {ready}")
+    cycle_hours = _regime_cycle_hours(ability)
+    grace_hours = _clean_float(ability.get("miss_after_hours", 0), 0, 0, 10000)
+    current_streak = _clean_int(ability.get("regime_streak", 0), 0, 0, 10**9)
+    if last and (now - last).total_seconds() / 3600 > cycle_hours + grace_hours:
+        current_streak = 0
+    streak = current_streak + 1
+    ability["regime_streak"] = streak
+    ability["regime_best_streak"] = max(_clean_int(ability.get("regime_best_streak", 0), 0), streak)
+    ability["last_cast_ts"] = _now_s()
+    ability["cast_count"] = _clean_int(ability.get("cast_count", 0), 0) + 1
+    state["effects"] = [e for e in state.get("effects", []) if not (
+        e.get("source_type") == "ability_regime" and e.get("source_id") == ability["id"]
+    )]
+    effects = []
+    for tpl in ability.get("effects", []):
+        e = _effect_instance(tpl, "ability_regime", ability["id"], ability["name"], streak, streak, 1)
+        e["regime_streak"] = streak
+        e["base_label"] = e["label"]
+        effects.append(e)
+    state["effects"].extend(effects)
+    record = {"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_regime_support",
+              "source": ability["name"], "streak": streak, "note": str(note or "")[:500],
+              "cycle_hours": cycle_hours, "grace_hours": grace_hours,
+              "effects": [e["label"] for e in effects]}
+    state["log"].append(record)
+    return record
+
+def _reset_ability_regime(state: dict, ability: dict, reason: str = "") -> dict:
+    old = _clean_int(ability.get("regime_streak", 0), 0, 0, 10**9)
+    ability["regime_streak"] = 0
+    ability["regime_last_reset_ts"] = _now_s()
+    ability["last_cast_ts"] = ""
+    state["effects"] = [e for e in state.get("effects", []) if not (
+        e.get("source_type") == "ability_regime" and e.get("source_id") == ability["id"]
+    )]
+    record = {"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_regime_reset",
+              "source": ability["name"], "streak_before": old, "note": str(reason or "")[:500],
+              "effects": []}
+    state["log"].append(record)
+    return record
+
 class AbilityReq(BaseModel):
     id: str = ""
     name: str = ""
@@ -3645,6 +3713,9 @@ def save_ability(req: AbilityReq, u: dict = Depends(current_user)):
             incoming["active_session"] = existing.get("active_session", {})
             incoming["last_session_minutes"] = existing.get("last_session_minutes", 0)
             incoming["total_session_minutes"] = existing.get("total_session_minutes", 0)
+            incoming["regime_streak"] = existing.get("regime_streak", 0)
+            incoming["regime_best_streak"] = existing.get("regime_best_streak", 0)
+            incoming["regime_last_reset_ts"] = existing.get("regime_last_reset_ts", "")
             state["abilities"] = [incoming if a["id"] == incoming["id"] else a for a in state["abilities"]]
         else:
             state["abilities"].append(incoming)
@@ -3666,6 +3737,10 @@ def cast_ability(aid: str, u: dict = Depends(current_user)):
                                  "source": ability["name"], "note": ability.get("practice", "")})
             _save_arcana_state(state, uid)
             return _arcana_payload(state)
+        if ability.get("mode") == "regime":
+            _support_ability_regime(state, ability)
+            _save_arcana_state(state, uid)
+            return _arcana_payload(state)
         last = _parse_arcana_dt(ability.get("last_cast_ts", ""))
         cooldown = _clean_float(ability.get("cooldown_hours", 0), 0, 0, 10000)
         if last and cooldown and _utcnow() < last + timedelta(hours=cooldown):
@@ -3678,6 +3753,30 @@ def cast_ability(aid: str, u: dict = Depends(current_user)):
         state["log"].append({"id": str(uuid.uuid4()), "ts": _now_s(), "type": "ability_cast",
                              "source": ability["name"], "note": ability.get("practice", ""),
                              "effects": [e["label"] for e in effects]})
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/support-regime")
+def support_ability_regime(aid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        ability = next((a for a in state["abilities"] if a["id"] == aid), None)
+        if not ability: raise HTTPException(404, "Способность не найдена")
+        if ability.get("mode") != "regime": raise HTTPException(400, "Это не режим")
+        _support_ability_regime(state, ability)
+        _save_arcana_state(state, uid)
+        return _arcana_payload(state)
+
+@app.post("/abilities/{aid}/reset-regime")
+def reset_ability_regime(aid: str, u: dict = Depends(current_user)):
+    uid = _uid(u)
+    with _ARCANA_LOCK:
+        state = _arcana_state(uid)
+        ability = next((a for a in state["abilities"] if a["id"] == aid), None)
+        if not ability: raise HTTPException(404, "Способность не найдена")
+        if ability.get("mode") != "regime": raise HTTPException(400, "Это не режим")
+        _reset_ability_regime(state, ability, "сброс режима")
         _save_arcana_state(state, uid)
         return _arcana_payload(state)
 
@@ -3797,6 +3896,10 @@ def clear_effect(eid: str, u: dict = Depends(current_user)):
     uid = _uid(u)
     with _ARCANA_LOCK:
         state = _arcana_state(uid)
+        effect = next((e for e in state.get("effects", []) if e.get("id") == eid), None)
+        if effect and effect.get("source_type") == "ability_regime":
+            ability = next((a for a in state["abilities"] if a["id"] == effect.get("source_id")), None)
+            if ability: _reset_ability_regime(state, ability, "эффект режима снят")
         state["effects"] = [e for e in state["effects"] if e["id"] != eid]
         _save_arcana_state(state, uid)
         return _arcana_payload(state)
@@ -4380,7 +4483,7 @@ section.active{display:block}
   outline:none;width:100%;box-shadow:0 0 0 2px rgba(139,105,20,.12)}
 
 /* ── DIALOGS ── */
-.dlg{display:none;position:fixed;inset:0;background:rgba(20,12,4,.5);z-index:400;
+.dlg{display:none;position:fixed;inset:0;background:rgba(20,12,4,.5);z-index:1300;
   align-items:center;justify-content:center;padding:14px;box-sizing:border-box;overflow:hidden}
 .dlg.open{display:flex}
 .dlg-box{background:var(--paper);border:2px solid var(--border);border-radius:4px;
@@ -4410,8 +4513,17 @@ section.active{display:block}
 .rhythm-remove{border:1px solid var(--border2);background:transparent;color:var(--red);
   min-height:39px;border-radius:3px;cursor:pointer;font-size:18px}
 
-#ability-dlg .dlg-box{width:min(900px,calc(100vw - 28px))!important;padding:16px 18px}
+#ability-dlg .dlg-box{width:min(900px,calc(100vw - 28px))!important;padding:16px 18px;
+  max-height:min(760px,calc(100dvh - 28px));overflow-y:auto;overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch}
 #ability-dlg .dlg-title{font-size:16px;margin-bottom:8px}
+#ability-dlg .ability-preset-row{display:flex;gap:8px;flex-wrap:wrap;margin:-2px 0 10px}
+#ability-dlg .ability-preset-row .btn-cancel{font-size:12px;padding:6px 12px}
+#ability-dlg .ability-core-grid{align-items:start}
+#ability-dlg .mini-field,.effect-mini-field{display:block;min-width:0}
+#ability-dlg .mini-field span,.effect-mini-field span{display:block;margin:0 0 3px;
+  font-family:sans-serif;font-size:8.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--ink3)}
+#ability-dlg .mini-field .dlg-input,.effect-mini-field .dlg-input{margin-bottom:0}
 #ability-dlg .dlg-label{font-size:9px;letter-spacing:2px;margin:6px 0 4px}
 #ability-dlg .dlg-input{font-size:13px;padding:7px 10px;margin-bottom:6px}
 #ability-dlg .dlg-textarea{font-size:13px;padding:8px 10px;height:48px;margin-bottom:7px}
@@ -4420,9 +4532,11 @@ section.active{display:block}
 #ability-dlg .dlg-help{font-size:10.5px;line-height:1.35;margin:-1px 0 8px}
 #ability-dlg .ability-session-settings{padding:10px;margin:8px 0 10px}
 #ability-dlg .ability-effects-layout{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
+#ability-dlg.ability-mode-regime #ab-duration-field{display:none}
+#ability-dlg.ability-mode-regime #ab-miss-effects-block{display:none}
 #ability-dlg .ability-effect-block{min-width:0}
 #ability-dlg .effect-edit-row{padding:8px;margin-bottom:8px}
-#ability-dlg .effect-edit-grid{grid-template-columns:minmax(130px,1.3fr) 78px minmax(100px,1fr);gap:6px}
+#ability-dlg .effect-edit-grid{grid-template-columns:minmax(130px,1.3fr) 78px minmax(100px,1fr) 64px 72px 34px;gap:6px}
 #ability-dlg .effect-edit-row .dlg-textarea{height:34px}
 #ability-dlg .rhythm-remove{min-height:34px;width:100%}
 #ability-dlg .dlg-btns{position:sticky;bottom:-16px;background:linear-gradient(180deg,rgba(250,245,236,.88),var(--paper) 35%);
@@ -4744,6 +4858,7 @@ section.active{display:block}
   .pocket-form,.pocket-tx-list{max-width:none}
   .arcana-topbar{flex-direction:column}
   .effect-edit-grid{grid-template-columns:1fr 1fr}
+  #ability-dlg .effect-edit-grid{grid-template-columns:1fr 1fr}
   .dlg-grid-3,.dlg-grid-4{grid-template-columns:1fr 1fr}
   .top-effects{display:none}
   .btn-edit-inline{opacity:1}
@@ -4942,6 +5057,7 @@ section.active{display:block}
   .arcana-grid,.effects-grid{ grid-template-columns:1fr; }
   .arcana-topbar{ align-items:stretch; flex-direction:column; }
   .effect-edit-grid{ grid-template-columns:1fr; }
+  #ability-dlg .effect-edit-grid{ grid-template-columns:1fr; }
   .dlg-grid-3,.dlg-grid-4{ grid-template-columns:1fr; }
   #ability-dlg .ability-effects-layout{ grid-template-columns:1fr; }
 
@@ -5278,6 +5394,9 @@ section.active{display:block}
 <div class="dlg" id="ability-dlg">
   <div class="dlg-box" style="width:680px;max-width:calc(100vw - 28px)">
     <div class="dlg-title" id="ability-dlg-title">Способность</div>
+    <div class="ability-preset-row">
+      <button class="btn-cancel" onclick="applyAbilityPreset('carnivore')">шаблон: Карнивор / Кетоз</button>
+    </div>
     <input type="hidden" id="ab-id">
     <label class="dlg-label">Название</label>
     <input class="dlg-input" id="ab-name" placeholder="Название: Медитация, Сон, Спорт...">
@@ -5286,16 +5405,25 @@ section.active{display:block}
     <label class="dlg-label">Смысл</label>
     <textarea class="dlg-textarea" id="ab-description" placeholder="Зачем эта способность нужна Герою"></textarea>
     <label class="dlg-label">Как работает</label>
-    <div class="dlg-grid-4">
-      <select class="dlg-input" id="ab-mode" onchange="toggleAbilityModeFields()">
-        <option value="instant">мгновенно</option>
-        <option value="session">сессия / таймер</option>
-      </select>
-      <input class="dlg-input" id="ab-duration" type="number" min="0" placeholder="Цель, минут">
-      <input class="dlg-input" id="ab-cooldown" type="number" min="0" step="0.5" placeholder="Пауза, часов">
-      <input class="dlg-input" id="ab-miss-after" type="number" min="0" step="1" placeholder="Долг, часов">
+    <div class="dlg-grid-4 ability-core-grid">
+      <label class="mini-field"><span>механика</span>
+        <select class="dlg-input" id="ab-mode" onchange="toggleAbilityModeFields()">
+          <option value="instant">мгновенно</option>
+          <option value="session">сессия / таймер</option>
+          <option value="regime">режим / серия</option>
+        </select>
+      </label>
+      <label class="mini-field" id="ab-duration-field"><span>цель</span>
+        <input class="dlg-input" id="ab-duration" type="number" min="0" placeholder="Минуты">
+      </label>
+      <label class="mini-field"><span>пауза</span>
+        <input class="dlg-input" id="ab-cooldown" type="number" min="0" step="0.5" placeholder="Часов">
+      </label>
+      <label class="mini-field" id="ab-miss-after-field"><span id="ab-miss-after-label">долг</span>
+        <input class="dlg-input" id="ab-miss-after" type="number" min="0" step="1" placeholder="Часов">
+      </label>
     </div>
-    <div class="dlg-help">Цель в минутах нужна для сессий: сон 480, медитация 20, тренировка 60. Пауза ограничивает повтор. Долг включает дебаф, если способность давно не закрывалась.</div>
+    <div class="dlg-help" id="ab-mode-help">Цель в минутах нужна для сессий: сон 480, медитация 20, тренировка 60. Пауза ограничивает повтор. Долг включает дебаф, если способность давно не закрывалась.</div>
     <div class="ability-session-settings" id="ab-session-settings">
       <label class="dlg-label" style="margin-top:0">Настройки сессии</label>
       <div class="dlg-grid-4">
@@ -5311,12 +5439,12 @@ section.active{display:block}
       <div class="dlg-help">Для сна: цель 480, мин. доля 0.25, шаг долга 8. Если поспал меньше цели, игра сама ослабит силу и длительность бафа.</div>
     </div>
     <div class="ability-effects-layout">
-      <div class="ability-effect-block">
+      <div class="ability-effect-block" id="ab-effects-block">
         <div class="pocket-section-title">Эффекты при применении</div>
         <div id="ab-effects-editor"></div>
         <button class="btn-cancel" onclick="addEffectRow('ab-effects-editor')">+ эффект</button>
       </div>
-      <div class="ability-effect-block">
+      <div class="ability-effect-block" id="ab-miss-effects-block">
         <div class="pocket-section-title">Дебаф при пропуске</div>
         <div id="ab-miss-effects-editor"></div>
         <button class="btn-cancel" onclick="addEffectRow('ab-miss-effects-editor','debuff')">+ дебаф</button>
@@ -6074,6 +6202,13 @@ function effectTtl(e){
   const m=Math.floor((diff%3600000)/60000);
   return h?`${h}ч ${m}м`:`${Math.max(1,m)}м`;
 }
+function effectRemainingPct(e){
+  if(!e?.expires_ts) return 100;
+  const d=parseServerTs(e.expires_ts);
+  if(!d) return 0;
+  const total=Math.max(0.05,Number(e.duration_hours||1))*3600000;
+  return Math.max(0,Math.min(100,((d.getTime()-Date.now())/total)*100));
+}
 function effectChip(e){
   const kind=e.kind==='debuff'?'debuff':'buff';
   const sign=Number(e.power||0)>0?'+':'';
@@ -6123,14 +6258,18 @@ function abilityWindowText(a){
   if(!a.ideal_start_time&&!a.ideal_end_time) return '';
   return ` · окно ${a.ideal_start_time||'--:--'}–${a.ideal_end_time||'--:--'}`;
 }
+function abilityRegimeEffect(a){
+  return (arcanaState.active_effects||[]).find(e=>e.source_type==='ability_regime'&&e.source_id===a.id);
+}
 function renderAbilityCard(a){
   const isSession=a.mode==='session';
+  const isRegime=a.mode==='regime';
   const active=!!a.active_session?.started_ts;
   const elapsed=active?abilitySessionElapsed(a):0;
   const last=a.last_cast_ts?`последний цикл: ${localTimeHM(a.last_cast_ts)||''} ${localDisplayDate(a.last_cast_ts)||''}`:'ещё не закрывалась';
   const target=Number(a.duration_minutes||0);
   const miss=a.miss_after_hours?` · долг после ${a.miss_after_hours}ч`:'';
-  const modeLabel=isSession?'сессия':'мгновенно';
+  const modeLabel=isRegime?'режим':(isSession?'сессия':'мгновенно');
   const lastProgress=a.last_session_minutes?`<div class="arcana-progress"><span style="width:${abilityRatio(a,a.last_session_minutes)}%"></span></div>`:'';
   const sessionBox=isSession?`<div class="ability-session-box">
     ${active?`<div class="ability-session-live">идёт сейчас: ${fmtMinutesRu(elapsed)} из ${fmtMinutesRu(target)}</div>
@@ -6138,13 +6277,23 @@ function renderAbilityCard(a){
       `<div class="arcana-muted">цель цикла: ${fmtMinutesRu(target)}${abilityWindowText(a)}${miss}</div>
        ${a.last_session_minutes?`<div class="arcana-muted">прошлый цикл: ${fmtMinutesRu(a.last_session_minutes)} из ${fmtMinutesRu(target)}</div>${lastProgress}`:''}`}
   </div>`:'';
-  const primaryButtons=isSession
+  const regimeEffect=abilityRegimeEffect(a);
+  const regimeGrace=Number(a.miss_after_hours||0);
+  const regimeBox=isRegime?`<div class="ability-session-box">
+    <div class="ability-session-live">${regimeEffect?'режим активен':'режим не активен'} · серия ${Number(a.regime_streak||0).toLocaleString('ru-RU')}</div>
+    <div class="arcana-muted">лучший ряд: ${Number(a.regime_best_streak||0).toLocaleString('ru-RU')}${regimeEffect?` · цикл держится ещё ${effectTtl(regimeEffect)}`:''}${regimeGrace?` · запас ${regimeGrace}ч`:''}</div>
+    <div class="arcana-progress"><span style="width:${regimeEffect?effectRemainingPct(regimeEffect):0}%"></span></div>
+  </div>`:'';
+  const primaryButtons=isRegime
+    ? `<button class="pocket-btn" onclick="supportAbilityRegime('${_jsEsc(a.id)}')">поддержать</button>
+       <button class="pocket-btn secondary" onclick="resetAbilityRegime('${_jsEsc(a.id)}')">сорвалось</button>`
+    : (isSession
     ? (active
         ? `<button class="pocket-btn" onclick="finishAbilitySession('${_jsEsc(a.id)}')">завершить</button>
            <button class="pocket-btn secondary" onclick="cancelAbilitySession('${_jsEsc(a.id)}')">отменить</button>`
         : `<button class="pocket-btn" onclick="startAbilitySession('${_jsEsc(a.id)}')">начать</button>
            <button class="pocket-btn secondary" onclick="openSessionManualDlg('${_jsEsc(a.id)}')">записать</button>`)
-    : `<button class="pocket-btn" onclick="castAbility('${_jsEsc(a.id)}')">применить</button>`;
+    : `<button class="pocket-btn" onclick="castAbility('${_jsEsc(a.id)}')">применить</button>`);
   return `<div class="arcana-card">
     <div class="arcana-card-title">✦ ${htmlesc(a.name)}</div>
     <div><span class="ability-pill">${modeLabel}</span></div>
@@ -6152,7 +6301,8 @@ function renderAbilityCard(a){
     ${a.description?`<div class="arcana-muted">${htmlesc(a.description)}</div>`:''}
     <div class="arcana-effects">${(a.effects||[]).map(effectChip).join('')}${(a.miss_effects||[]).map(effectChip).join('')}</div>
     ${sessionBox}
-    <div class="arcana-muted">${isSession?'сессия':fmtMinutesRu(target)} · пауза ${a.cooldown_hours||0}ч${!isSession?miss:''}<br>${last}</div>
+    ${regimeBox}
+    <div class="arcana-muted">${isRegime?'режим':(isSession?'сессия':fmtMinutesRu(target))} · пауза ${a.cooldown_hours||0}ч${(!isSession&&!isRegime)?miss:''}<br>${last}</div>
     <div class="arcana-card-actions">
       ${primaryButtons}
       <button class="pocket-btn secondary" onclick="openAbilityDlg('${_jsEsc(a.id)}')">настроить</button>
@@ -6211,14 +6361,24 @@ function effectRowHtml(e={},kind='buff'){
   const k=e.kind||kind||'buff';
   return `<div class="effect-edit-row" data-effect-row id="${rowId}">
     <div class="effect-edit-grid">
-      <input class="dlg-input" data-effect-field="label" placeholder="Название эффекта" value="${htmlesc(e.label||'')}">
-      <select class="dlg-input" data-effect-field="kind">
-        <option value="buff" ${k==='buff'?'selected':''}>баф</option>
-        <option value="debuff" ${k==='debuff'?'selected':''}>дебаф</option>
-      </select>
-      <input class="dlg-input" data-effect-field="axis" placeholder="Параметр: Фокус" value="${htmlesc(e.axis||'')}">
-      <input class="dlg-input" data-effect-field="power" type="number" step="0.5" placeholder="Сила" value="${e.power??1}">
-      <input class="dlg-input" data-effect-field="duration_hours" type="number" min="0.05" step="0.5" placeholder="Часов" value="${e.duration_hours??12}">
+      <label class="effect-mini-field"><span>эффект</span>
+        <input class="dlg-input" data-effect-field="label" placeholder="Название" value="${htmlesc(e.label||'')}">
+      </label>
+      <label class="effect-mini-field"><span>тип</span>
+        <select class="dlg-input" data-effect-field="kind">
+          <option value="buff" ${k==='buff'?'selected':''}>баф</option>
+          <option value="debuff" ${k==='debuff'?'selected':''}>дебаф</option>
+        </select>
+      </label>
+      <label class="effect-mini-field"><span>шкала</span>
+        <input class="dlg-input" data-effect-field="axis" placeholder="Фокус" value="${htmlesc(e.axis||'')}">
+      </label>
+      <label class="effect-mini-field"><span>сила</span>
+        <input class="dlg-input" data-effect-field="power" type="number" step="0.5" placeholder="+1" value="${e.power??1}">
+      </label>
+      <label class="effect-mini-field"><span>часов</span>
+        <input class="dlg-input" data-effect-field="duration_hours" type="number" min="0.05" step="0.5" placeholder="12" value="${e.duration_hours??12}">
+      </label>
       <button class="rhythm-remove" onclick="this.closest('[data-effect-row]').remove()">×</button>
     </div>
     <textarea class="dlg-textarea" data-effect-field="note" placeholder="Что этот эффект значит в игре">${htmlesc(e.note||'')}</textarea>
@@ -6245,6 +6405,36 @@ function toggleAbilityModeFields(){
   const mode=document.getElementById('ab-mode')?.value||'instant';
   const box=document.getElementById('ab-session-settings');
   if(box) box.style.display=mode==='session'?'block':'none';
+  const dlg=document.getElementById('ability-dlg');
+  if(dlg) dlg.classList.toggle('ability-mode-regime',mode==='regime');
+  const duration=document.getElementById('ab-duration');
+  if(duration) duration.placeholder=mode==='session'?'Цель, минут':(mode==='regime'?'не нужно':'Длительность, минут');
+  const missAfter=document.getElementById('ab-miss-after');
+  if(missAfter) missAfter.placeholder=mode==='regime'?'Запас серии, ч':'Долг, часов';
+  const missLabel=document.getElementById('ab-miss-after-label');
+  if(missLabel) missLabel.textContent=mode==='regime'?'запас серии':'долг';
+  const help=document.getElementById('ab-mode-help');
+  if(help){
+    help.textContent=mode==='regime'
+      ? 'Режим — это серия. Пауза задаёт, как часто можно поддерживать режим. Запас серии — сколько часов можно опоздать без потери ряда. Эффект Кетоз +1 на 24ч будет усиливаться до +2, +3 и дальше.'
+      : 'Цель в минутах нужна для сессий: сон 480, медитация 20, тренировка 60. Пауза ограничивает повтор. Долг включает дебаф, если способность давно не закрывалась.';
+  }
+}
+function applyAbilityPreset(kind){
+  if(kind!=='carnivore') return;
+  document.getElementById('ab-id').value=document.getElementById('ab-id').value||'carnivore';
+  document.getElementById('ab-name').value='Карнивор';
+  document.getElementById('ab-practice').value='День на животных продуктах без углеводов';
+  document.getElementById('ab-description').value='Режим питания, который поддерживает кетоз и считает непрерывную серию. Если углеводы сбили режим — нажми «сорвалось», серия снимется без дебафа.';
+  document.getElementById('ab-mode').value='regime';
+  document.getElementById('ab-duration').value=0;
+  document.getElementById('ab-cooldown').value=24;
+  document.getElementById('ab-miss-after').value=12;
+  document.getElementById('ab-ideal-start').value='';
+  document.getElementById('ab-ideal-end').value='';
+  fillEffectEditor('ab-effects-editor',[{label:'Кетоз',kind:'buff',axis:'Метаболизм',power:1,duration_hours:24,note:'День питания кетонами: стабильная энергия без углеводного отката.'}],'buff');
+  fillEffectEditor('ab-miss-effects-editor',[],'debuff');
+  toggleAbilityModeFields();
 }
 function openAbilityDlg(id=''){
   const a=(arcanaState.abilities||[]).find(x=>x.id===id)||{};
@@ -6289,6 +6479,17 @@ async function saveAbility(){
 async function castAbility(id){
   const r=await fetch(`/abilities/${encodeURIComponent(id)}/cast`,{method:'POST'});
   if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось применить'})); alert(d.detail||'Не удалось применить'); return;}
+  arcanaState=await r.json(); renderAbilities(); renderTopEffects();
+}
+async function supportAbilityRegime(id){
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/support-regime`,{method:'POST'});
+  if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось поддержать режим'})); alert(d.detail||'Не удалось поддержать режим'); return;}
+  arcanaState=await r.json(); renderAbilities(); renderTopEffects();
+}
+async function resetAbilityRegime(id){
+  if(!confirm('Сбросить серию режима без дебафа?')) return;
+  const r=await fetch(`/abilities/${encodeURIComponent(id)}/reset-regime`,{method:'POST'});
+  if(!r.ok){const d=await r.json().catch(()=>({detail:'Не удалось сбросить режим'})); alert(d.detail||'Не удалось сбросить режим'); return;}
   arcanaState=await r.json(); renderAbilities(); renderTopEffects();
 }
 async function startAbilitySession(id){
