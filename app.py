@@ -4381,10 +4381,11 @@ section.active{display:block}
 
 /* ── DIALOGS ── */
 .dlg{display:none;position:fixed;inset:0;background:rgba(20,12,4,.5);z-index:400;
-  align-items:center;justify-content:center}
+  align-items:center;justify-content:center;padding:14px;box-sizing:border-box;overflow:hidden}
 .dlg.open{display:flex}
 .dlg-box{background:var(--paper);border:2px solid var(--border);border-radius:4px;
-  padding:26px;width:440px;box-shadow:0 8px 28px rgba(0,0,0,.2)}
+  padding:26px;width:440px;box-shadow:0 8px 28px rgba(0,0,0,.2);
+  max-height:calc(100dvh - 28px);overflow-y:auto;box-sizing:border-box}
 .dlg-title{font-size:18px;color:var(--ink);margin-bottom:16px}
 .dlg-label{font-size:10px;letter-spacing:2px;text-transform:uppercase;
   color:var(--ink3);font-family:sans-serif;margin:2px 0 7px}
@@ -4408,6 +4409,24 @@ section.active{display:block}
 .rhythm-edit-head .dlg-input{margin-bottom:8px}
 .rhythm-remove{border:1px solid var(--border2);background:transparent;color:var(--red);
   min-height:39px;border-radius:3px;cursor:pointer;font-size:18px}
+
+#ability-dlg .dlg-box{width:min(900px,calc(100vw - 28px))!important;padding:16px 18px}
+#ability-dlg .dlg-title{font-size:16px;margin-bottom:8px}
+#ability-dlg .dlg-label{font-size:9px;letter-spacing:2px;margin:6px 0 4px}
+#ability-dlg .dlg-input{font-size:13px;padding:7px 10px;margin-bottom:6px}
+#ability-dlg .dlg-textarea{font-size:13px;padding:8px 10px;height:48px;margin-bottom:7px}
+#ability-dlg #ab-description{height:54px}
+#ability-dlg .pocket-section-title{font-size:10px;margin:12px 0 8px}
+#ability-dlg .dlg-help{font-size:10.5px;line-height:1.35;margin:-1px 0 8px}
+#ability-dlg .ability-session-settings{padding:10px;margin:8px 0 10px}
+#ability-dlg .ability-effects-layout{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
+#ability-dlg .ability-effect-block{min-width:0}
+#ability-dlg .effect-edit-row{padding:8px;margin-bottom:8px}
+#ability-dlg .effect-edit-grid{grid-template-columns:minmax(130px,1.3fr) 78px minmax(100px,1fr);gap:6px}
+#ability-dlg .effect-edit-row .dlg-textarea{height:34px}
+#ability-dlg .rhythm-remove{min-height:34px;width:100%}
+#ability-dlg .dlg-btns{position:sticky;bottom:-16px;background:linear-gradient(180deg,rgba(250,245,236,.88),var(--paper) 35%);
+  padding-top:10px;margin-top:8px}
 .rhythm-remove:hover{border-color:var(--red);background:rgba(128,47,31,.06)}
 .rhythm-reminder-row{display:flex;align-items:flex-start;gap:9px;font-size:12px;
   color:var(--ink3);font-family:sans-serif;line-height:1.45;margin:8px 0 14px}
@@ -4771,6 +4790,7 @@ section.active{display:block}
   .arcana-grid,.effects-grid{grid-template-columns:1fr}
   .effect-edit-grid{grid-template-columns:1fr}
   .dlg-grid-3,.dlg-grid-4{grid-template-columns:1fr}
+  #ability-dlg .ability-effects-layout{grid-template-columns:1fr}
   .effect-edit-grid .rhythm-remove{width:44px}
   .pocket-btn{padding:8px 14px}
   .pocket-tx-item{gap:8px}
@@ -4923,6 +4943,7 @@ section.active{display:block}
   .arcana-topbar{ align-items:stretch; flex-direction:column; }
   .effect-edit-grid{ grid-template-columns:1fr; }
   .dlg-grid-3,.dlg-grid-4{ grid-template-columns:1fr; }
+  #ability-dlg .ability-effects-layout{ grid-template-columns:1fr; }
 
   /* ── Full-screen sheet modals ── */
   .dlg,#ent-modal,#settings-modal,#oracle-modal,#reanalyze-modal{
@@ -5289,12 +5310,18 @@ section.active{display:block}
       </div>
       <div class="dlg-help">Для сна: цель 480, мин. доля 0.25, шаг долга 8. Если поспал меньше цели, игра сама ослабит силу и длительность бафа.</div>
     </div>
-    <div class="pocket-section-title">Эффекты при применении</div>
-    <div id="ab-effects-editor"></div>
-    <button class="btn-cancel" onclick="addEffectRow('ab-effects-editor')">+ эффект</button>
-    <div class="pocket-section-title" style="margin-top:16px">Дебаф при пропуске</div>
-    <div id="ab-miss-effects-editor"></div>
-    <button class="btn-cancel" onclick="addEffectRow('ab-miss-effects-editor','debuff')">+ дебаф</button>
+    <div class="ability-effects-layout">
+      <div class="ability-effect-block">
+        <div class="pocket-section-title">Эффекты при применении</div>
+        <div id="ab-effects-editor"></div>
+        <button class="btn-cancel" onclick="addEffectRow('ab-effects-editor')">+ эффект</button>
+      </div>
+      <div class="ability-effect-block">
+        <div class="pocket-section-title">Дебаф при пропуске</div>
+        <div id="ab-miss-effects-editor"></div>
+        <button class="btn-cancel" onclick="addEffectRow('ab-miss-effects-editor','debuff')">+ дебаф</button>
+      </div>
+    </div>
     <div class="dlg-btns" style="margin-top:14px">
       <button class="btn-primary" onclick="saveAbility()">Сохранить</button>
       <button class="btn-cancel" onclick="closeDlg('ability-dlg')">Отмена</button>
