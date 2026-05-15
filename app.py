@@ -2685,13 +2685,23 @@ def progress_overview(u: dict = Depends(current_user)):
     missions = {
         r[0]: {"id": r[0], "title": r[1], "status": r[2], "created_ts": r[3],
                "total": 0, "active": 0, "done": 0, "cycles": 0, "rituals": 0, "timers": 0,
-               "counters": 0, "events": 0, "last_completed_ts": ""}
+               "counters": 0, "events": 0, "last_completed_ts": "", "branches": [], "tasks": []}
         for r in mission_rows
     }
+    branch_rows = kuzu_rows(_conn.execute(
+        "MATCH (b:QuestBranch) WHERE b.user_id=$uid RETURN b.id,b.mission_id,b.title,b.status,b.position,b.ts "
+        "ORDER BY b.position,b.ts",
+        {"uid": uid}))
+    for bid, mid, title, status, position, ts in branch_rows:
+        if mid in missions:
+            missions[mid]["branches"].append({"id": bid, "title": title or "Ветвь",
+                                              "status": status or "active",
+                                              "position": int(position or 0), "ts": ts or ""})
     task_rows = kuzu_rows(_conn.execute(
         "MATCH (t:Task) WHERE t.user_id=$uid RETURN "
         "t.id,t.mission_id,t.title,t.status,t.ts,t.completed_ts,t.quest_kind,t.task_type,"
-        "t.current_iters,t.required_iters,t.progress_value,t.target_value,t.timer_total_seconds,t.best_streak "
+        "t.current_iters,t.required_iters,t.progress_value,t.target_value,t.timer_total_seconds,t.best_streak,"
+        "t.branch_id,t.parent_id,t.position,t.progress_mode,t.is_current "
         "ORDER BY t.completed_ts DESC,t.ts DESC",
         {"uid": uid}))
     totals = {"missions": len(missions), "active_missions": 0, "done_missions": 0,
@@ -2707,19 +2717,31 @@ def progress_overview(u: dict = Depends(current_user)):
             totals["active_missions"] += 1
     for r in task_rows:
         tid, mid, title, status, ts, completed_ts, kind, task_type = r[:8]
+        current_iters, required_iters, progress_value, target_value, timer_total_seconds = r[8:13]
+        branch_id, parent_id, position, progress_mode, is_current = r[14:19]
         kind = kind or ("ritual" if (task_type or "") == "repeat" else "task")
-        task_index[tid] = {"id": tid, "mission_id": mid or "", "title": title,
-                           "quest_kind": kind, "ts": ts or "", "mission_title": ""}
+        task_index[tid] = {"id": tid, "mission_id": mid or "", "title": title or "Квест",
+                           "status": status or "active", "quest_kind": kind, "task_type": task_type or "once",
+                           "ts": ts or "", "completed_ts": completed_ts or "",
+                           "branch_id": branch_id or (_default_branch_id(mid) if mid else ""),
+                           "parent_id": parent_id or "", "position": int(position or 0),
+                           "progress_mode": progress_mode or "",
+                           "current_iters": int(current_iters or 0), "required_iters": int(required_iters or 1),
+                           "progress_value": float(progress_value or 0), "target_value": float(target_value or 1),
+                           "timer_total_seconds": int(timer_total_seconds or 0),
+                           "is_current": (is_current or "false") == "true", "cycle_count": 0,
+                           "mission_title": ""}
         kind_counts[kind] = kind_counts.get(kind, 0) + 1
         totals["tasks"] += 1
         m = missions.get(mid)
         if not m:
             m = {"id": mid or "", "title": "Без пути", "status": "active", "created_ts": "",
                  "total": 0, "active": 0, "done": 0, "cycles": 0, "rituals": 0, "timers": 0,
-                 "counters": 0, "events": 0, "last_completed_ts": ""}
+                 "counters": 0, "events": 0, "last_completed_ts": "", "branches": [], "tasks": []}
             missions[mid or ""] = m
         m["total"] += 1
         task_index[tid]["mission_title"] = m["title"]
+        m["tasks"].append(task_index[tid])
         if kind == "ritual": m["rituals"] += 1
         if kind == "timer": m["timers"] += 1
         if kind == "counter": m["counters"] += 1
@@ -2741,12 +2763,14 @@ def progress_overview(u: dict = Depends(current_user)):
         "MATCH (ev:QuestEvent) WHERE ev.user_id=$uid RETURN ev.task_id,ev.mission_id,ev.event_type,ev.ts",
         {"uid": uid}))
     event_counts: dict[str, int] = {}
+    cycle_counts: dict[str, int] = {}
     for tid, mid, etype, ts in event_rows:
         totals["events"] += 1
         event_counts[etype or "event"] = event_counts.get(etype or "event", 0) + 1
         if mid in missions:
             missions[mid]["events"] += 1
         if etype == "cycle_completed":
+            cycle_counts[tid or ""] = cycle_counts.get(tid or "", 0) + 1
             totals["done_tasks"] += 1
             if mid in missions:
                 missions[mid]["cycles"] += 1
@@ -2770,6 +2794,12 @@ def progress_overview(u: dict = Depends(current_user)):
         days.append({"date": key, "completed": by_day.get(key, 0)})
     mission_list = []
     for m in missions.values():
+        if not m.get("branches"):
+            m["branches"] = [{"id": _default_branch_id(m["id"]) if m.get("id") else "",
+                              "title": "Основная", "status": "active", "position": 0, "ts": m.get("created_ts") or ""}]
+        for t in m.get("tasks") or []:
+            t["cycle_count"] = cycle_counts.get(t.get("id") or "", 0)
+        m["tasks"].sort(key=lambda t: (t.get("branch_id") or "", int(t.get("position") or 0), t.get("ts") or ""))
         total = max(1, int(m.get("total") or 0))
         pct = round((int(m.get("done") or 0) / total) * 100)
         mission_list.append({**m, "completed_total": int(m.get("done") or 0) + int(m.get("cycles") or 0), "completion_pct": pct})
@@ -4624,6 +4654,22 @@ section.active{display:block}
 .progress-recent{display:grid;gap:8px}
 .progress-recent-item{border-left:2px solid var(--gold);padding:7px 0 7px 10px;background:rgba(253,248,240,.4)}
 .progress-recent-title{font-size:13px;color:var(--ink)}
+.progress-roadmap{margin-top:12px;border-top:1px solid var(--border2);padding-top:10px}
+.progress-roadmap summary{cursor:pointer;list-style:none;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--ink3);font-family:sans-serif}
+.progress-roadmap summary::-webkit-details-marker{display:none}
+.progress-roadmap summary::after{content:'↓';float:right;color:var(--gold)}
+.progress-roadmap[open] summary::after{content:'↑'}
+.progress-branch{margin-top:12px}
+.progress-branch-title{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);font-family:sans-serif;margin-bottom:7px}
+.progress-node{--depth:0;margin:7px 0 0 calc(var(--depth)*18px);padding:9px 10px;border-left:2px solid var(--border2);background:rgba(253,248,240,.45)}
+.progress-node.done{border-left-color:var(--gold);background:rgba(139,105,20,.08)}
+.progress-node.current{border-left-color:var(--blue)}
+.progress-node-row{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.progress-node-title{font-size:13px;color:var(--ink);line-height:1.3}
+.progress-node-status{font-size:9px;letter-spacing:1.3px;text-transform:uppercase;color:var(--ink3);font-family:sans-serif;white-space:nowrap}
+.progress-node.done .progress-node-status{color:var(--gold)}
+.progress-node.current .progress-node-status{color:var(--blue)}
+.progress-node-meta{font-size:10px;color:var(--ink3);font-family:sans-serif;line-height:1.45;margin-top:4px}
 
 /* ── DIALOGS ── */
 .dlg{display:none;position:fixed;inset:0;background:rgba(20,12,4,.5);z-index:1300;
@@ -7095,6 +7141,63 @@ async function loadProgress(){
       <div class="progress-day-label">${label}</div>
     </div>`;
   }).join('');
+  const taskKindLabel=t=>({task:'квест',ritual:'ритуал',timer:'таймер',counter:'счётчик'}[t.quest_kind||'task']||'квест');
+  const taskStatusLabel=t=>{
+    if(t.status==='done') return 'в архиве';
+    if(t.is_current) return 'актуально';
+    if(Number(t.cycle_count||0)>0) return 'поддерживается';
+    return 'активно';
+  };
+  const taskProgressMeta=t=>{
+    const parts=[taskKindLabel(t)];
+    if(t.status==='done'&&t.completed_ts) parts.push(`закрыт ${localDisplayDate(t.completed_ts)} ${localTimeHM(t.completed_ts)}`);
+    if(Number(t.cycle_count||0)>0) parts.push(`${Number(t.cycle_count||0)} циклов`);
+    if((t.quest_kind||'')==='ritual') parts.push(`${Number(t.current_iters||0)}/${Number(t.required_iters||1)}`);
+    if((t.quest_kind||'')==='counter') parts.push(`${Number(t.progress_value||0).toLocaleString('ru-RU')}/${Number(t.target_value||1).toLocaleString('ru-RU')}`);
+    if((t.quest_kind||'')==='timer') parts.push(`накоплено ${fmtDuration(t.timer_total_seconds||0)}`);
+    return parts.filter(Boolean).join(' · ');
+  };
+  const renderProgressTree=(tasks,branchId)=>{
+    const scoped=tasks.filter(t=>(t.branch_id||branchId)===branchId);
+    const byParent={};
+    scoped.forEach(t=>{
+      const pid=t.parent_id||'';
+      if(!byParent[pid]) byParent[pid]=[];
+      byParent[pid].push(t);
+    });
+    Object.values(byParent).forEach(list=>list.sort((a,b)=>(Number(a.position||0)-Number(b.position||0))||String(a.ts||'').localeCompare(String(b.ts||''))));
+    const render=(t,depth=0)=>{
+      const cls=t.status==='done'?'done':(t.is_current?'current':'');
+      const children=(byParent[t.id]||[]).map(ch=>render(ch,depth+1)).join('');
+      return `<div class="progress-node ${cls}" style="--depth:${Math.min(depth,6)}">
+        <div class="progress-node-row">
+          <div class="progress-node-title">${htmlesc(t.title||'Квест')}</div>
+          <div class="progress-node-status">${htmlesc(taskStatusLabel(t))}</div>
+        </div>
+        <div class="progress-node-meta">${htmlesc(taskProgressMeta(t))}</div>
+      </div>${children}`;
+    };
+    const roots=(byParent['']||[]).concat(scoped.filter(t=>t.parent_id&&!scoped.some(x=>x.id===t.parent_id)));
+    return roots.map(t=>render(t,0)).join('');
+  };
+  const roadmap=m=>{
+    const tasks=m.tasks||[];
+    if(!tasks.length) return '';
+    const branches=(m.branches&&m.branches.length)?m.branches:[{id:'',title:'Основная'}];
+    const branchHtml=branches.map(b=>{
+      const branchId=b.id||'';
+      const body=renderProgressTree(tasks,branchId);
+      if(!body) return '';
+      return `<div class="progress-branch">
+        <div class="progress-branch-title">${htmlesc(b.title||'Ветвь')}</div>
+        ${body}
+      </div>`;
+    }).join('');
+    return `<details class="progress-roadmap" open>
+      <summary>карта пути · ${tasks.length} заданий</summary>
+      ${branchHtml||'<div class="empty" style="padding:14px 0">Карта пока пуста</div>'}
+    </details>`;
+  };
   const missions=(d.by_mission||[]).map(m=>{
     const meta=[`${Number(m.done||0)} в архиве`,m.cycles?`${Number(m.cycles||0)} циклов`:'',`${Number(m.active||0)} активно`,m.events?`${m.events} событий`:'',m.last_completed_ts?`последнее ${localDisplayDate(m.last_completed_ts)}`:''].filter(Boolean).join(' · ');
     return `<div class="progress-mission">
@@ -7104,6 +7207,7 @@ async function loadProgress(){
       </div>
       <div class="progress-line"><div class="progress-line-fill" style="width:${Math.max(0,Math.min(100,Number(m.completion_pct||0)))}%"></div></div>
       <div class="progress-mission-meta">${htmlesc(meta||'пока нет квестов')}</div>
+      ${roadmap(m)}
     </div>`;
   }).join('')||'<div class="empty" style="padding:20px">Путей пока нет</div>';
   const recent=(d.recent_completed||[]).map(t=>`<div class="progress-recent-item">
