@@ -4659,8 +4659,14 @@ section.active{display:block}
 .progress-roadmap summary::-webkit-details-marker{display:none}
 .progress-roadmap summary::after{content:'↓';float:right;color:var(--gold)}
 .progress-roadmap[open] summary::after{content:'↑'}
-.progress-branch{margin-top:12px}
-.progress-branch-title{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);font-family:sans-serif;margin-bottom:7px}
+.progress-branch{margin-top:10px;border:1px solid var(--border2);border-radius:4px;background:rgba(253,248,240,.42);overflow:hidden}
+.progress-branch summary{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;font-family:sans-serif}
+.progress-branch summary::-webkit-details-marker{display:none}
+.progress-branch summary::after{content:'↓';color:var(--gold);font-size:12px}
+.progress-branch[open] summary::after{content:'↑'}
+.progress-branch-title{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);font-family:sans-serif}
+.progress-branch-count{font-size:10px;color:var(--ink3);font-family:sans-serif;white-space:nowrap}
+.progress-branch-body{border-top:1px solid var(--border2);padding:8px 10px 12px}
 .progress-node{--depth:0;margin:7px 0 0 calc(var(--depth)*18px);padding:9px 10px;border-left:2px solid var(--border2);background:rgba(253,248,240,.45)}
 .progress-node.done{border-left-color:var(--gold);background:rgba(139,105,20,.08)}
 .progress-node.current{border-left-color:var(--blue)}
@@ -5309,7 +5315,7 @@ section.active{display:block}
     <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
     <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
     <div class="nav-item" data-s="progress" onclick="nav(this)">🏆 Прогресс</div>
-    <div class="nav-item" data-s="abilities" onclick="nav(this)">✦ Бафы</div>
+    <div class="nav-item" data-s="abilities" onclick="nav(this)">🪄 Бафы</div>
     <div class="nav-item" data-s="inventory" onclick="nav(this)">🎒 Инвентарь</div>
     <div class="nav-item" data-s="pocket" onclick="nav(this)">💰 Карман</div>
     <div class="nav-item" data-s="base" onclick="nav(this)" style="display:none">🗄️ База знаний</div>
@@ -5349,7 +5355,7 @@ section.active{display:block}
     <span class="bnav-icon">🏆</span><span>Прогр.</span>
   </div>
   <div class="bnav-item" data-s="abilities" onclick="navMob(this)">
-    <span class="bnav-icon">✦</span><span>Бафы</span>
+    <span class="bnav-icon">🪄</span><span>Бафы</span>
   </div>
   <div class="bnav-item" data-s="inventory" onclick="navMob(this)">
     <span class="bnav-icon">🎒</span><span>Инв.</span>
@@ -5934,13 +5940,29 @@ function doLogout(){
 let allEntities = [];
 let _openMissions = new Set();   // expanded mission blocks
 let _closedMissions = new Set(); // manually collapsed by user
-let _closedAsideMissions = new Set(); // collapsed active paths in sidebar
+const CLOSED_ASIDE_MISSIONS_KEY = 'lrpg_closed_aside_missions';
+let _closedAsideMissions = loadLocalSet(CLOSED_ASIDE_MISSIONS_KEY); // collapsed active paths in sidebar
 
 const ICONS = {person:'👤',place:'📍',project:'📁',concept:'💡',event:'📅',quest:'⚔'};
 const TYPE_COLORS = {
   person:'var(--blue)', place:'#6b4a22', project:'var(--green)',
   concept:'#7b4fa0', event:'var(--gold)', quest:'var(--red)'
 };
+
+function loadLocalSet(key){
+  try{
+    const raw=window.localStorage.getItem(key);
+    const arr=raw?JSON.parse(raw):[];
+    return new Set(Array.isArray(arr)?arr.filter(Boolean):[]);
+  }catch(e){
+    return new Set();
+  }
+}
+function saveLocalSet(key,set){
+  try{
+    window.localStorage.setItem(key,JSON.stringify(Array.from(set).filter(Boolean).slice(0,500)));
+  }catch(e){}
+}
 
 // ── Live astro (wttr.in) ─────────────────────────────────────────────────────
 let _liveAstro = null;
@@ -6513,7 +6535,7 @@ function renderAbilityCard(a){
            <button class="pocket-btn secondary" onclick="openSessionManualDlg('${_jsEsc(a.id)}')">записать</button>`)
     : `<button class="pocket-btn" onclick="castAbility('${_jsEsc(a.id)}')">применить</button>`);
   return `<div class="arcana-card">
-    <div class="arcana-card-title">✦ ${htmlesc(a.name)}</div>
+    <div class="arcana-card-title">🪄 ${htmlesc(a.name)}</div>
     <div><span class="ability-pill">${modeLabel}</span></div>
     <div class="arcana-card-sub">${htmlesc(a.practice||a.description||'Практика без описания.')}</div>
     ${a.description?`<div class="arcana-muted">${htmlesc(a.description)}</div>`:''}
@@ -7005,6 +7027,7 @@ function isTaskClosedForNow(t){
 function toggleAsideMission(mid){
   if(_closedAsideMissions.has(mid)) _closedAsideMissions.delete(mid);
   else _closedAsideMissions.add(mid);
+  saveLocalSet(CLOSED_ASIDE_MISSIONS_KEY,_closedAsideMissions);
   loadAsides();
 }
 async function loadAsides(){
@@ -7186,14 +7209,18 @@ async function loadProgress(){
     const branches=(m.branches&&m.branches.length)?m.branches:[{id:'',title:'Основная'}];
     const branchHtml=branches.map(b=>{
       const branchId=b.id||'';
+      const branchCount=tasks.filter(t=>(t.branch_id||branchId)===branchId).length;
       const body=renderProgressTree(tasks,branchId);
       if(!body) return '';
-      return `<div class="progress-branch">
-        <div class="progress-branch-title">${htmlesc(b.title||'Ветвь')}</div>
-        ${body}
-      </div>`;
+      return `<details class="progress-branch">
+        <summary>
+          <span class="progress-branch-title">${htmlesc(b.title||'Ветвь')}</span>
+          <span class="progress-branch-count">${branchCount} заданий</span>
+        </summary>
+        <div class="progress-branch-body">${body}</div>
+      </details>`;
     }).join('');
-    return `<details class="progress-roadmap" open>
+    return `<details class="progress-roadmap">
       <summary>карта пути · ${tasks.length} заданий</summary>
       ${branchHtml||'<div class="empty" style="padding:14px 0">Карта пока пуста</div>'}
     </details>`;
