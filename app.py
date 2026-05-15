@@ -396,6 +396,15 @@ def _game_day_bounds(local_date: str = "") -> tuple[str, str]:
     utc_end = utc_start + timedelta(days=1)
     return utc_start.strftime("%Y-%m-%d %H:%M"), utc_end.strftime("%Y-%m-%d %H:%M")
 
+def _game_day_key_from_ts(ts: str) -> str:
+    dt = _dt_from_s(ts)
+    if not dt:
+        return str(ts or "")[:10]
+    local = dt + timedelta(minutes=GAME_TZ_OFFSET_MINUTES)
+    if local.hour < GAME_DAY_START_HOUR:
+        local = local - timedelta(days=1)
+    return local.strftime("%Y-%m-%d")
+
 def _client_tz_offset_minutes(request: Request | None) -> int:
     if not request:
         return 0
@@ -2453,6 +2462,8 @@ def tick_task(tid: str, u: dict = Depends(current_user)):
     _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.current_iters=$c,t.progress_value=$p,t.last_reset_ts=$lr,t.completed_ts=$cts",
                   {"id":tid,"uid":uid,"c":new_cur,"p":new_progress,"lr":lr,"cts":cts})
     _record_quest_event(tid, mid, uid, "tick", 1)
+    if new_cur >= req and cur < req:
+        _record_quest_event(tid, mid, uid, "cycle_completed", 1)
     _write_quest_journal_event(tid, uid, "tick", 1)
     return {"current":new_cur,"required":req,"completed":new_cur>=req}
 
@@ -2479,6 +2490,8 @@ def update_task_progress(tid: str, req: TaskProgressReq, u: dict = Depends(curre
         _conn.execute("MATCH (t:Task) WHERE t.id=$id AND t.user_id=$uid SET t.status='done',t.is_current='false'",
                       {"id":tid,"uid":uid})
     _record_quest_event(tid, mid or "", uid, "progress", float(req.delta or 0), req.note)
+    if completed:
+        _record_quest_event(tid, mid or "", uid, "completed", 1, req.note)
     _write_quest_journal_event(tid, uid, "progress", new_value)
     return {"ok":True,"progress_value":new_value,"completed":completed}
 
@@ -2598,6 +2611,8 @@ def stop_task_timer(tid: str, u: dict = Depends(current_user)):
             "t.current_iters=$iters,t.progress_value=$progress,t.last_reset_ts=$reset,t.completed_ts=$completed",
             {"id":tid,"uid":uid,"iters":new_iters,"progress":new_progress,
              "reset":last_reset_ts or _now_s(),"completed":completed_ts})
+        if new_iters >= max(1, int(required_iters or 1)) and int(current_iters or 0) < max(1, int(required_iters or 1)):
+            _record_quest_event(tid, mid or "", uid, "cycle_completed", 1)
     _record_quest_event(tid, mid or "", uid, "timer_stopped", float(session_delta))
     _write_quest_journal_event(tid, uid, "timer_stopped", float(session_delta))
     return {"ok":True,"timer_total_seconds":new_total,"last_session_seconds":int(session_delta),
@@ -2660,6 +2675,109 @@ def completed_today(request: Request, u: dict = Depends(current_user)):
                 and _ts_in_range(r[0] or "", start, end)
                 and not _ts_in_range(r[1] or "", start, end))
     return {"count": done+partial}
+
+@app.get("/progress")
+def progress_overview(u: dict = Depends(current_user)):
+    uid = _uid(u)
+    mission_rows = kuzu_rows(_conn.execute(
+        "MATCH (m:Mission) WHERE m.user_id=$uid RETURN m.id,m.title,m.status,m.ts ORDER BY m.ts",
+        {"uid": uid}))
+    missions = {
+        r[0]: {"id": r[0], "title": r[1], "status": r[2], "created_ts": r[3],
+               "total": 0, "active": 0, "done": 0, "cycles": 0, "rituals": 0, "timers": 0,
+               "counters": 0, "events": 0, "last_completed_ts": ""}
+        for r in mission_rows
+    }
+    task_rows = kuzu_rows(_conn.execute(
+        "MATCH (t:Task) WHERE t.user_id=$uid RETURN "
+        "t.id,t.mission_id,t.title,t.status,t.ts,t.completed_ts,t.quest_kind,t.task_type,"
+        "t.current_iters,t.required_iters,t.progress_value,t.target_value,t.timer_total_seconds,t.best_streak "
+        "ORDER BY t.completed_ts DESC,t.ts DESC",
+        {"uid": uid}))
+    totals = {"missions": len(missions), "active_missions": 0, "done_missions": 0,
+              "tasks": 0, "active_tasks": 0, "done_tasks": 0, "events": 0}
+    recent = []
+    task_index = {}
+    by_day: dict[str, int] = {}
+    kind_counts: dict[str, int] = {}
+    for m in missions.values():
+        if m["status"] == "done":
+            totals["done_missions"] += 1
+        else:
+            totals["active_missions"] += 1
+    for r in task_rows:
+        tid, mid, title, status, ts, completed_ts, kind, task_type = r[:8]
+        kind = kind or ("ritual" if (task_type or "") == "repeat" else "task")
+        task_index[tid] = {"id": tid, "mission_id": mid or "", "title": title,
+                           "quest_kind": kind, "ts": ts or "", "mission_title": ""}
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        totals["tasks"] += 1
+        m = missions.get(mid)
+        if not m:
+            m = {"id": mid or "", "title": "Без пути", "status": "active", "created_ts": "",
+                 "total": 0, "active": 0, "done": 0, "cycles": 0, "rituals": 0, "timers": 0,
+                 "counters": 0, "events": 0, "last_completed_ts": ""}
+            missions[mid or ""] = m
+        m["total"] += 1
+        task_index[tid]["mission_title"] = m["title"]
+        if kind == "ritual": m["rituals"] += 1
+        if kind == "timer": m["timers"] += 1
+        if kind == "counter": m["counters"] += 1
+        if status == "done":
+            totals["done_tasks"] += 1
+            m["done"] += 1
+            if completed_ts and completed_ts > (m.get("last_completed_ts") or ""):
+                m["last_completed_ts"] = completed_ts
+            day = _game_day_key_from_ts(completed_ts or ts or "")
+            if day:
+                by_day[day] = by_day.get(day, 0) + 1
+            recent.append({"id": tid, "title": title, "mission_id": mid or "",
+                           "mission_title": m["title"], "completed_ts": completed_ts or "",
+                           "quest_kind": kind})
+        else:
+            totals["active_tasks"] += 1
+            m["active"] += 1
+    event_rows = kuzu_rows(_conn.execute(
+        "MATCH (ev:QuestEvent) WHERE ev.user_id=$uid RETURN ev.task_id,ev.mission_id,ev.event_type,ev.ts",
+        {"uid": uid}))
+    event_counts: dict[str, int] = {}
+    for tid, mid, etype, ts in event_rows:
+        totals["events"] += 1
+        event_counts[etype or "event"] = event_counts.get(etype or "event", 0) + 1
+        if mid in missions:
+            missions[mid]["events"] += 1
+        if etype == "cycle_completed":
+            totals["done_tasks"] += 1
+            if mid in missions:
+                missions[mid]["cycles"] += 1
+                if ts and ts > (missions[mid].get("last_completed_ts") or ""):
+                    missions[mid]["last_completed_ts"] = ts
+            day = _game_day_key_from_ts(ts or "")
+            if day:
+                by_day[day] = by_day.get(day, 0) + 1
+            t = task_index.get(tid, {"id": tid or "", "title": "Повторяемый квест",
+                                     "mission_id": mid or "", "mission_title": missions.get(mid, {}).get("title", "Без пути"),
+                                     "quest_kind": "ritual"})
+            recent.append({"id": t["id"], "title": t["title"], "mission_id": t.get("mission_id") or mid or "",
+                           "mission_title": t.get("mission_title") or missions.get(mid, {}).get("title", "Без пути"),
+                           "completed_ts": ts or "", "quest_kind": t.get("quest_kind") or "ritual"})
+    today_local = _utcnow() + timedelta(minutes=GAME_TZ_OFFSET_MINUTES)
+    if today_local.hour < GAME_DAY_START_HOUR:
+        today_local -= timedelta(days=1)
+    days = []
+    for i in range(13, -1, -1):
+        key = (today_local - timedelta(days=i)).strftime("%Y-%m-%d")
+        days.append({"date": key, "completed": by_day.get(key, 0)})
+    mission_list = []
+    for m in missions.values():
+        total = max(1, int(m.get("total") or 0))
+        pct = round((int(m.get("done") or 0) / total) * 100)
+        mission_list.append({**m, "completed_total": int(m.get("done") or 0) + int(m.get("cycles") or 0), "completion_pct": pct})
+    mission_list.sort(key=lambda m: (m.get("status") == "done", -(m.get("done") or 0), m.get("title") or ""))
+    recent.sort(key=lambda x: x.get("completed_ts") or "", reverse=True)
+    return {"totals": totals, "by_mission": mission_list,
+            "recent_completed": recent[:24], "by_day": days,
+            "kind_counts": kind_counts, "event_counts": event_counts}
 
 @app.post("/entities/{eid}/delete")
 def delete_entity(eid: str, u: dict = Depends(current_user)):
@@ -4482,6 +4600,31 @@ section.active{display:block}
   font-family:'Georgia',serif;font-size:inherit;padding:2px 8px;border-radius:3px;
   outline:none;width:100%;box-shadow:0 0 0 2px rgba(139,105,20,.12)}
 
+/* ── PROGRESS ARCHIVE ── */
+.progress-wrap{max-width:1180px;padding:48px 52px 80px}
+.progress-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0 18px}
+.progress-stat{background:var(--paper2);border:1px solid var(--border2);border-radius:4px;padding:16px 18px}
+.progress-stat-label{font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--ink3);font-family:sans-serif;margin-bottom:7px}
+.progress-stat-value{font-size:28px;color:var(--ink);line-height:1}
+.progress-panels{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr);gap:16px}
+.progress-panel{background:rgba(139,105,20,.045);border:1px solid var(--border2);border-radius:4px;padding:16px 18px}
+.progress-panel-title{font-size:10px;letter-spacing:3px;text-transform:uppercase;color:var(--ink3);font-family:sans-serif;margin-bottom:14px}
+.progress-bars{display:grid;grid-template-columns:repeat(14,1fr);gap:6px;align-items:end;height:132px}
+.progress-day{display:flex;flex-direction:column;align-items:center;gap:6px;height:100%;justify-content:flex-end}
+.progress-day-bar{width:100%;min-height:3px;background:linear-gradient(180deg,var(--gold),var(--red));border-radius:3px 3px 0 0}
+.progress-day-label{font-size:9px;color:var(--ink3);font-family:sans-serif;writing-mode:vertical-rl;transform:rotate(180deg);height:36px}
+.progress-mission{padding:12px 0;border-bottom:1px solid var(--border2)}
+.progress-mission:last-child{border-bottom:none}
+.progress-mission-head{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-bottom:7px}
+.progress-mission-title{font-size:15px;color:var(--ink)}
+.progress-mission-num{font-size:11px;color:var(--gold);font-family:sans-serif;white-space:nowrap}
+.progress-line{height:7px;background:rgba(139,105,20,.14);border-radius:8px;overflow:hidden}
+.progress-line-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--gold));border-radius:8px}
+.progress-mission-meta,.progress-recent-meta{font-size:10px;color:var(--ink3);font-family:sans-serif;line-height:1.5;margin-top:6px}
+.progress-recent{display:grid;gap:8px}
+.progress-recent-item{border-left:2px solid var(--gold);padding:7px 0 7px 10px;background:rgba(253,248,240,.4)}
+.progress-recent-title{font-size:13px;color:var(--ink)}
+
 /* ── DIALOGS ── */
 .dlg{display:none;position:fixed;inset:0;background:rgba(20,12,4,.5);z-index:1300;
   align-items:center;justify-content:center;padding:14px;box-sizing:border-box;overflow:hidden}
@@ -4851,12 +4994,15 @@ section.active{display:block}
   .missions-wrap{max-width:none;padding:30px 22px 56px}
   .missions-sub{margin-bottom:24px}
   .base-wrap,#s-pocket,#s-abilities,#s-inventory{padding:28px 22px 48px}
+  .progress-wrap{padding:28px 22px 48px}
   .base-topbar{gap:12px;align-items:flex-start}
   .base-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,240px),1fr))}
   .mech-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,210px),1fr))}
   .pocket-cards{grid-template-columns:repeat(2,minmax(0,1fr));max-width:none}
   .pocket-form,.pocket-tx-list{max-width:none}
   .arcana-topbar{flex-direction:column}
+  .progress-stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .progress-panels{grid-template-columns:1fr}
   .effect-edit-grid{grid-template-columns:1fr 1fr}
   #ability-dlg .effect-edit-grid{grid-template-columns:1fr 1fr}
   .dlg-grid-3,.dlg-grid-4{grid-template-columns:1fr 1fr}
@@ -4885,6 +5031,7 @@ section.active{display:block}
   .day-heading::after{min-width:80px}
   .daily-done-badge{margin-left:0;font-size:11px}
   .missions-wrap,.base-wrap,#s-pocket,#s-abilities,#s-inventory{padding:22px 16px 40px}
+  .progress-wrap{padding:22px 16px 40px}
   .missions-topbar,.base-topbar{align-items:stretch;flex-direction:column}
   .base-topbar-right,.mission-actions,.dlg-btns,.pocket-form-row{
     width:100%;justify-content:flex-start;flex-wrap:wrap;
@@ -4899,6 +5046,8 @@ section.active{display:block}
   .repeat-progress{gap:6px}
   .pocket-cards{grid-template-columns:1fr;gap:12px;margin-bottom:24px}
   .pocket-card{padding:16px 18px}
+  .progress-stats{grid-template-columns:1fr}
+  .progress-bars{gap:4px}
   .pocket-card-amount{font-size:24px;letter-spacing:0}
   .pocket-reserve-row{align-items:flex-start;flex-wrap:wrap}
   .pocket-actions{gap:9px;margin-bottom:24px}
@@ -5047,6 +5196,7 @@ section.active{display:block}
   /* ── Content padding: bottom = bottom-nav + input-bar height ── */
   .journal-main{ padding:18px 16px 176px; }
   .missions-wrap,.base-wrap,#s-pocket,#s-abilities,#s-inventory{ padding:18px 16px 80px; }
+  .progress-wrap{ padding:18px 16px 80px; }
   .missions-sub{ margin-bottom:20px; }
 
   /* ── Cards ── */
@@ -5056,6 +5206,9 @@ section.active{display:block}
   .pocket-form,.pocket-tx-list{ max-width:none; }
   .arcana-grid,.effects-grid{ grid-template-columns:1fr; }
   .arcana-topbar{ align-items:stretch; flex-direction:column; }
+  .progress-stats{ grid-template-columns:1fr; }
+  .progress-panels{ grid-template-columns:1fr; }
+  .progress-bars{ gap:4px; }
   .effect-edit-grid{ grid-template-columns:1fr; }
   #ability-dlg .effect-edit-grid{ grid-template-columns:1fr; }
   .dlg-grid-3,.dlg-grid-4{ grid-template-columns:1fr; }
@@ -5109,6 +5262,7 @@ section.active{display:block}
   <nav>
     <div class="nav-item active" data-s="journal" onclick="nav(this)">🗺️ Дневник</div>
     <div class="nav-item" data-s="missions" onclick="nav(this)">⚔️ Пути</div>
+    <div class="nav-item" data-s="progress" onclick="nav(this)">🏆 Прогресс</div>
     <div class="nav-item" data-s="abilities" onclick="nav(this)">✦ Бафы</div>
     <div class="nav-item" data-s="inventory" onclick="nav(this)">🎒 Инвентарь</div>
     <div class="nav-item" data-s="pocket" onclick="nav(this)">💰 Карман</div>
@@ -5125,13 +5279,13 @@ section.active{display:block}
 <div id="drawer-backdrop" onclick="closeDrawer()"></div>
 
 <aside id="sidebar">
-  <div class="cal-widget" id="sidebar-cal"></div>
-  <div class="rhythm-widget" id="day-rhythm-widget"></div>
   <div class="aside-section">
     <div class="aside-label">Активные пути</div>
     <div id="aside-missions"></div>
   </div>
+  <div class="rhythm-widget" id="day-rhythm-widget"></div>
   <div class="char-section" id="char-sidebar"></div>
+  <div class="cal-widget" id="sidebar-cal"></div>
   <div class="aside-bottom">
     <div class="aside-bottom-link" onclick="nav(document.querySelector('[data-s=base]'));closeDrawer()">🗄️ База знаний →</div>
   </div>
@@ -5144,6 +5298,9 @@ section.active{display:block}
   </div>
   <div class="bnav-item" data-s="missions" onclick="navMob(this)">
     <span class="bnav-icon">⚔️</span><span>Пути</span>
+  </div>
+  <div class="bnav-item" data-s="progress" onclick="navMob(this)">
+    <span class="bnav-icon">🏆</span><span>Прогр.</span>
   </div>
   <div class="bnav-item" data-s="abilities" onclick="navMob(this)">
     <span class="bnav-icon">✦</span><span>Бафы</span>
@@ -5179,6 +5336,20 @@ section.active{display:block}
         <button class="btn-add" onclick="openDlg('mission-dlg')">+ Новый путь</button>
       </div>
       <div id="missions-list"></div>
+    </div>
+  </section>
+
+  <section id="s-progress">
+    <div class="progress-wrap">
+      <div class="arcana-topbar">
+        <div>
+          <div class="arcana-eyebrow">АРХИВ ПОДВИГОВ</div>
+          <div class="arcana-heading">Прогресс</div>
+          <div class="arcana-sub">Выполненные квесты не исчезают из истории: они уходят в архив Пути и становятся материалом будущих достижений.</div>
+        </div>
+        <button class="btn-add" onclick="loadProgress()">обновить</button>
+      </div>
+      <div id="progress-content"><div class="empty">Загрузка прогресса...</div></div>
     </div>
   </section>
 
@@ -5717,6 +5888,7 @@ function doLogout(){
 let allEntities = [];
 let _openMissions = new Set();   // expanded mission blocks
 let _closedMissions = new Set(); // manually collapsed by user
+let _closedAsideMissions = new Set(); // collapsed active paths in sidebar
 
 const ICONS = {person:'👤',place:'📍',project:'📁',concept:'💡',event:'📅',quest:'⚔'};
 const TYPE_COLORS = {
@@ -6569,7 +6741,7 @@ async function clearEffect(id){
 }
 
 // ── Nav ──────────────────────────────────────────────────────────────────────
-const TITLES={journal:'Дневник',missions:'Пути',base:'База знаний',pocket:'Карман',abilities:'Бафы',inventory:'Инвентарь'};
+const TITLES={journal:'Дневник',missions:'Пути',progress:'Прогресс',base:'База знаний',pocket:'Карман',abilities:'Бафы',inventory:'Инвентарь'};
 function nav(el){
   document.querySelectorAll('.nav-item').forEach(i=>i.classList.remove('active'));
   el.classList.add('active');
@@ -6585,6 +6757,7 @@ function nav(el){
   if(window.innerWidth<=768) _ib.classList.toggle('mob-visible', s==='journal');
   if(s==='journal'){loadJournal();loadAsides();}
   if(s==='missions') loadMissions();
+  if(s==='progress') loadProgress();
   if(s==='base') loadBase();
   if(s==='pocket') loadPocket();
   if(s==='abilities'){loadArcana().then(renderAbilities);}
@@ -6602,6 +6775,7 @@ function navMob(el){
     document.getElementById('s-'+s).classList.add('active');
     if(s==='journal'){loadJournal();loadAsides();}
     if(s==='missions') loadMissions();
+    if(s==='progress') loadProgress();
     if(s==='base') loadBase();
     if(s==='pocket') loadPocket();
     if(s==='abilities'){loadArcana().then(renderAbilities);}
@@ -6775,6 +6949,18 @@ function _taskUrgency(t){
   const due=last.getTime()+(t.reset_hours||24)*3600000;
   return due-Date.now();
 }
+function isTaskClosedForNow(t){
+  if(t.status==='done') return true;
+  const kind=t.quest_kind||((t.task_type||'')==='repeat'?'ritual':'task');
+  if(kind==='ritual') return Number(t.current_iters||0)>=Number(t.required_iters||1);
+  if(kind==='counter') return Number(t.target_value||0)>0&&Number(t.progress_value||0)>=Number(t.target_value||1);
+  return false;
+}
+function toggleAsideMission(mid){
+  if(_closedAsideMissions.has(mid)) _closedAsideMissions.delete(mid);
+  else _closedAsideMissions.add(mid);
+  loadAsides();
+}
 async function loadAsides(){
   const mr=await fetch('/missions');
   const missions=await mr.json();
@@ -6782,7 +6968,7 @@ async function loadAsides(){
     .filter(m=>m.status==='active')
     .map(m=>({
       ...m,
-      currentTasks:(m.tasks||[]).filter(t=>t.status!=='done'&&t.is_current)
+      currentTasks:(m.tasks||[]).filter(t=>t.is_current&&!isTaskClosedForNow(t))
         .sort((a,b)=>_taskUrgency(a)-_taskUrgency(b))
     }))
     .filter(m=>m.currentTasks.length);
@@ -6876,14 +7062,74 @@ async function loadAsides(){
           ${asideControls(t,m.id)}
         </div>`;
       }).join('');
-      return `<div class="aside-mission" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+      const closed=_closedAsideMissions.has(m.id);
+      return `<div class="aside-mission" onclick="toggleAsideMission('${_jsEsc(m.id)}')">
         <div class="aside-mission-t">⚔ ${_entEsc(m.title)}</div>
       </div>
-      <div>${tasksHtml}</div>`;
+      <div style="display:${closed?'none':'block'}">${tasksHtml}</div>`;
     }).join('')
     :'<div style="font-size:12px;color:var(--ink3);font-family:sans-serif;line-height:1.5">нет актуальных квестов</div>';
   ensureTimedRitualTicker();
   tickLiveClocks();
+}
+
+async function loadProgress(){
+  const el=document.getElementById('progress-content');
+  if(!el) return;
+  el.innerHTML='<div class="empty">Собираю архив подвигов...</div>';
+  const r=await fetch('/progress');
+  if(!r.ok){ el.innerHTML='<div class="empty">Не удалось загрузить прогресс</div>'; return; }
+  const d=await r.json();
+  const totals=d.totals||{};
+  const days=d.by_day||[];
+  const maxDay=Math.max(1,...days.map(x=>Number(x.completed||0)));
+  const stat=(label,value)=>`<div class="progress-stat">
+    <div class="progress-stat-label">${label}</div>
+    <div class="progress-stat-value">${Number(value||0).toLocaleString('ru-RU')}</div>
+  </div>`;
+  const dayBars=days.map(x=>{
+    const h=Math.max(3,Math.round((Number(x.completed||0)/maxDay)*92));
+    const label=String(x.date||'').slice(5).replace('-','.');
+    return `<div class="progress-day" title="${_entEsc(x.date||'')} · ${Number(x.completed||0)} выполн.">
+      <div class="progress-day-bar" style="height:${h}px"></div>
+      <div class="progress-day-label">${label}</div>
+    </div>`;
+  }).join('');
+  const missions=(d.by_mission||[]).map(m=>{
+    const meta=[`${Number(m.done||0)} в архиве`,m.cycles?`${Number(m.cycles||0)} циклов`:'',`${Number(m.active||0)} активно`,m.events?`${m.events} событий`:'',m.last_completed_ts?`последнее ${localDisplayDate(m.last_completed_ts)}`:''].filter(Boolean).join(' · ');
+    return `<div class="progress-mission">
+      <div class="progress-mission-head">
+        <div class="progress-mission-title">${htmlesc(m.title||'Без пути')}</div>
+        <div class="progress-mission-num">${Number(m.completion_pct||0)}%</div>
+      </div>
+      <div class="progress-line"><div class="progress-line-fill" style="width:${Math.max(0,Math.min(100,Number(m.completion_pct||0)))}%"></div></div>
+      <div class="progress-mission-meta">${htmlesc(meta||'пока нет квестов')}</div>
+    </div>`;
+  }).join('')||'<div class="empty" style="padding:20px">Путей пока нет</div>';
+  const recent=(d.recent_completed||[]).map(t=>`<div class="progress-recent-item">
+    <div class="progress-recent-title">${htmlesc(t.title||'Квест')}</div>
+    <div class="progress-recent-meta">${htmlesc(t.mission_title||'Без пути')} · ${localDisplayDate(t.completed_ts)||''} ${localTimeHM(t.completed_ts)||''}</div>
+  </div>`).join('')||'<div class="empty" style="padding:20px">Выполненных квестов пока нет</div>';
+  el.innerHTML=`<div class="progress-stats">
+    ${stat('квестов всего',totals.tasks)}
+    ${stat('выполнено',totals.done_tasks)}
+    ${stat('активно',totals.active_tasks)}
+    ${stat('событий',totals.events)}
+  </div>
+  <div class="progress-panels">
+    <div class="progress-panel">
+      <div class="progress-panel-title">14 игровых дней</div>
+      <div class="progress-bars">${dayBars}</div>
+    </div>
+    <div class="progress-panel">
+      <div class="progress-panel-title">Последние закрытые квесты</div>
+      <div class="progress-recent">${recent}</div>
+    </div>
+  </div>
+  <div class="progress-panel" style="margin-top:16px">
+    <div class="progress-panel-title">Прогресс по путям</div>
+    ${missions}
+  </div>`;
 }
 
 function questKindName(kind, taskType=''){
@@ -7434,14 +7680,15 @@ async function loadMissions(){
   el.innerHTML=ms.map(m=>{
     const branches=(m.branches&&m.branches.length)?m.branches:[{id:defaultBranchId(m),title:'Основная',status:'active',position:0}];
     const defaultBid=defaultBranchId(m);
+    const activeTasks=m.tasks.filter(t=>t.status!=='done');
     const doneCount=m.tasks.filter(t=>t.status==='done').length;
-    const ritualCount=m.tasks.filter(t=>questKind(t)==='ritual').length;
-    const timerCount=m.tasks.filter(t=>questKind(t)==='timer').length;
+    const ritualCount=activeTasks.filter(t=>questKind(t)==='ritual').length;
+    const timerCount=activeTasks.filter(t=>questKind(t)==='timer').length;
     const wasOpen=_openMissions.has(m.id);
-    const badge=[`${branches.length} ветв.`,`${m.tasks.length} квестов`,doneCount?`${doneCount} выполн.`:'',ritualCount?`${ritualCount} ритуал.`:'',timerCount?`${timerCount} таймер.`:''].filter(Boolean).join(' · ');
+    const badge=[`${branches.length} ветв.`,`${activeTasks.length} активн.`,doneCount?`${doneCount} в архиве`:'',ritualCount?`${ritualCount} ритуал.`:'',timerCount?`${timerCount} таймер.`:''].filter(Boolean).join(' · ');
     const entTags=(m.entities||[]).map(e=>`<span class="mission-ent-tag" onclick="openPathEntity('${jsArg(m.id)}','${jsArg(e.name||'')}');event.stopPropagation()" title="${htmlEsc(e.summary||'')}">${htmlEsc(e.name)}</span>`).join('');
     const branchHtml=branches.map(b=>{
-      const branchTasks=m.tasks.filter(t=>(t.branch_id||defaultBid)===b.id);
+      const branchTasks=activeTasks.filter(t=>(t.branch_id||defaultBid)===b.id);
       const tree=taskTree(branchTasks);
       const body=(tree['']||[]).map(t=>renderTask(t,m,tree)).join('')||`<div class="quest-empty">Пустая ветвь.</div>`;
       const isDefault=b.id===defaultBid;
